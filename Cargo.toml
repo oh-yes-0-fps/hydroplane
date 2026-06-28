@@ -1,0 +1,46 @@
+[package]
+name = "spmd"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Float-agnostic, ISPC-style SPMD/SIMD infrastructure: write one kernel generic over the scalar element (f32/f64/f16/bf16) and run it with runtime ISA dispatch."
+repository = "https://github.com/valstad-shipworks/wreck"
+
+[features]
+default = ["std"]
+std = ["alloc", "half/std"]
+alloc = []
+libm = ["dep:libm"]
+
+# Declare `target_arch = "spirv"` (the rust-gpu target) and the opt-out `no_apple_accelerate`
+# cfg as known, so the platform-specific `#[cfg]`s don't trip the unexpected_cfgs lint.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(target_arch, values("spirv"))',
+    'cfg(no_apple_accelerate)',
+    'cfg(no_sve)',
+    'cfg(no_sme)',
+    'cfg(no_amx)',
+    'cfg(neon_over_sve)',
+] }
+
+[dependencies]
+# f16/bf16 element support (widen-to-f32 compute path; native AVX-512-FP16 / NEON-fp16 lanes layer
+# on top where the target supports them). Always present — `f16`/`bf16` are re-exported from the crate root.
+half = { version = "2", default-features = false }
+libm = { version = "0.2", optional = true }
+
+# rust-gpu subgroup intrinsics — only pulled in when compiling to SPIR-V.
+[target.'cfg(target_arch = "spirv")'.dependencies]
+spirv-std = "=0.10.0-alpha.1"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+rand = "0.9"
+soa-rs = "1.0.0"
+
+# Same f32 GEMM kernel through `dispatch_matrix`; compare default (Accelerate) vs
+# `--cfg no_apple_accelerate` (SME) via criterion baselines — see the file header.
+[[bench]]
+name = "gemm_accel_toggle"
+harness = false

@@ -1,0 +1,28 @@
+[package]
+name = "spmd-test"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "rust-gpu shader crate exercising spmd's SPIR-V subgroup backend (compile + disasm + on-device testing)."
+
+# Isolate this crate's lockfile from any ancestor; it builds only via cargo-gpu for SPIR-V.
+[workspace]
+
+[lib]
+crate-type = ["dylib", "lib"]
+
+[profile.release]
+panic = "abort"
+
+[dependencies]
+spmd = { path = "..", default-features = false }
+spirv-std = "=0.10.0-alpha.1"
+half = { version = "2", default-features = false }
+# glam is pulled transitively by spirv-std (and re-exported as `spirv_std::glam`). spirv-std
+# 0.10.0-alpha.1 declares a loose `glam >=0.30.8` that resolves to glam 0.33, which breaks its
+# own compile — so the lockfile pins glam to 0.30.8 (`cargo update -p glam --precise 0.30.8`).
+# A direct dep can't pin it: `=0.30.8` is semver-incompatible with `>=0.30.8`→0.33, so cargo
+# would keep both copies instead of unifying.
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(target_arch, values("spirv"))'] }

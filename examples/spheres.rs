@@ -1,11 +1,11 @@
 //! End-to-end proof: `wreck`'s sphere–sphere "does the query overlap any sphere in the
-//! batch?" kernel, written **once** against the `spmd` varying layer and run for `f32`
+//! batch?" kernel, written **once** against the `hydroplane` varying layer and run for `f32`
 //! *and* `f64` on whatever backend `dispatch` selects (AVX2 when present, else scalar).
 //!
 //! Run with `cargo run --example spheres --release` (add `-C target-cpu=native` via
 //! RUSTFLAGS to force the compile-time AVX2 path).
 
-use spmd::{Backend, Kernel, Scalar, Simd, Soa, SimdDispatch, dispatch};
+use hydroplane::{Backend, Kernel, Scalar, Simd, Soa, SimdDispatch, dispatch};
 
 /// Columns of the sphere SoA.
 const X: usize = 0;
@@ -55,7 +55,7 @@ pub fn any_overlap<T: Scalar, S: Backend<T>>(ctx: Simd<T, S>, soa: &Soa<T>, q: [
     false
 }
 
-/// `Kernel` wrapper so the same code runs through `spmd::dispatch`.
+/// `Kernel` wrapper so the same code runs through `hydroplane::dispatch`.
 pub struct AnyOverlap<'a, T: Scalar> {
     pub soa: &'a Soa<T>,
     pub query: [T; 4],

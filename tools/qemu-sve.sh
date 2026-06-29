@@ -6,7 +6,7 @@
 # (rustup target add aarch64-unknown-linux-musl), and rust-lld (bundled). No cross-gcc needed.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-WORK="${TMPDIR:-/tmp}/spmd-qemu-sve"
+WORK="${TMPDIR:-/tmp}/hydroplane-qemu-sve"
 mkdir -p "$WORK"; cd "$WORK"
 
 # 1. static aarch64-linux test binary (PID1 prints SVE_ALL_OK / SVE_FAILS=N, then exits)

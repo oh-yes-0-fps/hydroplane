@@ -1,11 +1,11 @@
-//! `soa-rs` interop: a `#[derive(Soars)]` struct's field slices feed `spmd` two ways —
+//! `soa-rs` interop: a `#[derive(Soars)]` struct's field slices feed `hydroplane` two ways —
 //! the zero-copy `chunks` + `load_partial` path (operate in place on the borrowed slices),
 //! and the `Soa::from_columns` copy bridge (reuse a padded-column kernel verbatim). Both
 //! must agree with a brute-force reference.
 
 use rand::Rng;
 use soa_rs::{Soars, soa};
-use spmd::{Backend, Kernel, Simd, dispatch};
+use hydroplane::{Backend, Kernel, Simd, dispatch};
 
 #[derive(Soars, Debug, Clone, Copy)]
 struct Sphere {
@@ -49,9 +49,9 @@ impl Kernel<f32> for AnyOverlapBorrowed<'_> {
     }
 }
 
-/// Copy bridge: a kernel written against `spmd`'s padded columns, fed by `Soa::from_columns`.
+/// Copy bridge: a kernel written against `hydroplane`'s padded columns, fed by `Soa::from_columns`.
 struct AnyOverlapPadded<'a> {
-    soa: &'a spmd::Soa<f32>,
+    soa: &'a hydroplane::Soa<f32>,
     q: [f32; 4],
 }
 impl Kernel<f32> for AnyOverlapPadded<'_> {
@@ -109,7 +109,7 @@ fn both_paths_match_reference() {
             .collect();
 
         let s: soa_rs::Soa<Sphere> = spheres.iter().copied().collect();
-        let padded = spmd::Soa::from_columns(&[s.x(), s.y(), s.z(), s.r()], &[0.0, 0.0, 0.0, f32::NAN]);
+        let padded = hydroplane::Soa::from_columns(&[s.x(), s.y(), s.z(), s.r()], &[0.0, 0.0, 0.0, f32::NAN]);
 
         for _ in 0..20 {
             let q = [

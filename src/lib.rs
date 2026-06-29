@@ -1,4 +1,4 @@
-//! `spmd` — float-agnostic, ISPC-style SPMD/SIMD infrastructure.
+//! `hydroplane` — float-agnostic, ISPC-style SPMD/SIMD infrastructure.
 //!
 //! Write one kernel generic over the scalar element ([`Scalar`]: `f32`, `f64`, `f16`, `bf16`);
 //! [`dispatch()`] runs it on the backend it selects by

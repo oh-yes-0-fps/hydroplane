@@ -2,7 +2,7 @@
 //! the executed backend is the build cfg:
 //!
 //!   * default build              → Apple Accelerate (cblas → AMX/SME)
-//!   * `--cfg no_apple_accelerate` → spmd's hand-rolled SME2 grid kernel
+//!   * `--cfg no_apple_accelerate` → hydroplane's hand-rolled SME2 grid kernel
 //!
 //! One binary can't hold both (the choice is compile-time), so compare two compilations with
 //! criterion baselines — the bench id is the size alone, so the two runs line up:
@@ -14,7 +14,7 @@
 
 use criterion::measurement::WallTime;
 use criterion::{BenchmarkGroup, BenchmarkId, Criterion, Throughput};
-use spmd::{Layout, MatrixBackend, MatrixKernel, Scalar, Simd, dispatch_matrix};
+use hydroplane::{Layout, MatrixBackend, MatrixKernel, Scalar, Simd, dispatch_matrix};
 use std::hint::black_box;
 
 /// `out = A·B` for a single `S×S×S` tile — large enough (≥ both engines' min dims) that the one

@@ -1,6 +1,6 @@
 //! GPU subgroup support for the rust-gpu / SPIR-V target — the ISPC→SIMT mapping.
 //!
-//! When `spmd` is compiled to SPIR-V (`target_arch = "spirv"`), the SPMD "gang" is a GPU
+//! When `hydroplane` is compiled to SPIR-V (`target_arch = "spirv"`), the SPMD "gang" is a GPU
 //! **subgroup** (warp). This module has two halves:
 //!
 //! * **Portable scheduling policy** (always compiled, unit-tested below): the [`choose`]

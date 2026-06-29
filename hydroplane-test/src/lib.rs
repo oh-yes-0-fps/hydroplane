@@ -1,7 +1,7 @@
-//! rust-gpu shader crate that exercises spmd's SPIR-V `Subgroup` backend end-to-end.
+//! rust-gpu shader crate that exercises hydroplane's SPIR-V `Subgroup` backend end-to-end.
 //!
 //! Each entry point is one compute shader where every invocation is a lane: it builds a varying
-//! value through the spmd `Simd` context, does element-wise math + a subgroup reduction, and
+//! value through the hydroplane `Simd` context, does element-wise math + a subgroup reduction, and
 //! writes the result back. Building this with `cargo gpu` forces the backend code into real
 //! SPIR-V (it is otherwise dead-code-eliminated), so the emitted module can be disassembled to
 //! confirm the hardware instructions — `OpExtInst Sqrt`/`Fma`, `PackHalf2x16`/`UnpackHalf2x16`,
@@ -11,14 +11,14 @@
 //! `slice[i]` (which can panic) fails to compile. A real host harness sizes the buffers to the
 //! dispatch, so the accesses are in-bounds by construction.
 //!
-//! Build:  `cargo gpu build --shader-crate ./spmd-test --spirv-builder-version 0.10.0-alpha.1`
+//! Build:  `cargo gpu build --shader-crate ./hydroplane-test --spirv-builder-version 0.10.0-alpha.1`
 
 #![cfg_attr(target_arch = "spirv", no_std)]
 #![allow(dead_code)]
 
 use core::marker::PhantomData;
 
-use spmd::{Backend, Kernel, Scalar, Simd};
+use hydroplane::{Backend, Kernel, Scalar, Simd};
 
 /// Splat this invocation's value, run `mul`/`add`/`fma`/`sqrt`, then sum across the subgroup.
 /// The math is native `OpFMul`/`OpFAdd` + GLSL.std.450 `Fma`/`Sqrt`, and the reduce is
@@ -73,7 +73,7 @@ pub fn op_f32(
 ) {
     let i = gid.x as usize;
     let r: f32 =
-        spmd::dispatch_subgroup(OpKernel::<f32> { val: input[i], _t: PhantomData }, SUBGROUP_WORK, 1);
+        hydroplane::dispatch_subgroup(OpKernel::<f32> { val: input[i], _t: PhantomData }, SUBGROUP_WORK, 1);
     output[i] = r;
 }
 
@@ -85,7 +85,7 @@ pub fn op_f64(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] output: &mut [f64],
 ) {
     let i = gid.x as usize;
-    let r: f64 = spmd::dispatch_subgroup(WideKernel { val: input[i] }, SUBGROUP_WORK, 1);
+    let r: f64 = hydroplane::dispatch_subgroup(WideKernel { val: input[i] }, SUBGROUP_WORK, 1);
     output[i] = r;
 }
 
@@ -98,7 +98,7 @@ pub fn op_f16(
 ) {
     let i = gid.x as usize;
     let r: f16 =
-        spmd::dispatch_subgroup(OpKernel::<f16> { val: input[i], _t: PhantomData }, SUBGROUP_WORK, 1);
+        hydroplane::dispatch_subgroup(OpKernel::<f16> { val: input[i], _t: PhantomData }, SUBGROUP_WORK, 1);
     output[i] = r.to_f32();
 }
 
@@ -110,7 +110,7 @@ pub fn op_bf16(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] output: &mut [f32],
 ) {
     let i = gid.x as usize;
-    let r: bf16 = spmd::dispatch_subgroup(
+    let r: bf16 = hydroplane::dispatch_subgroup(
         OpKernel::<bf16> { val: input[i], _t: PhantomData },
         SUBGROUP_WORK,
         1,

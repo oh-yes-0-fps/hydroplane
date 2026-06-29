@@ -2,7 +2,7 @@
 
 How to emit Vulkan **cooperative matrix** instructions — the `SPV_KHR_cooperative_matrix`
 extension and the older `SPV_NV_cooperative_matrix` — from Rust compiled with rust-gpu, as
-used by `spmd-test` / the rev pinned in `Cargo.toml` (`spirv-std =0.10.0-alpha.1`, also
+used by `hydroplane-test` / the rev pinned in `Cargo.toml` (`spirv-std =0.10.0-alpha.1`, also
 verified against git rev `36e3348`).
 
 A cooperative matrix is a matrix whose storage and arithmetic are spread across a whole
@@ -14,7 +14,7 @@ simdgroup_matrix). It is the SPIR-V equivalent of CUDA `wmma` / HLSL SM6.8
 ## Status: does not compile on rust-gpu yet (empirical, 2026-06-28)
 
 The asm blocks below are **grammar-correct but do not compile** — verified by building
-`spmd-test` with the exact KHR example against **both** `spirv-std 0.10.0-alpha.1` (the pinned
+`hydroplane-test` with the exact KHR example against **both** `spirv-std 0.10.0-alpha.1` (the pinned
 release) and the **git rev `36e3348`** named above, targeting `spirv-unknown-vulkan1.3`. Both ICE
 identically:
 
@@ -34,7 +34,7 @@ itself triggers the path. `options(nostack)` is also rejected (`asm flags not su
 **Conclusion:** cooperative matrices need an upstream rust-gpu codegen feature (a
 `SpirvType::CooperativeMatrix` + real `instruction_signatures`), not just hand-written `asm!`.
 Until a rust-gpu version ships that, this path is blocked. The rest of this file remains a correct
-operand-grammar reference for when it lands. (The `spmd` non-coop GPU fallback — per-invocation
+operand-grammar reference for when it lands. (The `hydroplane` non-coop GPU fallback — per-invocation
 scalar tiles in `MatrixBackend for Subgroup` — is unaffected and remains the working path.)
 
 ## What rust-gpu actually gives you
@@ -65,9 +65,9 @@ Two consequences fall out of the "no API" state, and both shape the code below:
    explicit result type** (`%tA`, `%tC`, …) on every cooperative-matrix instruction — which
    you must do anyway — and you never touch it.
 
-## It does *not* fit spmd's `Backend` / `Simd` model
+## It does *not* fit hydroplane's `Backend` / `Simd` model
 
-spmd's lane abstraction is **element-wise per invocation** (`Vector = T`, one lane = one
+hydroplane's lane abstraction is **element-wise per invocation** (`Vector = T`, one lane = one
 invocation). A cooperative matrix is the opposite shape: the *whole subgroup* cooperatively
 owns *one tile*, and `MulAdd` is a single op over that tile, not a per-lane operation. There
 is no sensible `Backend<T>` method for it, and you cannot build one out of `splat`/`add`/…
@@ -231,7 +231,7 @@ unsafe fn coop_mma_16x16x16_f16_f32_nv(
 
 ## Wiring it into a compute entry point
 
-Same structure as the `op_*` entry points in `spmd-test/src/lib.rs`: a `#[spirv(compute(...))]`
+Same structure as the `op_*` entry points in `hydroplane-test/src/lib.rs`: a `#[spirv(compute(...))]`
 function with storage buffers, indexing unchecked (rust-gpu has no panic machinery). The one
 real constraint is **execution scope** — `Scope::Subgroup` means an *entire subgroup* must
 reach the `MulAdd` in uniform control flow, so launch with `threads()` a multiple of the
@@ -268,11 +268,11 @@ needs. Declare inline (alongside the two `OpCapability` lines already in the exa
   `f32` instead.)
 * For integer matmul: `Int8` and/or `Int16` for the component types.
 
-Build it the way `spmd-test` documents, but raise the target environment so the validator
+Build it the way `hydroplane-test` documents, but raise the target environment so the validator
 accepts the extension (cooperative matrix needs a Vulkan 1.3 / SPIR-V 1.6-class target):
 
 ```
-cargo gpu build --shader-crate ./spmd-test \
+cargo gpu build --shader-crate ./hydroplane-test \
   --spirv-builder-version 0.10.0-alpha.1 \
   --target spirv-unknown-vulkan1.3
 ```
@@ -295,7 +295,7 @@ On the **host** (wgpu / ash), before any of this runs on device:
 
 There is no compiler type-checking behind raw `asm!`, and this crate can't compile a SPIR-V
 shader in a normal `cargo build`, so treat the blocks above as a **correct-by-the-grammar
-starting point, not tested code**. Verify the same way `spmd-test` verifies its subgroup
+starting point, not tested code**. Verify the same way `hydroplane-test` verifies its subgroup
 shaders:
 
 1. `cargo gpu build … --target spirv-unknown-vulkan1.3` — forces the backend code into real

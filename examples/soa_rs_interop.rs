@@ -1,11 +1,11 @@
 //! Interop with the [`soa-rs`](https://docs.rs/soa-rs) crate: write your data as an ordinary
-//! `#[derive(Soars)]` struct, then run an `spmd` kernel over its field slices — either
+//! `#[derive(Soars)]` struct, then run an `hydroplane` kernel over its field slices — either
 //! zero-copy in place, or via the one-line `Soa::from_columns` bridge.
 //!
 //! Run with `cargo run --example soa_rs_interop`.
 
 use soa_rs::{Soars, soa};
-use spmd::{Backend, Kernel, Simd, dispatch};
+use hydroplane::{Backend, Kernel, Simd, dispatch};
 
 #[derive(Soars, Debug, Clone, Copy)]
 struct Sphere {
@@ -69,8 +69,8 @@ fn main() {
     println!("borrow  hit  near (5,0,0): {}", query([5.2, 0.0, 0.0, 0.1])); // true
     println!("borrow  miss near (2,0,0): {}", query([2.0, 0.0, 0.0, 0.1])); // false
 
-    // Copy bridge: build a padded `spmd::Soa` from the same field slices when you'd rather
+    // Copy bridge: build a padded `hydroplane::Soa` from the same field slices when you'd rather
     // reuse a padded-column kernel. (Here just shown converting; same data either way.)
-    let cols = spmd::Soa::from_columns(&[s.x(), s.y(), s.z(), s.r()], &[0.0, 0.0, 0.0, f32::NAN]);
+    let cols = hydroplane::Soa::from_columns(&[s.x(), s.y(), s.z(), s.r()], &[0.0, 0.0, 0.0, f32::NAN]);
     println!("bridged columns: {} rows, padded to {}", cols.len(), cols.padded());
 }

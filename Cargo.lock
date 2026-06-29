@@ -202,6 +202,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydroplane"
+version = "0.0.1"
+dependencies = [
+ "criterion",
+ "half",
+ "libm",
+ "rand",
+ "soa-rs",
+ "spirv-std",
+]
+
+[[package]]
 name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -460,18 +472,6 @@ name = "spirv-std-types"
 version = "0.10.0-alpha.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28b7ffce7843c3a9f5d5d2b9c21402d4cd026c26780b2f16a3cd6de3e6436230"
-
-[[package]]
-name = "spmd"
-version = "0.0.1"
-dependencies = [
- "criterion",
- "half",
- "libm",
- "rand",
- "soa-rs",
- "spirv-std",
-]
 
 [[package]]
 name = "syn"

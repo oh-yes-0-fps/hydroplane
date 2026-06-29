@@ -6,7 +6,7 @@
 
 #[cfg(target_arch = "aarch64")]
 fn main() {
-    use spmd::arch::sve1::*;
+    use hydroplane::arch::sve1::*;
 
     if !std::arch::is_aarch64_feature_detected!("sve") {
         println!("SVE_NOT_PRESENT");
@@ -138,11 +138,11 @@ fn main() {
         }
     }
 
-    // End-to-end dispatch: `spmd::dispatch` must pick an `Sve<C>` token here (non-Apple aarch64),
+    // End-to-end dispatch: `hydroplane::dispatch` must pick an `Sve<C>` token here (non-Apple aarch64),
     // not NEON. Proof: the chosen f32 backend reports `C/4` lanes = VL/4 (8 at 256-bit, 16 at
     // 512-bit), whereas NEON is always 4. Also check the dispatched result against a scalar sum.
     {
-        use spmd::{Backend, Kernel, Simd, dispatch};
+        use hydroplane::{Backend, Kernel, Simd, dispatch};
 
         struct SumKernel<'a> {
             xs: &'a [f32],
@@ -174,7 +174,7 @@ fn main() {
             println!("FAIL dispatch sum: {sum} vs {want}");
             fails += 1;
         }
-        let vl = spmd::arch::sve2::vl_bytes();
+        let vl = hydroplane::arch::sve2::vl_bytes();
         let c = if vl >= 64 { 64 } else if vl >= 32 { 32 } else { 16 };
         if lanes != c / 4 {
             println!("FAIL dispatch picked {lanes} f32 lanes, expected SVE {} (VL {vl}B)", c / 4);

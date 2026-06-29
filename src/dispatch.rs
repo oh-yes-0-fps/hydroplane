@@ -159,7 +159,7 @@ macro_rules! arm_dispatch_tail {
 }
 pub(crate) use arm_dispatch_tail;
 
-/// A unit of work generic over the execution backend. Implement this once; `spmd` runs it on
+/// A unit of work generic over the execution backend. Implement this once; `hydroplane` runs it on
 /// the backend it selects, handing your [`run`](Kernel::run) a [`Simd`] context to build
 /// varying values through (`splat`, `load`, …). Reach the raw [`Backend`] token, if you need
 /// it, via [`Simd::backend`].

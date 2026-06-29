@@ -1,7 +1,7 @@
 //! `kernel!` macro: the generated kernels must behave exactly like the hand-written struct+impl
 //! form, for both the element-wise and matrix flavours, including lifetimes and const generics.
 
-use spmd::{Scalar, kernel};
+use hydroplane::{Scalar, kernel};
 
 // Element-wise kernel: lifetime + scalar generic `T`, borrowed slice + a small array param.
 kernel! {

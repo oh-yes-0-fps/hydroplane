@@ -1,4 +1,6 @@
-# spmd
+# hydroplane
+
+*Floating but fast.*
 
 Float-agnostic, ISPC-style SPMD/SIMD infrastructure for Rust. Write one kernel generic
 over the scalar element (`f32`, `f64`, and `half`'s `f16`/`bf16`) and the execution
@@ -11,7 +13,7 @@ like [`wreck`](../).
 
 Existing crates each miss something: `pulp` isn't generic over the scalar and has no f16;
 `wide` fixes lane width at compile time; `std::simd` is nightly; `simba` has no runtime
-dispatch or f16. `spmd` is a thin unifier: one generic-over-scalar `Backend` trait, with
+dispatch or f16. `hydroplane` is a thin unifier: one generic-over-scalar `Backend` trait, with
 the SIMD hand-written via intrinsics so instruction selection (FMA, native f16, AVX-512
 `k`-masks) is fully under control and everything stays on stable.
 
@@ -23,7 +25,7 @@ operator-overloaded `Lane`/`Mask` varying values through it, so the body reads l
 Rust but runs as SIMD:
 
 ```rust
-use spmd::{Backend, Kernel, Scalar, Simd, Soa, SimdDispatch, dispatch};
+use hydroplane::{Backend, Kernel, Scalar, Simd, Soa, SimdDispatch, dispatch};
 
 // sphere–sphere "does the query overlap any sphere?" — written ONCE, runs for
 // f32/f64/f16 on scalar/SSE4/AVX2/AVX-512/NEON.
@@ -63,7 +65,7 @@ the un-wrapped op API, via `ctx.backend()`.
 
 ```rust
 // Picks the widest backend the running CPU supports and runs the kernel.
-let hit = spmd::dispatch(MyKernel { /* … */ });
+let hit = hydroplane::dispatch(MyKernel { /* … */ });
 ```
 
 - **Runtime** (default, std): `is_x86_feature_detected!` selects AVX-512 → AVX2 → SSE4 →
@@ -75,7 +77,7 @@ let hit = spmd::dispatch(MyKernel { /* … */ });
 - **no-std**: with no runtime detection, the widest ISA the build guarantees via
   `target_feature` is taken.
 - `ScalarBackend` is always the fallback, so every scalar type has a path.
-  [`run_scalar`](https://docs.rs/spmd) forces it directly — handy as a correctness oracle or
+  [`run_scalar`](https://docs.rs/hydroplane) forces it directly — handy as a correctness oracle or
   baseline.
 
 ## f16 / bf16
@@ -92,11 +94,11 @@ let hit = spmd::dispatch(MyKernel { /* … */ });
 ## soa-rs interop
 
 Already storing your data with [`soa-rs`](https://docs.rs/soa-rs)? Its `#[derive(Soars)]`
-fields are plain `&[T]` slices, so `spmd` runs over them with no glue type — two ways:
+fields are plain `&[T]` slices, so `hydroplane` runs over them with no glue type — two ways:
 
 ```rust
 use soa_rs::{Soars, soa};
-use spmd::{Backend, Kernel, Simd, dispatch};
+use hydroplane::{Backend, Kernel, Simd, dispatch};
 
 #[derive(Soars, Clone, Copy)]
 struct Sphere { x: f32, y: f32, z: f32, r: f32 }
@@ -117,8 +119,8 @@ impl Kernel<f32> for MyKernel<'_> {
 }
 let hit = dispatch(MyKernel { xs: s.x(), ys: s.y(), zs: s.z(), rs: s.r(), q });
 
-// Copy bridge: one line into a padded `spmd::Soa`, then reuse a padded-column kernel verbatim.
-let cols = spmd::Soa::from_columns(&[s.x(), s.y(), s.z(), s.r()], &[0.0, 0.0, 0.0, f32::NAN]);
+// Copy bridge: one line into a padded `hydroplane::Soa`, then reuse a padded-column kernel verbatim.
+let cols = hydroplane::Soa::from_columns(&[s.x(), s.y(), s.z(), s.r()], &[0.0, 0.0, 0.0, f32::NAN]);
 ```
 
 `load_partial`/`store_partial`/`chunks` are general (they work on any `&[T]`, no `soa-rs`

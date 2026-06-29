@@ -1,9 +1,9 @@
 //! The ported sphere kernel must give identical hit/miss results to a brute-force reference
-//! — for f32 and f64, on whatever backend `dispatch` selects. This is the `spmd` analogue of
+//! — for f32 and f64, on whatever backend `dispatch` selects. This is the `hydroplane` analogue of
 //! `wreck`'s "0 mismatches vs CPU" methodology.
 
 use rand::Rng;
-use spmd::{Backend, Kernel, Scalar, Simd, SimdDispatch, Soa, dispatch};
+use hydroplane::{Backend, Kernel, Scalar, Simd, SimdDispatch, Soa, dispatch};
 
 fn spheres_soa<T: Scalar>(rows: &[[T; 4]]) -> Soa<T> {
     let mut soa = Soa::with_pad_fills(&[T::ZERO, T::ZERO, T::ZERO, T::from_f64(f64::NAN)]);
@@ -89,7 +89,7 @@ fn run_for<T: Scalar + SimdDispatch>(to: impl Fn(f64) -> T) {
                 to(rng.random_range(0.1..1.5)),
             ];
             let want = naive(&rows, q);
-            let scalar = spmd::run_scalar(AnyOverlap { soa: &soa, q });
+            let scalar = hydroplane::run_scalar(AnyOverlap { soa: &soa, q });
             let dispatched = dispatch(AnyOverlap { soa: &soa, q });
             assert_eq!(scalar, want, "scalar vs naive (n={n})");
             assert_eq!(dispatched, want, "dispatched vs naive (n={n})");

@@ -113,7 +113,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28b7ffce7843c3a9f5d5d2b9c21402d4cd026c26780b2f16a3cd6de3e6436230"
 
 [[package]]
-name = "spmd"
+name = "hydroplane"
 version = "0.0.1"
 dependencies = [
  "half",
@@ -121,12 +121,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "spmd-test"
+name = "hydroplane-test"
 version = "0.0.0"
 dependencies = [
  "half",
  "spirv-std",
- "spmd",
+ "hydroplane",
 ]
 
 [[package]]

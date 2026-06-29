@@ -8,7 +8,7 @@
 //! that runs `dispatch` for you:
 //!
 //! ```ignore
-//! spmd::kernel! {
+//! hydroplane::kernel! {
 //!     /// Any sphere overlapping the query?
 //!     pub fn any_overlap['a, T: Scalar](ctx, soa: &'a Soa<T>, q: [T; 4]) -> bool {
 //!         // `ctx`, `soa`, `q` are all in scope; write the kernel body directly.

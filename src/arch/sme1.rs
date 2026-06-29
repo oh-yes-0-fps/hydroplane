@@ -4,7 +4,7 @@
 //! with `.arch_extension sme` so the integrated assembler accepts the SME mnemonics, then closes
 //! with `.arch_extension nosme` to restore state — so this whole module builds on **stable**, the
 //! same way [`super::sve1`] uses the stable `sve` feature. The mnemonics still only *execute* where
-//! SME is implemented (e.g. Apple M4+, some server ARM); on Apple, spmd prefers NEON + Accelerate
+//! SME is implemented (e.g. Apple M4+, some server ARM); on Apple, hydroplane prefers NEON + Accelerate
 //! (see [`super::select`]), so this path serves non-Apple SME hosts.
 //!
 //! The headline op is [`mma_f32`] (& `_f64`/`_f16`/`_bf16`): a register-tile GEMM `D = C + A·B`

@@ -3,7 +3,7 @@
 # diff them. The backend is a compile-time choice, so each pass is a separate compilation:
 #
 #   1. default build              → Apple Accelerate (cblas → AMX/SME), saved as baseline "accelerate"
-#   2. `--cfg no_apple_accelerate` → spmd's hand-rolled SME2 grid kernel, compared vs that baseline
+#   2. `--cfg no_apple_accelerate` → hydroplane's hand-rolled SME2 grid kernel, compared vs that baseline
 #
 # Criterion prints the per-size % change of the SME path against Accelerate (with p-values). Any extra
 # args are forwarded to criterion, e.g. a quick pass:

@@ -1,4 +1,4 @@
-use spmd::{Layout, MatrixBackend, MatrixKernel, Scalar, Simd, dispatch_matrix, run_matrix_scalar};
+use hydroplane::{Layout, MatrixBackend, MatrixKernel, Scalar, Simd, dispatch_matrix, run_matrix_scalar};
 
 struct Gemm<'a, T: Scalar, const M: usize, const N: usize, const K: usize> {
     a: &'a [T],

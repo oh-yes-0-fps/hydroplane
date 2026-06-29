@@ -1,4 +1,4 @@
-//! Execution test for the SME ZA matrix engine (`spmd::arch::sme1`), run against a scalar GEMM
+//! Execution test for the SME ZA matrix engine (`hydroplane::arch::sme1`), run against a scalar GEMM
 //! reference. SME instructions are emitted via raw `asm!` (stable; see `sme1.rs`), so they compile
 //! on any aarch64 target but only *run* where SME is implemented — this test detects SME at runtime
 //! (macOS `sysctl`, Linux `HWCAP2`) and skips with a note where it's absent (e.g. QEMU, M1–M3).
@@ -36,7 +36,7 @@ fn sme_present() -> bool {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        spmd::arch::sme1::is_supported()
+        hydroplane::arch::sme1::is_supported()
     }
 }
 
@@ -64,7 +64,7 @@ fn sme2_present() -> bool {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        spmd::arch::sme2::is_supported()
+        hydroplane::arch::sme2::is_supported()
     }
 }
 
@@ -100,7 +100,7 @@ fn sme_mma_f32() {
     let mut want = c.clone();
     ref_gemm(M, N, K, &a, &b, &mut want);
     unsafe {
-        spmd::arch::sme1::mma_f32::<M, N, K>(a.as_ptr(), K, b.as_ptr(), N, c.as_mut_ptr(), N);
+        hydroplane::arch::sme1::mma_f32::<M, N, K>(a.as_ptr(), K, b.as_ptr(), N, c.as_mut_ptr(), N);
     }
     assert!(maxabs_err(&c, &want) < 1e-3, "f32: {c:?} vs {want:?}");
 }
@@ -113,7 +113,7 @@ fn check_wide<const M: usize, const N: usize, const K: usize>() {
     let mut want = c.clone();
     ref_gemm(M, N, K, &a, &b, &mut want);
     unsafe {
-        spmd::arch::sme2::mma_f32_wide::<M, N, K>(a.as_ptr(), K, b.as_ptr(), N, c.as_mut_ptr(), N);
+        hydroplane::arch::sme2::mma_f32_wide::<M, N, K>(a.as_ptr(), K, b.as_ptr(), N, c.as_mut_ptr(), N);
     }
     assert!(maxabs_err(&c, &want) < 1e-3, "wide {M}x{N}x{K}: {c:?} vs {want:?}");
 }
@@ -147,7 +147,7 @@ fn check_wide_f64<const M: usize, const N: usize, const K: usize>() {
         }
     }
     unsafe {
-        spmd::arch::sme2::mma_f64_wide::<M, N, K>(a.as_ptr(), K, b.as_ptr(), N, c.as_mut_ptr(), N);
+        hydroplane::arch::sme2::mma_f64_wide::<M, N, K>(a.as_ptr(), K, b.as_ptr(), N, c.as_mut_ptr(), N);
     }
     let err = c.iter().zip(&want).fold(0.0f64, |m, (&g, &w)| m.max((g - w).abs()));
     assert!(err < 1e-9, "wide f64 {M}x{N}x{K} err={err}");
@@ -169,7 +169,7 @@ fn check_wide_f16<const M: usize, const N: usize, const K: usize>() {
         &mut want,
     );
     unsafe {
-        spmd::arch::sme2::mma_f16_wide::<M, N, K>(a16.as_ptr(), K, b16.as_ptr(), N, c.as_mut_ptr(), N);
+        hydroplane::arch::sme2::mma_f16_wide::<M, N, K>(a16.as_ptr(), K, b16.as_ptr(), N, c.as_mut_ptr(), N);
     }
     let got: Vec<f32> = c.iter().map(|x| x.to_f32()).collect();
     assert!(maxabs_err(&got, &want) < 5e-2, "wide f16 {M}x{N}x{K}: {got:?} vs {want:?}");
@@ -204,7 +204,7 @@ fn check_wide_bf16<const M: usize, const N: usize, const K: usize>() {
         &mut want,
     );
     unsafe {
-        spmd::arch::sme2::mma_bf16_wide::<M, N, K>(a.as_ptr(), K, b.as_ptr(), N, c.as_mut_ptr(), N);
+        hydroplane::arch::sme2::mma_bf16_wide::<M, N, K>(a.as_ptr(), K, b.as_ptr(), N, c.as_mut_ptr(), N);
     }
     // bf16 inputs round, but the BFMOPA accumulate is f32 — error is just the bf16 input rounding.
     assert!(maxabs_err(&c, &want) < 1e-1, "wide bf16 {M}x{N}x{K}: {c:?} vs {want:?}");
@@ -260,7 +260,7 @@ fn sme_mma_f64() {
         }
     }
     unsafe {
-        spmd::arch::sme1::mma_f64::<M, N, K>(a.as_ptr(), K, b.as_ptr(), N, c.as_mut_ptr(), N);
+        hydroplane::arch::sme1::mma_f64::<M, N, K>(a.as_ptr(), K, b.as_ptr(), N, c.as_mut_ptr(), N);
     }
     let err = c.iter().zip(&want).fold(0.0f64, |m, (&g, &w)| m.max((g - w).abs()));
     assert!(err < 1e-9, "f64 err={err}: {c:?} vs {want:?}");
@@ -292,7 +292,7 @@ fn sme_mma_half() {
         &mut want16,
     );
     unsafe {
-        spmd::arch::sme1::mma_f16::<M, N, K>(a16.as_ptr(), K, b16.as_ptr(), N, c16.as_mut_ptr(), N);
+        hydroplane::arch::sme1::mma_f16::<M, N, K>(a16.as_ptr(), K, b16.as_ptr(), N, c16.as_mut_ptr(), N);
     }
     let got16: Vec<f32> = c16.iter().map(|x| x.to_f32()).collect();
     assert!(maxabs_err(&got16, &want16) < 5e-2, "f16: {got16:?} vs {want16:?}");
@@ -310,7 +310,7 @@ fn sme_mma_half() {
         &mut wantb,
     );
     unsafe {
-        spmd::arch::sme1::mma_bf16::<M, N, K>(ab.as_ptr(), K, bb.as_ptr(), N, cb.as_mut_ptr(), N);
+        hydroplane::arch::sme1::mma_bf16::<M, N, K>(ab.as_ptr(), K, bb.as_ptr(), N, cb.as_mut_ptr(), N);
     }
     assert!(maxabs_err(&cb, &wantb) < 1e-1, "bf16: {cb:?} vs {wantb:?}");
 }

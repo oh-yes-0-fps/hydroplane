@@ -1,9 +1,9 @@
 [package]
-name = "spmd-test"
+name = "hydroplane-test"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "rust-gpu shader crate exercising spmd's SPIR-V subgroup backend (compile + disasm + on-device testing)."
+description = "rust-gpu shader crate exercising hydroplane's SPIR-V subgroup backend (compile + disasm + on-device testing)."
 
 # Isolate this crate's lockfile from any ancestor; it builds only via cargo-gpu for SPIR-V.
 [workspace]
@@ -15,7 +15,7 @@ crate-type = ["dylib", "lib"]
 panic = "abort"
 
 [dependencies]
-spmd = { path = "..", default-features = false }
+hydroplane = { path = "..", default-features = false }
 spirv-std = "=0.10.0-alpha.1"
 half = { version = "2", default-features = false }
 # glam is pulled transitively by spirv-std (and re-exported as `spirv_std::glam`). spirv-std

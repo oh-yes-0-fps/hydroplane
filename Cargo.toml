@@ -1,9 +1,9 @@
 [package]
-name = "spmd"
+name = "hydroplane"
 version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
-description = "Float-agnostic, ISPC-style SPMD/SIMD infrastructure: write one kernel generic over the scalar element (f32/f64/f16/bf16) and run it with runtime ISA dispatch."
+description = "Floating but fast: float-agnostic, ISPC-style SPMD/SIMD infrastructure — write one kernel generic over the scalar element (f32/f64/f16/bf16) and run it with runtime ISA dispatch."
 repository = "https://github.com/valstad-shipworks/wreck"
 
 [features]

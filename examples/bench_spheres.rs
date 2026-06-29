@@ -7,7 +7,7 @@
 
 use std::time::Instant;
 
-use spmd::{Backend, Scalar, Simd, Soa};
+use hydroplane::{Backend, Scalar, Simd, Soa};
 
 fn spheres_soa<T: Scalar>(rows: &[[T; 4]]) -> Soa<T> {
     let mut soa = Soa::with_pad_fills(&[T::ZERO, T::ZERO, T::ZERO, T::from_f64(f64::NAN)]);
@@ -45,7 +45,7 @@ fn any_overlap<T: Scalar, S: Backend<T>>(ctx: Simd<T, S>, soa: &Soa<T>, q: [T; 4
     false
 }
 
-fn bench<T: spmd::SimdDispatch>(label: &str, to: impl Fn(f64) -> T) {
+fn bench<T: hydroplane::SimdDispatch>(label: &str, to: impl Fn(f64) -> T) {
     // A batch the query (mostly) misses, so the kernel scans the whole SoA — worst case.
     let n = 4096;
     let rows: Vec<[T; 4]> = (0..n)
@@ -66,7 +66,7 @@ fn bench<T: spmd::SimdDispatch>(label: &str, to: impl Fn(f64) -> T) {
     let mut acc = 0u64;
     for _ in 0..iters {
         for q in &queries {
-            acc += spmd::run_scalar(Query { soa: &soa, q: *q }) as u64;
+            acc += hydroplane::run_scalar(Query { soa: &soa, q: *q }) as u64;
         }
     }
     let scalar = t0.elapsed();
@@ -76,7 +76,7 @@ fn bench<T: spmd::SimdDispatch>(label: &str, to: impl Fn(f64) -> T) {
     let mut acc2 = 0u64;
     for _ in 0..iters {
         for q in &queries {
-            acc2 += spmd::dispatch(Query { soa: &soa, q: *q }) as u64;
+            acc2 += hydroplane::dispatch(Query { soa: &soa, q: *q }) as u64;
         }
     }
     let simd = t1.elapsed();
@@ -95,7 +95,7 @@ struct Query<'a, T: Scalar> {
     soa: &'a Soa<T>,
     q: [T; 4],
 }
-impl<T: Scalar> spmd::Kernel<T> for Query<'_, T> {
+impl<T: Scalar> hydroplane::Kernel<T> for Query<'_, T> {
     type Output = bool;
     fn run<S: Backend<T>>(self, simd: Simd<T, S>) -> bool {
         any_overlap(simd, self.soa, self.q)

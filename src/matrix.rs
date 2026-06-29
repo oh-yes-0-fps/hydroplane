@@ -312,19 +312,30 @@ fn simd_gemm<C: Scalar, B: Backend<C>, const M: usize, const N: usize, const K: 
 ///   serializes on the `fma` latency (≈¼ throughput); the independent chains hide it, and each
 ///   loaded B vector feeds `MR` rows / each broadcast A feeds `NR` columns, cutting load traffic.
 ///
+/// `MR·NR` is the same superscalar saturation target as the vector reductions — the caller sizes
+/// `NR` from the cached per-core unroll factor (`Gang::unroll`), capped to fit the SIMD register
+/// file (`MR·NR + NR + 1` registers): `4×2 = 8` on AVX2/SSE (16 regs), `4×3`/`4×4` on aarch64 and
+/// AVX-512 (32 regs) so a wide FP unit isn't left idle.
+///
 /// Numerically identical to [`simd_gemm`] (same per-element `fma` order). Worth it only for large
-/// tiles — the caller gates on size. `MR·NR + NR + 1 ≤ 16` keeps it within the AVX2 register file.
+/// tiles — the caller gates on size.
 #[cfg(feature = "std")]
 #[inline]
 #[allow(clippy::needless_range_loop)]
-fn packed_gemm<C: Scalar, B: Backend<C>, const M: usize, const N: usize, const K: usize>(
+fn packed_gemm<
+    C: Scalar,
+    B: Backend<C>,
+    const M: usize,
+    const N: usize,
+    const K: usize,
+    const MR: usize,
+    const NR: usize,
+>(
     backend: B,
     a: [[C; K]; M],
     b: [[C; N]; K],
     mut c: [[C; N]; M],
 ) -> [[C; N]; M] {
-    const MR: usize = 4;
-    const NR: usize = 2; // vectors wide
     let lanes = backend.lanes();
     let nb = N / lanes;
     let (full, panel) = (nb * lanes, K * lanes);
@@ -1171,7 +1182,22 @@ where
     // already L1-resident, where the pack pass wouldn't pay for itself.
     #[cfg(feature = "std")]
     if M >= 32 && N >= 32 && K >= 32 {
-        return packed_gemm(backend, ac, bc, c);
+        // Size the MR×NR register block to this core's saturation point — the same cached unroll
+        // factor the vector reductions use, taken to 2-D. `~k` independent accumulator chains,
+        // capped to fit the SIMD register file with scratch to spare (`5*NR + 1 <= REGS - 2`).
+        const REGS: usize = if cfg!(target_arch = "aarch64") || cfg!(target_feature = "avx512f") {
+            32
+        } else {
+            16
+        };
+        let k = crate::varying::Gang::<T::Compute, S>::new(backend).unroll();
+        let by_regs = (REGS - 3) / 5;
+        let nr = k.div_ceil(4).clamp(2, by_regs).min(4);
+        return match nr {
+            2 => packed_gemm::<_, _, M, N, K, 4, 2>(backend, ac, bc, c),
+            3 => packed_gemm::<_, _, M, N, K, 4, 3>(backend, ac, bc, c),
+            _ => packed_gemm::<_, _, M, N, K, 4, 4>(backend, ac, bc, c),
+        };
     }
     simd_gemm(backend, ac, bc, c)
 }
@@ -1368,10 +1394,10 @@ impl_array_matrix_backend!(crate::backend::subgroup::Subgroup, scalar);
 
 use core::marker::PhantomData;
 
-use crate::varying::Simd;
+use crate::varying::Gang;
 
-/// The tile/MMA surface reached from a [`Simd`] context via [`Simd::tiles`]. The matrix analogue
-/// of building [`Lane`](crate::Lane)s through `Simd`.
+/// The tile/MMA surface reached from a [`Gang`] context via [`Gang::tiles`]. The matrix analogue
+/// of building [`Lane`](crate::Lane)s through `Gang`.
 #[derive(Clone, Copy)]
 pub struct Tiles<T: Scalar, S: MatrixBackend<T>> {
     backend: S,
@@ -1395,7 +1421,7 @@ pub struct Tile<
     _p: PhantomData<(T, Ro)>,
 }
 
-impl<T: Scalar, S: MatrixBackend<T>> Simd<T, S> {
+impl<T: Scalar, S: MatrixBackend<T>> Gang<T, S> {
     /// Gateway to the tile / matrix-multiply surface.
     #[inline(always)]
     pub fn tiles(self) -> Tiles<T, S> {
@@ -1557,13 +1583,13 @@ impl<'a, T: Scalar, S: MatrixBackend<T>, E: Scalar, const R: usize, const C: usi
 /// also supports tiles. Run with [`run_matrix_scalar`] (oracle) or `dispatch`-style selection.
 pub trait MatrixKernel<T: Scalar> {
     type Output;
-    fn run<S: MatrixBackend<T>>(self, ctx: Simd<T, S>) -> Self::Output;
+    fn run<S: MatrixBackend<T>>(self, ctx: Gang<T, S>) -> Self::Output;
 }
 
 /// Run a matmul kernel on the always-available scalar backend (correctness oracle / baseline).
 #[inline]
 pub fn run_matrix_scalar<T: Scalar, K: MatrixKernel<T>>(kernel: K) -> K::Output {
-    kernel.run(Simd::new(crate::backend::ScalarBackend))
+    kernel.run(Gang::new(crate::backend::ScalarBackend))
 }
 
 /// Per-scalar dispatch policy for matmul kernels — the [`SimdDispatch`](crate::SimdDispatch)
@@ -1587,13 +1613,13 @@ macro_rules! impl_matrix_dispatch_simd {
                 #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "std"))]
                 {
                     if let Some(b) = crate::backend::avx512::Avx512::detect() {
-                        return kernel.run(Simd::new(b));
+                        return kernel.run(Gang::new(b));
                     }
                     if let Some(b) = crate::backend::avx2::Avx2::detect() {
-                        return kernel.run(Simd::new(b));
+                        return kernel.run(Gang::new(b));
                     }
                     if let Some(b) = crate::backend::sse4::Sse4::detect() {
-                        return kernel.run(Simd::new(b));
+                        return kernel.run(Gang::new(b));
                     }
                 }
                 // aarch64: non-Apple SVE token (its `mma` lands on the SME ZA engine where present),
@@ -1605,7 +1631,7 @@ macro_rules! impl_matrix_dispatch_simd {
                 $( crate::dispatch::$arm_tail!(kernel); )?
                 // wasm32: relaxed-simd else simd128, both using the register-blocked array GEMM.
                 crate::dispatch::wasm_dispatch_tail!(kernel);
-                kernel.run(Simd::new(crate::backend::ScalarBackend))
+                kernel.run(Gang::new(crate::backend::ScalarBackend))
             }
         }
     };
@@ -1615,7 +1641,7 @@ impl_matrix_dispatch_simd!(f32, arm_dispatch_tail);
 impl_matrix_dispatch_simd!(f64);
 
 mod half_matrix_dispatch {
-    use super::{MatrixDispatch, MatrixKernel, Simd};
+    use super::{MatrixDispatch, MatrixKernel, Gang};
     use half::{bf16, f16};
 
     // f16 matmul widens to f32 (the `T::Compute` accumulator), so the AVX2 F16C tile backend applies
@@ -1630,11 +1656,11 @@ mod half_matrix_dispatch {
             #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "std"))]
             {
                 if let Some(b) = crate::backend::avx2::Avx2::detect() {
-                    return kernel.run(Simd::new(b));
+                    return kernel.run(Gang::new(b));
                 }
             }
             crate::dispatch::aarch64_dispatch_tail!(kernel, crate::backend::ScalarBackend);
-            kernel.run(Simd::new(crate::backend::ScalarBackend))
+            kernel.run(Gang::new(crate::backend::ScalarBackend))
         }
     }
 
@@ -1647,15 +1673,67 @@ mod half_matrix_dispatch {
             #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "std"))]
             {
                 if let Some(b) = crate::backend::avx512::Avx512::detect() {
-                    return kernel.run(Simd::new(b));
+                    return kernel.run(Gang::new(b));
                 }
                 if let Some(b) = crate::backend::avx2::Avx2::detect() {
-                    return kernel.run(Simd::new(b));
+                    return kernel.run(Gang::new(b));
                 }
             }
             crate::dispatch::aarch64_dispatch_tail!(kernel, crate::backend::neon::Neon::new());
             crate::dispatch::wasm_dispatch_tail!(kernel);
-            kernel.run(Simd::new(crate::backend::ScalarBackend))
+            kernel.run(Gang::new(crate::backend::ScalarBackend))
         }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod packed_parity {
+    use crate::{Backend, Gang, Kernel, dispatch};
+
+    const M: usize = 9;
+    const N: usize = 22;
+    const K: usize = 7;
+
+    #[allow(clippy::needless_range_loop, clippy::type_complexity)]
+    fn data() -> ([[f32; K]; M], [[f32; N]; K], [[f32; N]; M]) {
+        let mut a = [[0.0f32; K]; M];
+        let mut b = [[0.0f32; N]; K];
+        let mut c = [[0.0f32; N]; M];
+        for i in 0..M {
+            for k in 0..K {
+                a[i][k] = ((i * K + k) as f32 * 0.13).sin();
+            }
+        }
+        for k in 0..K {
+            for j in 0..N {
+                b[k][j] = ((k * N + j) as f32 * 0.07).cos();
+            }
+        }
+        for i in 0..M {
+            for j in 0..N {
+                c[i][j] = ((i + j) as f32 * 0.01) - 0.5;
+            }
+        }
+        (a, b, c)
+    }
+
+    struct Probe;
+    impl Kernel<f32> for Probe {
+        type Output = ();
+        fn run<S: Backend<f32>>(self, ctx: Gang<f32, S>) {
+            let be = ctx.backend();
+            let (a, b, c) = data();
+            // Every register-block width the dispatcher can pick must match `simd_gemm` exactly —
+            // same per-element `fma` order, so bit-equal, not merely close.
+            let want = super::simd_gemm::<f32, S, M, N, K>(be, a, b, c);
+            assert_eq!(super::packed_gemm::<_, _, M, N, K, 4, 2>(be, a, b, c), want);
+            assert_eq!(super::packed_gemm::<_, _, M, N, K, 4, 3>(be, a, b, c), want);
+            assert_eq!(super::packed_gemm::<_, _, M, N, K, 4, 4>(be, a, b, c), want);
+        }
+    }
+
+    #[test]
+    fn packed_matches_simd_every_block_width() {
+        dispatch(Probe);
     }
 }

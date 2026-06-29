@@ -7,10 +7,13 @@ description = "Floating but fast: float-agnostic, ISPC-style SPMD/SIMD infrastru
 repository = "https://github.com/valstad-shipworks/wreck"
 
 [features]
-default = ["std"]
+default = ["std", "macros"]
 std = ["alloc", "half/std"]
 alloc = []
 libm = ["dep:libm"]
+# The `#[kernel]` attribute (proc-macro). On by default; disable for a build with no proc-macro
+# dependency — the `macro_rules!` `kernel!` fallback then takes over.
+macros = ["dep:hydroplane-macros"]
 
 # Declare `target_arch = "spirv"` (the rust-gpu target) and the opt-out `no_apple_accelerate`
 # cfg as known, so the platform-specific `#[cfg]`s don't trip the unexpected_cfgs lint.
@@ -21,6 +24,7 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(no_sve)',
     'cfg(no_sme)',
     'cfg(no_amx)',
+    'cfg(no_ilp)',
     'cfg(neon_over_sve)',
 ] }
 
@@ -28,6 +32,7 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 # f16/bf16 element support (widen-to-f32 compute path; native AVX-512-FP16 / NEON-fp16 lanes layer
 # on top where the target supports them). Always present — `f16`/`bf16` are re-exported from the crate root.
 half = { version = "2", default-features = false }
+hydroplane-macros = { version = "0.0.1", path = "hydroplane-macros", optional = true }
 libm = { version = "0.2", optional = true }
 
 # rust-gpu subgroup intrinsics — only pulled in when compiling to SPIR-V.
@@ -38,9 +43,29 @@ spirv-std = "=0.10.0-alpha.1"
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 rand = "0.9"
 soa-rs = "1.0.0"
+wide = "1.5.0"
+
+# Use the `#[kernel]` attribute, so they only build with the (default) `macros` feature.
+[[example]]
+name = "spheres"
+required-features = ["macros"]
+
+[[example]]
+name = "micro_kernel"
+required-features = ["macros"]
+
+[[example]]
+name = "asm_probe"
+required-features = ["macros"]
 
 # Same f32 GEMM kernel through `dispatch_matrix`; compare default (Accelerate) vs
 # `--cfg no_apple_accelerate` (SME) via criterion baselines — see the file header.
 [[bench]]
 name = "gemm_accel_toggle"
 harness = false
+
+# `#[kernel]` micro-kernel (cached dispatch) vs hand-written `wide` SIMD vs scalar.
+[[bench]]
+name = "micro_vs_wide"
+harness = false
+required-features = ["macros"]

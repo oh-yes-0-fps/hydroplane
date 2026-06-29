@@ -19,17 +19,19 @@ the SIMD hand-written via intrinsics so instruction selection (FMA, native f16, 
 
 ## Writing a kernel
 
-You never name a backend. Implement [`Kernel`] once; its `run` receives a [`Simd`] context
-— `dispatch` builds it from the backend it picked by runtime CPU detection — and you build
-operator-overloaded `Lane`/`Mask` varying values through it, so the body reads like scalar
-Rust but runs as SIMD:
+You never name a backend. The `#[kernel]` attribute turns a plain generic function into the
+struct + [`Kernel`] impl + dispatching wrapper; its first parameter is the [`Gang`] context —
+`dispatch` builds it from the backend it picked by runtime CPU detection — and you build
+operator-overloaded `Lane`/`Mask` varying values through it, so the body reads like scalar Rust
+but runs as SIMD:
 
 ```rust
-use hydroplane::{Backend, Kernel, Scalar, Simd, Soa, SimdDispatch, dispatch};
+use hydroplane::{Scalar, Gang, Soa, kernel};
 
 // sphere–sphere "does the query overlap any sphere?" — written ONCE, runs for
 // f32/f64/f16 on scalar/SSE4/AVX2/AVX-512/NEON.
-fn any_overlap<T: Scalar, S: Backend<T>>(ctx: Simd<T, S>, soa: &Soa<T>, q: [T; 4]) -> bool {
+#[kernel]
+pub fn any_overlap<'a, T: Scalar>(ctx: Gang<T>, soa: &'a Soa<T>, q: [T; 4]) -> bool {
     let n = ctx.lanes();
     let (cx, cy, cz, sr) = (ctx.splat(q[0]), ctx.splat(q[1]), ctx.splat(q[2]), ctx.splat(q[3]));
     let (xs, ys, zs, rs) = (soa.column(0), soa.column(1), soa.column(2), soa.column(3));
@@ -46,14 +48,86 @@ fn any_overlap<T: Scalar, S: Backend<T>>(ctx: Simd<T, S>, soa: &Soa<T>, q: [T; 4
     false
 }
 
+// call site — no struct, no impl, no `dispatch`:
+let hit = any_overlap(&soa, q);
+```
+
+The leading parameters are contexts, each typed `Gang<T>` (the backend type argument is filled in for
+you); the scalar is the type parameter bound by `Scalar` (or named `T`, or set with
+`#[kernel(scalar = U)]`). Generics are ordinary `<…>` and may carry multiple bounds, where-clauses,
+and several lifetimes/type parameters.
+
+A kernel lists the execution surfaces it needs, in the order their context parameters appear:
+
+- `#[kernel(vector)]` (the default, also bare `#[kernel]`) — one `Backend<T>` context.
+- `#[kernel(matrix)]` — one [`MatrixKernel`] context with the `.tiles()` matmul surface;
+  dispatched via `dispatch_matrix`.
+- `#[kernel(vector, matrix)]` — two leading contexts in that order, both over the *same* dispatched
+  backend, so the first is a plain vector handle and the second a matrix handle:
+
+```rust
+#[kernel(vector, matrix)]
+fn gemm_and_reduce<'a, T: Scalar, const M: usize, const N: usize, const K: usize>(
+    v: Gang<T>, m: Gang<T>, a: &'a [T], b: &'a [T], out: &'a mut [T::Compute],
+) -> f64 {
+    m.tiles()/* …A·B into out… */;
+    let _ = v.lanes();      // same backend, vector surface
+    0.0
+}
+```
+
+**Tiny hot kernels** — backend selection inside `dispatch` is cached: each scalar resolves its
+runtime tier once into a process-global atomic, so a micro-kernel (a joint-limit check in an inner
+loop) is a load + `match` per call, not a fresh CPU probe. The scalar may be concrete — `fn
+any_gt(ctx: Gang<f32>, …)` infers `f32` from the context, no generic needed.
+
+**Reductions saturate the pipes for free** — a wide out-of-order core (Apple's ~4 NEON FP pipes, x86's
+2–3) runs at a fraction of peak if your reduction is one serial accumulator chain stalling on FMA
+latency. `zip_sum`/`sum` run several *independent* accumulator chains and combine them as a tree — and
+the chain count `K` is the per-core saturation point, **detected once and cached exactly like the
+backend**. You write the obvious sum and never mention ILP, accumulators, or `K`:
+
+```rust
+#[kernel]
+fn dot(ctx: Gang<f32>, a: &[f32], b: &[f32]) -> f32 {
+    ctx.zip_sum(a, b, |acc, x, y| x.fma(y, acc))   // K chains, all implied; one dispatch picks K
+}
+```
+
+The `0` identity supplies the seed, both masked-tail fills, and the chain combine. The warm-path cost
+is one relaxed atomic load + a `match` to the `K`-monomorphized loop. (For non-sum reductions —
+max/min/any — `zip_reduce` takes an explicit identity and combine.)
+
+**Kernel calling kernel** — every kernel also gets a `<name>_on(ctx, …)` companion that runs its body
+on a context you pass in, skipping dispatch. Call it from inside another kernel to reuse the outer
+kernel's already-dispatched backend, so dispatch happens *once* at the outer boundary:
+
+```rust
+#[kernel] fn scaled<'a, T: Scalar>(ctx: Gang<T>, xs: &'a [T], k: T) -> f64 { /* … */ }
+
+#[kernel]
+fn scaled_then_sum<'a, T: Scalar>(ctx: Gang<T>, xs: &'a [T], ys: &'a [T], k: T) -> f64 {
+    scaled_on(ctx, xs, k) + scaled_on(ctx, ys, k)   // one dispatch, two inner runs
+}
+```
+
+`#[kernel]` is the `macros` feature, on by default. It expands to exactly the hand-written form,
+which you can always write yourself when a kernel falls outside the attribute's shape:
+
+```rust
+use hydroplane::{Backend, Kernel, Scalar, Gang, Soa, SimdDispatch, dispatch};
+
 struct AnyOverlap<'a, T: Scalar> { soa: &'a Soa<T>, q: [T; 4] }
 impl<T: Scalar> Kernel<T> for AnyOverlap<'_, T> {
     type Output = bool;
-    fn run<S: Backend<T>>(self, ctx: Simd<T, S>) -> bool { any_overlap(ctx, self.soa, self.q) }
+    fn run<S: Backend<T>>(self, ctx: Gang<T, S>) -> bool { /* same body */ }
 }
 
 fn query<T: SimdDispatch>(soa: &Soa<T>, q: [T; 4]) -> bool { dispatch(AnyOverlap { soa, q }) }
 ```
+
+Building `--no-default-features` (no proc-macro dependency) swaps `#[kernel]` for a `macro_rules!`
+`kernel!` fallback of the same name with a slightly stricter syntax — see the `kernel_macro` module.
 
 Underneath sits the **engine**: `Backend<T: Scalar>`, one concrete impl per `(ISA, scalar)`.
 You write kernels generic over `S: Backend<T>`, but the concrete tokens (`Avx2`, `Avx512`,
@@ -98,7 +172,7 @@ fields are plain `&[T]` slices, so `hydroplane` runs over them with no glue type
 
 ```rust
 use soa_rs::{Soars, soa};
-use hydroplane::{Backend, Kernel, Simd, dispatch};
+use hydroplane::{Backend, Kernel, Gang, dispatch};
 
 #[derive(Soars, Clone, Copy)]
 struct Sphere { x: f32, y: f32, z: f32, r: f32 }
@@ -108,7 +182,7 @@ let s: soa_rs::Soa<Sphere> = soa![/* … */];
 // Zero-copy: walk the borrowed field slices in place. `chunks` yields full registers plus a
 // final short tail; `load_partial` stages the tail, filling inactive lanes with a sentinel.
 impl Kernel<f32> for MyKernel<'_> {
-    fn run<S: Backend<f32>>(self, ctx: Simd<f32, S>) -> bool {
+    fn run<S: Backend<f32>>(self, ctx: Gang<f32, S>) -> bool {
         for (k, cnt) in ctx.chunks(self.xs.len()) {
             let x = ctx.load_partial(&self.xs[k..k + cnt], 0.0);
             let r = ctx.load_partial(&self.rs[k..k + cnt], f32::NAN); // NaN tail ⇒ no false hit
@@ -143,10 +217,13 @@ src/backend.rs         Backend<T> trait + ScalarBackend (oracle / SPIR-V target)
 src/backend/{sse4,avx2,avx512}.rs   hand-rolled x86_64 intrinsics (avx2 incl. F16C f16)
 src/backend/avx512fp16.rs   native 32-wide f16 (nightly `f16-native`)
 src/backend/neon.rs    hand-rolled aarch64 NEON
-src/varying.rs         Lane / Mask / Simd surface + chunks / load_partial / store_partial
+src/varying.rs         Lane / Mask / Gang surface + chunks / load_partial / store_partial
 src/soa.rs             generic padded columnar SoA (NaN-padded tails) + from_columns bridge
-src/dispatch.rs        Kernel trait + runtime (default) / compile-time backend selection
+src/dispatch.rs        Kernel trait + runtime (cached, default) / compile-time backend selection
+src/ilp.rs             cached per-core unroll factor K (multi-accumulator reductions: zip_sum/reduce)
 src/backend/subgroup.rs   SPIR-V subgroup backend + portable size/decision policy
+src/kernel_macro.rs    `macro_rules!` `kernel!` fallback (only when the `macros` feature is off)
+hydroplane-macros/     proc-macro crate: the default `#[kernel]` attribute
 ```
 
 ## Verification

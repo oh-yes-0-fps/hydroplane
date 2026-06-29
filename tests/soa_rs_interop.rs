@@ -5,7 +5,7 @@
 
 use rand::Rng;
 use soa_rs::{Soars, soa};
-use hydroplane::{Backend, Kernel, Simd, dispatch};
+use hydroplane::{Backend, Kernel, Gang, dispatch};
 
 #[derive(Soars, Debug, Clone, Copy)]
 struct Sphere {
@@ -27,7 +27,7 @@ struct AnyOverlapBorrowed<'a> {
 }
 impl Kernel<f32> for AnyOverlapBorrowed<'_> {
     type Output = bool;
-    fn run<S: Backend<f32>>(self, ctx: Simd<f32, S>) -> bool {
+    fn run<S: Backend<f32>>(self, ctx: Gang<f32, S>) -> bool {
         let (cx, cy, cz, sr) = (
             ctx.splat(self.q[0]),
             ctx.splat(self.q[1]),
@@ -56,7 +56,7 @@ struct AnyOverlapPadded<'a> {
 }
 impl Kernel<f32> for AnyOverlapPadded<'_> {
     type Output = bool;
-    fn run<S: Backend<f32>>(self, ctx: Simd<f32, S>) -> bool {
+    fn run<S: Backend<f32>>(self, ctx: Gang<f32, S>) -> bool {
         let n = ctx.lanes();
         let (cx, cy, cz, sr) = (
             ctx.splat(self.q[0]),
@@ -145,7 +145,7 @@ fn store_partial_writes_back_into_soa_rs() {
     }
     impl Kernel<f32> for Scale<'_> {
         type Output = ();
-        fn run<S: Backend<f32>>(self, ctx: Simd<f32, S>) {
+        fn run<S: Backend<f32>>(self, ctx: Gang<f32, S>) {
             let kv = ctx.splat(self.k);
             for (i, cnt) in ctx.chunks(self.rs.len()) {
                 let v = ctx.load_partial(&self.rs[i..i + cnt], 0.0) * kv;

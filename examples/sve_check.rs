@@ -142,14 +142,14 @@ fn main() {
     // not NEON. Proof: the chosen f32 backend reports `C/4` lanes = VL/4 (8 at 256-bit, 16 at
     // 512-bit), whereas NEON is always 4. Also check the dispatched result against a scalar sum.
     {
-        use hydroplane::{Backend, Kernel, Simd, dispatch};
+        use hydroplane::{Backend, Kernel, Gang, dispatch};
 
         struct SumKernel<'a> {
             xs: &'a [f32],
         }
         impl Kernel<f32> for SumKernel<'_> {
             type Output = (usize, f32);
-            fn run<S: Backend<f32>>(self, simd: Simd<f32, S>) -> (usize, f32) {
+            fn run<S: Backend<f32>>(self, simd: Gang<f32, S>) -> (usize, f32) {
                 let b = simd.backend();
                 let lanes = b.lanes();
                 let mut acc = b.splat(0.0);

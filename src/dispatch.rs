@@ -1,6 +1,6 @@
 //! Entry points that pick a [`Backend`] and run a generic [`Kernel`].
 //!
-//! A kernel is written once against the [`Simd`] context and is monomorphized for whichever
+//! A kernel is written once against the [`Gang`] context and is monomorphized for whichever
 //! backend is chosen. The backend is never named by the caller — it is chosen per scalar
 //! type via [`SimdDispatch`]:
 //!
@@ -18,7 +18,7 @@
 
 use crate::backend::{Backend, ScalarBackend};
 use crate::scalar::Scalar;
-use crate::varying::Simd;
+use crate::varying::Gang;
 
 /// The aarch64 tail of a dispatch, shared by [`SimdDispatch`] and [`MatrixDispatch`] (element-wise
 /// and matrix). Policy: **non-Apple** aarch64 with base SVE takes the widest [`Sve`](crate::backend)
@@ -40,23 +40,23 @@ macro_rules! aarch64_dispatch_tail {
             if std::arch::is_aarch64_feature_detected!("sve") {
                 let vl = crate::arch::sve2::vl_bytes();
                 if vl >= 64 {
-                    return $kernel.run(crate::varying::Simd::new(unsafe {
+                    return $kernel.run(crate::varying::Gang::new(unsafe {
                         crate::backend::sve::Sve::<64>::new_unchecked()
                     }));
                 }
                 if vl >= 32 {
-                    return $kernel.run(crate::varying::Simd::new(unsafe {
+                    return $kernel.run(crate::varying::Gang::new(unsafe {
                         crate::backend::sve::Sve::<32>::new_unchecked()
                     }));
                 }
-                return $kernel.run(crate::varying::Simd::new(unsafe {
+                return $kernel.run(crate::varying::Gang::new(unsafe {
                     crate::backend::sve::Sve::<16>::new_unchecked()
                 }));
             }
         }
         #[cfg(target_arch = "aarch64")]
         {
-            return $kernel.run(crate::varying::Simd::new($fallback));
+            return $kernel.run(crate::varying::Gang::new($fallback));
         }
     }};
 }
@@ -70,7 +70,7 @@ macro_rules! wasm_dispatch_tail {
     ($kernel:expr) => {{
         #[cfg(all(target_arch = "wasm32", target_feature = "relaxed-simd"))]
         {
-            return $kernel.run(crate::varying::Simd::new(
+            return $kernel.run(crate::varying::Gang::new(
                 crate::backend::wasm::RelaxedSimd::new(),
             ));
         }
@@ -80,7 +80,7 @@ macro_rules! wasm_dispatch_tail {
             not(target_feature = "relaxed-simd")
         ))]
         {
-            return $kernel.run(crate::varying::Simd::new(crate::backend::wasm::Simd128::new()));
+            return $kernel.run(crate::varying::Gang::new(crate::backend::wasm::Simd128::new()));
         }
     }};
 }
@@ -100,16 +100,16 @@ macro_rules! riscv_dispatch_tail {
             let vl = crate::arch::rvv::vlenb();
             // SAFETY: the build guarantees the "V" extension; `VLENB` ≥ 16 (mandated by "V").
             if vl >= 64 {
-                return $kernel.run(crate::varying::Simd::new(unsafe {
+                return $kernel.run(crate::varying::Gang::new(unsafe {
                     crate::backend::rvv::Rvv::<64>::new_unchecked()
                 }));
             }
             if vl >= 32 {
-                return $kernel.run(crate::varying::Simd::new(unsafe {
+                return $kernel.run(crate::varying::Gang::new(unsafe {
                     crate::backend::rvv::Rvv::<32>::new_unchecked()
                 }));
             }
-            return $kernel.run(crate::varying::Simd::new(unsafe {
+            return $kernel.run(crate::varying::Gang::new(unsafe {
                 crate::backend::rvv::Rvv::<16>::new_unchecked()
             }));
         }
@@ -118,16 +118,16 @@ macro_rules! riscv_dispatch_tail {
             if crate::arch::rvv::is_supported() {
                 let vl = crate::arch::rvv::vlenb();
                 if vl >= 64 {
-                    return $kernel.run(crate::varying::Simd::new(unsafe {
+                    return $kernel.run(crate::varying::Gang::new(unsafe {
                         crate::backend::rvv::Rvv::<64>::new_unchecked()
                     }));
                 }
                 if vl >= 32 {
-                    return $kernel.run(crate::varying::Simd::new(unsafe {
+                    return $kernel.run(crate::varying::Gang::new(unsafe {
                         crate::backend::rvv::Rvv::<32>::new_unchecked()
                     }));
                 }
-                return $kernel.run(crate::varying::Simd::new(unsafe {
+                return $kernel.run(crate::varying::Gang::new(unsafe {
                     crate::backend::rvv::Rvv::<16>::new_unchecked()
                 }));
             }
@@ -145,14 +145,14 @@ macro_rules! arm_dispatch_tail {
         #[cfg(all(target_arch = "arm", target_feature = "neon"))]
         {
             // SAFETY: the build guarantees NEON.
-            return $kernel.run(crate::varying::Simd::new(unsafe {
+            return $kernel.run(crate::varying::Gang::new(unsafe {
                 crate::backend::neon_a32::Neon::new_unchecked()
             }));
         }
         #[cfg(all(target_arch = "arm", feature = "std", not(target_feature = "neon")))]
         {
             if let Some(b) = crate::backend::neon_a32::Neon::detect() {
-                return $kernel.run(crate::varying::Simd::new(b));
+                return $kernel.run(crate::varying::Gang::new(b));
             }
         }
     }};
@@ -160,12 +160,12 @@ macro_rules! arm_dispatch_tail {
 pub(crate) use arm_dispatch_tail;
 
 /// A unit of work generic over the execution backend. Implement this once; `hydroplane` runs it on
-/// the backend it selects, handing your [`run`](Kernel::run) a [`Simd`] context to build
+/// the backend it selects, handing your [`run`](Kernel::run) a [`Gang`] context to build
 /// varying values through (`splat`, `load`, …). Reach the raw [`Backend`] token, if you need
-/// it, via [`Simd::backend`].
+/// it, via [`Gang::backend`].
 pub trait Kernel<T: Scalar> {
     type Output;
-    fn run<S: Backend<T>>(self, simd: Simd<T, S>) -> Self::Output;
+    fn run<S: Backend<T>>(self, simd: Gang<T, S>) -> Self::Output;
 }
 
 /// Per-scalar dispatch policy. `f32`/`f64` try a SIMD backend then fall back to scalar;
@@ -184,7 +184,26 @@ pub fn dispatch<T: SimdDispatch, K: Kernel<T>>(kernel: K) -> K::Output {
 /// oracle or baseline; normal code should use [`dispatch`].
 #[inline]
 pub fn run_scalar<T: Scalar, K: Kernel<T>>(kernel: K) -> K::Output {
-    kernel.run(Simd::new(ScalarBackend))
+    kernel.run(Gang::new(ScalarBackend))
+}
+
+/// Resolve-once cache for the x86 runtime backend tier. The detected tier is immutable for the life
+/// of the process, so each scalar's `dispatch` keeps it in a single relaxed atomic (a `static` in the
+/// function body): the warm path is one load + a `match`, not a fresh `is_x86_feature_detected!`
+/// ladder per call. `0` means unresolved; `resolve` returns the tier code and never `0`. Resolution
+/// is idempotent, so a racing thread recomputing the same value and storing it again is harmless.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "std"))]
+#[inline]
+fn cached_tier(slot: &core::sync::atomic::AtomicU8, resolve: impl FnOnce() -> u8) -> u8 {
+    use core::sync::atomic::Ordering;
+    match slot.load(Ordering::Relaxed) {
+        0 => {
+            let t = resolve();
+            slot.store(t, Ordering::Relaxed);
+            t
+        }
+        t => t,
+    }
 }
 
 macro_rules! impl_simd_dispatch_x86 {
@@ -199,47 +218,38 @@ macro_rules! impl_simd_dispatch_x86 {
                 {
                     // SAFETY: target compiled with avx512f.
                     let b = unsafe { crate::backend::avx512::Avx512::new_unchecked() };
-                    return kernel.run(Simd::new(b));
+                    return kernel.run(Gang::new(b));
                 }
-                // std, not statically avx512: avx512 is the one genuinely unknown ISA, so it
-                // is the only runtime check. The floor beneath it (avx2 then sse4) is taken
-                // *statically* via `new_unchecked` whenever the build already guarantees it —
-                // so an avx2-baseline build (x86-64-v3) multiversions on a single avx512 check,
-                // and tiers below a static floor are `cfg`'d out rather than left as dead
-                // detects.
+                // std, not statically avx512: the tier (avx512 → avx2 → sse4 → scalar) is resolved
+                // once by runtime detection and cached in a process-global atomic, so each call is a
+                // load + `match` rather than a fresh feature probe.
                 #[cfg(all(
                     any(target_arch = "x86_64", target_arch = "x86"),
                     feature = "std",
                     not(target_feature = "avx512f")
                 ))]
                 {
-                    if let Some(b) = crate::backend::avx512::Avx512::detect() {
-                        return kernel.run(Simd::new(b));
-                    }
-                    #[cfg(all(target_feature = "avx2", target_feature = "fma"))]
-                    {
-                        // SAFETY: build guarantees avx2+fma.
-                        let b = unsafe { crate::backend::avx2::Avx2::new_unchecked() };
-                        return kernel.run(Simd::new(b));
-                    }
-                    #[cfg(not(all(target_feature = "avx2", target_feature = "fma")))]
-                    {
-                        if let Some(b) = crate::backend::avx2::Avx2::detect() {
-                            return kernel.run(Simd::new(b));
+                    use crate::backend::{avx2::Avx2, avx512::Avx512, sse4::Sse4};
+                    static TIER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+                    let t = cached_tier(&TIER, || {
+                        if Avx512::detect().is_some() {
+                            1
+                        } else if Avx2::detect().is_some() {
+                            2
+                        } else if Sse4::detect().is_some() {
+                            3
+                        } else {
+                            u8::MAX
                         }
-                        #[cfg(target_feature = "sse4.1")]
-                        {
-                            // SAFETY: build guarantees sse4.1.
-                            let b = unsafe { crate::backend::sse4::Sse4::new_unchecked() };
-                            return kernel.run(Simd::new(b));
-                        }
-                        #[cfg(not(target_feature = "sse4.1"))]
-                        {
-                            if let Some(b) = crate::backend::sse4::Sse4::detect() {
-                                return kernel.run(Simd::new(b));
-                            }
-                        }
-                    }
+                    });
+                    // SAFETY: each token is built only for the tier `cached_tier` resolved via the
+                    // matching `detect()`, which confirmed the CPU has those features this run.
+                    return match t {
+                        1 => kernel.run(Gang::new(unsafe { Avx512::new_unchecked() })),
+                        2 => kernel.run(Gang::new(unsafe { Avx2::new_unchecked() })),
+                        3 => kernel.run(Gang::new(unsafe { Sse4::new_unchecked() })),
+                        _ => kernel.run(Gang::new(ScalarBackend)),
+                    };
                 }
                 #[cfg(all(
                     any(target_arch = "x86_64", target_arch = "x86"),
@@ -251,7 +261,7 @@ macro_rules! impl_simd_dispatch_x86 {
                 {
                     // SAFETY: target compiled with avx2+fma.
                     let b = unsafe { crate::backend::avx2::Avx2::new_unchecked() };
-                    return kernel.run(Simd::new(b));
+                    return kernel.run(Gang::new(b));
                 }
                 #[cfg(all(
                     any(target_arch = "x86_64", target_arch = "x86"),
@@ -262,7 +272,7 @@ macro_rules! impl_simd_dispatch_x86 {
                 {
                     // SAFETY: target compiled with sse4.1.
                     let b = unsafe { crate::backend::sse4::Sse4::new_unchecked() };
-                    return kernel.run(Simd::new(b));
+                    return kernel.run(Gang::new(b));
                 }
                 // aarch64: non-Apple SVE (by VL) else NEON — NEON is the only SIMD backend on Apple.
                 aarch64_dispatch_tail!(kernel, crate::backend::neon::Neon::new());
@@ -272,7 +282,7 @@ macro_rules! impl_simd_dispatch_x86 {
                 $( $arm_tail!(kernel); )?
                 // wasm32: relaxed-simd else simd128 (compile-time, no runtime detection).
                 wasm_dispatch_tail!(kernel);
-                kernel.run(Simd::new(ScalarBackend))
+                kernel.run(Gang::new(ScalarBackend))
             }
         }
     };
@@ -283,7 +293,7 @@ impl_simd_dispatch_x86!(f64);
 
 // Scalars without a hand-rolled SIMD backend yet (f16/bf16) always take the scalar path.
 mod half_dispatch {
-    use super::{Kernel, ScalarBackend, Simd, SimdDispatch};
+    use super::{Kernel, ScalarBackend, Gang, SimdDispatch};
     use half::{bf16, f16};
 
     impl SimdDispatch for f16 {
@@ -295,39 +305,32 @@ mod half_dispatch {
             {
                 // SAFETY: target compiled with avx512fp16.
                 let b = unsafe { crate::backend::avx512fp16::Avx512Fp16::new_unchecked() };
-                return kernel.run(Simd::new(b));
+                return kernel.run(Gang::new(b));
             }
-            // Runtime detection: native FP16 if present, else the AVX2 F16C widen path.
+            // Runtime detection (cached): native FP16 if present, else the AVX2 F16C widen path.
             #[cfg(all(
                 any(target_arch = "x86_64", target_arch = "x86"),
                 feature = "std",
                 not(target_feature = "avx512fp16")
             ))]
             {
-                if let Some(b) = crate::backend::avx512fp16::Avx512Fp16::detect() {
-                    return kernel.run(Simd::new(b));
-                }
-                // The F16C widen path is the floor: branchless when the build guarantees it.
-                #[cfg(all(
-                    target_feature = "avx2",
-                    target_feature = "fma",
-                    target_feature = "f16c"
-                ))]
-                {
-                    // SAFETY: build guarantees avx2+fma+f16c.
-                    let b = unsafe { crate::backend::avx2::Avx2::new_unchecked() };
-                    return kernel.run(Simd::new(b));
-                }
-                #[cfg(not(all(
-                    target_feature = "avx2",
-                    target_feature = "fma",
-                    target_feature = "f16c"
-                )))]
-                {
-                    if let Some(b) = crate::backend::avx2::Avx2::detect() {
-                        return kernel.run(Simd::new(b));
+                use crate::backend::{avx2::Avx2, avx512fp16::Avx512Fp16};
+                static TIER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+                let t = super::cached_tier(&TIER, || {
+                    if Avx512Fp16::detect().is_some() {
+                        1
+                    } else if Avx2::detect().is_some() {
+                        2
+                    } else {
+                        u8::MAX
                     }
-                }
+                });
+                // SAFETY: each token is built only for the tier resolved via the matching `detect()`.
+                return match t {
+                    1 => kernel.run(Gang::new(unsafe { Avx512Fp16::new_unchecked() })),
+                    2 => kernel.run(Gang::new(unsafe { Avx2::new_unchecked() })),
+                    _ => kernel.run(Gang::new(ScalarBackend)),
+                };
             }
             // no-std: the AVX2 F16C widen path if the build guarantees it.
             #[cfg(all(
@@ -340,11 +343,11 @@ mod half_dispatch {
             {
                 // SAFETY: target compiled with avx2+fma+f16c.
                 let b = unsafe { crate::backend::avx2::Avx2::new_unchecked() };
-                return kernel.run(Simd::new(b));
+                return kernel.run(Gang::new(b));
             }
             // aarch64: non-Apple SVE has native f16; NEON has no f16, so the fallback is scalar.
             super::aarch64_dispatch_tail!(kernel, ScalarBackend);
-            kernel.run(Simd::new(ScalarBackend))
+            kernel.run(Gang::new(ScalarBackend))
         }
     }
     impl SimdDispatch for bf16 {
@@ -357,30 +360,41 @@ mod half_dispatch {
             {
                 // SAFETY: target compiled with avx512bf16.
                 let b = unsafe { crate::backend::avx512bf16::Avx512Bf16::new_unchecked() };
-                return kernel.run(Simd::new(b));
+                return kernel.run(Gang::new(b));
             }
-            // Runtime detection: native AVX-512-BF16 first, then the AVX-512 / AVX2 f32 widen paths.
+            // Runtime detection (cached): native AVX-512-BF16 first, then the AVX-512 / AVX2 widen paths.
             #[cfg(all(
                 any(target_arch = "x86_64", target_arch = "x86"),
                 feature = "std",
                 not(target_feature = "avx512bf16")
             ))]
             {
-                if let Some(b) = crate::backend::avx512bf16::Avx512Bf16::detect() {
-                    return kernel.run(Simd::new(b));
-                }
-                if let Some(b) = crate::backend::avx512::Avx512::detect() {
-                    return kernel.run(Simd::new(b));
-                }
-                if let Some(b) = crate::backend::avx2::Avx2::detect() {
-                    return kernel.run(Simd::new(b));
-                }
+                use crate::backend::{avx2::Avx2, avx512::Avx512, avx512bf16::Avx512Bf16};
+                static TIER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+                let t = super::cached_tier(&TIER, || {
+                    if Avx512Bf16::detect().is_some() {
+                        1
+                    } else if Avx512::detect().is_some() {
+                        2
+                    } else if Avx2::detect().is_some() {
+                        3
+                    } else {
+                        u8::MAX
+                    }
+                });
+                // SAFETY: each token is built only for the tier resolved via the matching `detect()`.
+                return match t {
+                    1 => kernel.run(Gang::new(unsafe { Avx512Bf16::new_unchecked() })),
+                    2 => kernel.run(Gang::new(unsafe { Avx512::new_unchecked() })),
+                    3 => kernel.run(Gang::new(unsafe { Avx2::new_unchecked() })),
+                    _ => kernel.run(Gang::new(ScalarBackend)),
+                };
             }
             // aarch64: non-Apple SVE (bf16 widen path) else NEON.
             super::aarch64_dispatch_tail!(kernel, crate::backend::neon::Neon::new());
             // wasm32: bf16 widen path on relaxed-simd else simd128.
             super::wasm_dispatch_tail!(kernel);
-            kernel.run(Simd::new(ScalarBackend))
+            kernel.run(Gang::new(ScalarBackend))
         }
     }
 }

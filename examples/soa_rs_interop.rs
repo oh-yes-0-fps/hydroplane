@@ -5,7 +5,7 @@
 //! Run with `cargo run --example soa_rs_interop`.
 
 use soa_rs::{Soars, soa};
-use hydroplane::{Backend, Kernel, Simd, dispatch};
+use hydroplane::{Backend, Kernel, Gang, dispatch};
 
 #[derive(Soars, Debug, Clone, Copy)]
 struct Sphere {
@@ -27,7 +27,7 @@ struct AnyOverlap<'a> {
 }
 impl Kernel<f32> for AnyOverlap<'_> {
     type Output = bool;
-    fn run<S: Backend<f32>>(self, ctx: Simd<f32, S>) -> bool {
+    fn run<S: Backend<f32>>(self, ctx: Gang<f32, S>) -> bool {
         let (cx, cy, cz, sr) = (
             ctx.splat(self.q[0]),
             ctx.splat(self.q[1]),

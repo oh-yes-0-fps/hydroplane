@@ -8,32 +8,76 @@
 //! (not in each backend) is what makes the scalar (1-lane) backend a faithful oracle for
 //! the widening SIMD path.
 
-/// Square root, routed through `std` or `libm` depending on features.
+// The CPU's scalar square-root instruction, reached through `core::arch` so it works without `std`
+// (where `f32::sqrt` is unavailable). `sqrtss`/`sqrtsd` on x86-64 (SSE/SSE2 are baseline there);
+// `fsqrt` on aarch64 (mandatory in the base FP ISA). IEEE correctly-rounded — bit-identical to
+// `std`'s `x.sqrt()`, which lowers to the same instruction.
+#[cfg(all(target_arch = "x86_64", any(test, not(feature = "std"))))]
+#[inline(always)]
+fn hw_sqrt_f32(x: f32) -> f32 {
+    use core::arch::x86_64::{_mm_cvtss_f32, _mm_set_ss, _mm_sqrt_ss};
+    // SAFETY: SSE is part of the x86-64 baseline, so the intrinsic is always available.
+    unsafe { _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(x))) }
+}
+
+#[cfg(all(target_arch = "x86_64", any(test, not(feature = "std"))))]
+#[inline(always)]
+fn hw_sqrt_f64(x: f64) -> f64 {
+    use core::arch::x86_64::{_mm_cvtsd_f64, _mm_set_sd, _mm_sqrt_sd};
+    // SAFETY: SSE2 is part of the x86-64 baseline.
+    unsafe { _mm_cvtsd_f64(_mm_sqrt_sd(_mm_set_sd(x), _mm_set_sd(x))) }
+}
+
+#[cfg(all(target_arch = "aarch64", any(test, not(feature = "std"))))]
+#[inline(always)]
+fn hw_sqrt_f32(x: f32) -> f32 {
+    let r: f32;
+    // SAFETY: `fsqrt` is a pure data op (no memory, no flags); `s` selects the 32-bit view of a V reg.
+    unsafe {
+        core::arch::asm!("fsqrt {y:s}, {x:s}", x = in(vreg) x, y = out(vreg) r, options(pure, nomem, nostack));
+    }
+    r
+}
+
+#[cfg(all(target_arch = "aarch64", any(test, not(feature = "std"))))]
+#[inline(always)]
+fn hw_sqrt_f64(x: f64) -> f64 {
+    let r: f64;
+    // SAFETY: as `hw_sqrt_f32`; `d` selects the 64-bit view.
+    unsafe {
+        core::arch::asm!("fsqrt {y:d}, {x:d}", x = in(vreg) x, y = out(vreg) r, options(pure, nomem, nostack));
+    }
+    r
+}
+
+/// Scalar `sqrt`. `std` lowers `x.sqrt()` to the hardware instruction; without `std` we reach that
+/// same instruction through [`hw_sqrt_f32`] on x86-64/aarch64. Only an exotic no-`std` target with no
+/// hardware sqrt falls back to `libm`, or — last resort — a software Newton loop.
 #[inline(always)]
 fn sqrt_f32(x: f32) -> f32 {
     #[cfg(feature = "std")]
     {
         x.sqrt()
     }
-    #[cfg(all(not(feature = "std"), feature = "libm"))]
+    #[cfg(all(not(feature = "std"), any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        hw_sqrt_f32(x)
+    }
+    #[cfg(all(
+        not(feature = "std"),
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        feature = "libm"
+    ))]
     {
         libm::sqrtf(x)
     }
-    #[cfg(all(not(feature = "std"), not(feature = "libm")))]
+    #[cfg(all(
+        not(feature = "std"),
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        not(feature = "libm")
+    ))]
     {
-        // Portable software fallback (Babylonian) so the crate builds on stable with
-        // neither `std` nor `libm`. Enable `libm` for a real implementation; the SPIR-V
-        // backend lowers `sqrt` via spirv-std instead of reaching here.
-        if x <= 0.0 {
-            return 0.0;
-        }
-        let mut g = x;
-        let mut i = 0;
-        while i < 20 {
-            g = 0.5 * (g + x / g);
-            i += 1;
-        }
-        g
+        software_sqrt_f32(x)
     }
 }
 
@@ -43,23 +87,73 @@ fn sqrt_f64(x: f64) -> f64 {
     {
         x.sqrt()
     }
-    #[cfg(all(not(feature = "std"), feature = "libm"))]
+    #[cfg(all(not(feature = "std"), any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        hw_sqrt_f64(x)
+    }
+    #[cfg(all(
+        not(feature = "std"),
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        feature = "libm"
+    ))]
     {
         libm::sqrt(x)
     }
-    #[cfg(all(not(feature = "std"), not(feature = "libm")))]
+    #[cfg(all(
+        not(feature = "std"),
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        not(feature = "libm")
+    ))]
     {
-        if x <= 0.0 {
-            return 0.0;
-        }
-        let mut g = x;
-        let mut i = 0;
-        while i < 24 {
-            g = 0.5 * (g + x / g);
-            i += 1;
-        }
-        g
+        software_sqrt_f64(x)
     }
+}
+
+// Portable Newton fallback — only for a no-`std`, no-`libm` build on a target without a hardware
+// sqrt (the SPIR-V backend lowers `sqrt` via spirv-std and never reaches here). `NaN` for negatives,
+// matching the hardware; `0`/`inf` pass straight through.
+#[cfg(all(
+    not(feature = "std"),
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    not(feature = "libm")
+))]
+#[inline]
+fn software_sqrt_f32(x: f32) -> f32 {
+    if x < 0.0 {
+        return f32::NAN;
+    }
+    if x == 0.0 || !x.is_finite() {
+        return x;
+    }
+    let mut g = x;
+    let mut i = 0;
+    while i < 20 {
+        g = 0.5 * (g + x / g);
+        i += 1;
+    }
+    g
+}
+
+#[cfg(all(
+    not(feature = "std"),
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    not(feature = "libm")
+))]
+#[inline]
+fn software_sqrt_f64(x: f64) -> f64 {
+    if x < 0.0 {
+        return f64::NAN;
+    }
+    if x == 0.0 || !x.is_finite() {
+        return x;
+    }
+    let mut g = x;
+    let mut i = 0;
+    while i < 24 {
+        g = 0.5 * (g + x / g);
+        i += 1;
+    }
+    g
 }
 
 /// A scalar float element a kernel can be generic over.
@@ -294,4 +388,27 @@ mod half_impls {
 
     impl_half!(f16);
     impl_half!(bf16);
+}
+
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod hw_sqrt_tests {
+    #[test]
+    fn matches_std_bit_for_bit() {
+        let xs32 = [
+            0.0f32, 1.0, 2.0, 3.0, 4.0, 9.0, 0.25, 1e-12, 1e12, 123.456, f32::MIN_POSITIVE, f32::MAX,
+        ];
+        for &x in &xs32 {
+            assert_eq!(super::hw_sqrt_f32(x).to_bits(), x.sqrt().to_bits(), "f32 sqrt({x})");
+        }
+        let xs64 = [
+            0.0f64, 1.0, 2.0, 3.0, 4.0, 9.0, 0.25, 1e-300, 1e300, 123.456, f64::MIN_POSITIVE, f64::MAX,
+        ];
+        for &x in &xs64 {
+            assert_eq!(super::hw_sqrt_f64(x).to_bits(), x.sqrt().to_bits(), "f64 sqrt({x})");
+        }
+        assert!(super::hw_sqrt_f32(-1.0).is_nan());
+        assert!(super::hw_sqrt_f64(-1.0).is_nan());
+        assert_eq!(super::hw_sqrt_f32(-0.0).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(super::hw_sqrt_f64(-0.0).to_bits(), (-0.0f64).to_bits());
+    }
 }

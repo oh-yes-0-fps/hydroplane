@@ -3,7 +3,7 @@
 //! `wreck`'s "0 mismatches vs CPU" methodology.
 
 use rand::Rng;
-use hydroplane::{Backend, Kernel, Scalar, Simd, SimdDispatch, Soa, dispatch};
+use hydroplane::{Backend, Kernel, Scalar, Gang, SimdDispatch, Soa, dispatch};
 
 fn spheres_soa<T: Scalar>(rows: &[[T; 4]]) -> Soa<T> {
     let mut soa = Soa::with_pad_fills(&[T::ZERO, T::ZERO, T::ZERO, T::from_f64(f64::NAN)]);
@@ -13,7 +13,7 @@ fn spheres_soa<T: Scalar>(rows: &[[T; 4]]) -> Soa<T> {
     soa
 }
 
-fn any_overlap<T: Scalar, S: Backend<T>>(ctx: Simd<T, S>, soa: &Soa<T>, q: [T; 4]) -> bool {
+fn any_overlap<T: Scalar, S: Backend<T>>(ctx: Gang<T, S>, soa: &Soa<T>, q: [T; 4]) -> bool {
     let lanes = ctx.lanes();
     let (cx, cy, cz, sr) = (
         ctx.splat(q[0]),
@@ -47,7 +47,7 @@ struct AnyOverlap<'a, T: Scalar> {
 }
 impl<T: Scalar> Kernel<T> for AnyOverlap<'_, T> {
     type Output = bool;
-    fn run<S: Backend<T>>(self, simd: Simd<T, S>) -> bool {
+    fn run<S: Backend<T>>(self, simd: Gang<T, S>) -> bool {
         any_overlap(simd, self.soa, self.q)
     }
 }

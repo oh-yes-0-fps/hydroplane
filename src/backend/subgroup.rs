@@ -59,7 +59,7 @@ mod device {
     use crate::backend::{Backend, ScalarBackend};
     use crate::dispatch::Kernel;
     use crate::scalar::Scalar;
-    use crate::varying::Simd;
+    use crate::varying::Gang;
     use half::{bf16, f16};
 
     /// Device entry point — the GPU analogue of the host [`dispatch`](crate::dispatch).
@@ -69,7 +69,7 @@ mod device {
     /// across the warp and the kernel's cross-lane ops become subgroup collectives
     /// ([`Subgroup`]); below that threshold the collectives don't pay for themselves, so a
     /// single invocation loops over the items on the scalar backend. Either way the kernel body
-    /// is the one written against [`Simd`].
+    /// is the one written against [`Gang`].
     ///
     /// `item_count` is the batch size the calling subgroup is responsible for (from the buffer
     /// length / push constant the entry point already knows); `fill_factor` is the occupancy
@@ -83,8 +83,8 @@ mod device {
         Subgroup: Backend<T>,
     {
         match choose(item_count, subgroup_size(), fill_factor) {
-            Execution::Subgroup => kernel.run(Simd::new(Subgroup::new())),
-            Execution::Sequential => kernel.run(Simd::new(ScalarBackend)),
+            Execution::Subgroup => kernel.run(Gang::new(Subgroup::new())),
+            Execution::Sequential => kernel.run(Gang::new(ScalarBackend)),
         }
     }
 

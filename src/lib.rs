@@ -26,6 +26,7 @@ pub const MAX_LANES: usize = 32;
 pub mod backend;
 pub mod arch;
 pub mod dispatch;
+pub(crate) mod ilp;
 pub mod kernel_macro;
 pub mod matrix;
 pub mod scalar;
@@ -46,13 +47,26 @@ pub use matrix::{
     Tiles, dispatch_matrix, run_matrix_scalar,
 };
 pub use scalar::Scalar;
-pub use varying::{Chunks, Varying, Mask, Simd};
+pub use varying::{Chunks, Varying, Mask, Gang};
+
+/// The `#[kernel]` attribute: write a [`Kernel`]/[`MatrixKernel`] as a plain generic function.
+/// See [`kernel_macro`] for the shape. Available unless the `macros` feature is disabled, in which
+/// case the `macro_rules!` [`kernel!`](crate::kernel) fallback takes over the same name.
+#[cfg(feature = "macros")]
+pub use hydroplane_macros::kernel;
 
 /// `f16`/`bf16` element types (from the `half` crate), usable anywhere a [`Scalar`] is expected.
 pub use half::{bf16, f16};
 
 #[cfg(feature = "alloc")]
 pub use soa::Soa;
+
+/// Test hook: the cached runtime unroll factor (`0` until the first multi-accumulator reduction on
+/// a SIMD backend resolves it). Not part of the stable surface.
+#[doc(hidden)]
+pub fn ilp_detected_for_test() -> u8 {
+    ilp::cached()
+}
 
 #[cfg(test)]
 mod tests {
@@ -100,7 +114,7 @@ mod tests {
     }
     impl<T: Scalar> Kernel<T> for AnyWithin<'_, T> {
         type Output = bool;
-        fn run<S: Backend<T>>(self, simd: Simd<T, S>) -> bool {
+        fn run<S: Backend<T>>(self, simd: Gang<T, S>) -> bool {
             any_within(simd.backend(), self.xs, self.r)
         }
     }

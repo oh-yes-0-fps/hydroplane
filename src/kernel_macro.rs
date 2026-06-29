@@ -1,5 +1,10 @@
-//! The [`kernel!`] macro — collapse the [`Kernel`](crate::Kernel)/[`MatrixKernel`](crate::MatrixKernel)
-//! struct-plus-impl boilerplate into one annotated function.
+//! The `macro_rules!` `kernel!` fallback — collapse the [`Kernel`](crate::Kernel)/[`MatrixKernel`](crate::MatrixKernel)
+//! struct-plus-impl boilerplate into one annotated function **without a proc-macro dependency**.
+//!
+//! This is only compiled when the `macros` feature is **off**. With the feature on (the default),
+//! the ergonomic [`#[kernel]`](crate::kernel) attribute — natural `<…>` generics, multiple bounds,
+//! where-clauses — supersedes it under the same name. The forms below exist so a
+//! `--no-default-features` build still has a kernel macro with zero build-time dependencies.
 //!
 //! A kernel must be generic over the backend `S` (unknown until runtime dispatch picks it), and a
 //! Rust closure can't be generic over a type, so the hand-written form is a struct (to carry the
@@ -31,6 +36,7 @@
 
 /// Generate a [`Kernel`](crate::Kernel) or [`MatrixKernel`](crate::MatrixKernel) and a dispatching
 /// wrapper from one annotated function. See the [module docs](crate::kernel_macro).
+#[cfg(not(feature = "macros"))]
 #[macro_export]
 macro_rules! kernel {
     (
@@ -71,6 +77,7 @@ macro_rules! kernel {
 /// (`<'a, T: Scalar, const M: usize>` → `'a, T, M`) for the `impl … for __Kernel<here>` position;
 /// `tc_acc` drops lifetimes (`T, M`) for the constructor turbofish (which rejects lifetimes and is
 /// needed so const generics — phantom in the fields — are inferable). CPS over the payload.
+#[cfg(not(feature = "macros"))]
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __kernel_strip {
@@ -110,6 +117,7 @@ macro_rules! __kernel_strip {
 /// Emit the kernel struct, its trait impl, and the dispatching wrapper. The struct lives in a
 /// private module named like the function (modules are a separate namespace from the `fn`), so the
 /// generated names never collide with the caller's.
+#[cfg(not(feature = "macros"))]
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __kernel_emit {
@@ -129,7 +137,7 @@ macro_rules! __kernel_emit {
             impl< $($decl)* > $($ktrait)*<T> for __Kernel< $($useg)* > {
                 type Output = $ret;
                 #[inline]
-                fn run<__S: $($bound)*<T>>(self, $ctx: $crate::Simd<T, __S>) -> $ret {
+                fn run<__S: $($bound)*<T>>(self, $ctx: $crate::Gang<T, __S>) -> $ret {
                     let __Kernel { $( $pn , )* } = self;
                     $body
                 }

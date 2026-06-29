@@ -1,11 +1,11 @@
 //! End-to-end proof: `wreck`'s sphere–sphere "does the query overlap any sphere in the
-//! batch?" kernel, written **once** against the `hydroplane` varying layer and run for `f32`
-//! *and* `f64` on whatever backend `dispatch` selects (AVX2 when present, else scalar).
+//! batch?" kernel, written **once** with the `#[kernel]` attribute and run for `f32` *and* `f64`
+//! on whatever backend `dispatch` selects (AVX2 when present, else scalar).
 //!
 //! Run with `cargo run --example spheres --release` (add `-C target-cpu=native` via
 //! RUSTFLAGS to force the compile-time AVX2 path).
 
-use hydroplane::{Backend, Kernel, Scalar, Simd, Soa, SimdDispatch, dispatch};
+use hydroplane::{Gang, Scalar, Soa, kernel};
 
 /// Columns of the sphere SoA.
 const X: usize = 0;
@@ -23,8 +23,10 @@ pub fn spheres_soa<T: Scalar>(rows: &[[T; 4]]) -> Soa<T> {
     soa
 }
 
-/// The kernel — reads like scalar Rust, runs as SIMD. `q = [cx, cy, cz, radius]`.
-pub fn any_overlap<T: Scalar, S: Backend<T>>(ctx: Simd<T, S>, soa: &Soa<T>, q: [T; 4]) -> bool {
+/// The kernel — reads like scalar Rust, runs as SIMD. `q = [cx, cy, cz, radius]`. `#[kernel]`
+/// generates the dispatching `any_overlap(soa, q)` callable; no struct, impl, or `dispatch` by hand.
+#[kernel]
+pub fn any_overlap<'a, T: Scalar>(ctx: Gang<T>, soa: &'a Soa<T>, q: [T; 4]) -> bool {
     let lanes = ctx.lanes();
 
     let cx = ctx.splat(q[X]);
@@ -55,23 +57,6 @@ pub fn any_overlap<T: Scalar, S: Backend<T>>(ctx: Simd<T, S>, soa: &Soa<T>, q: [
     false
 }
 
-/// `Kernel` wrapper so the same code runs through `hydroplane::dispatch`.
-pub struct AnyOverlap<'a, T: Scalar> {
-    pub soa: &'a Soa<T>,
-    pub query: [T; 4],
-}
-impl<T: Scalar> Kernel<T> for AnyOverlap<'_, T> {
-    type Output = bool;
-    fn run<S: Backend<T>>(self, simd: Simd<T, S>) -> bool {
-        any_overlap(simd, self.soa, self.query)
-    }
-}
-
-/// Convenience: build + dispatch in one call.
-pub fn query<T: SimdDispatch>(soa: &Soa<T>, query: [T; 4]) -> bool {
-    dispatch(AnyOverlap { soa, query })
-}
-
 fn main() {
     // a handful of f32 spheres on a line, plus an f64 run of the same data
     let rows_f32 = [
@@ -80,10 +65,10 @@ fn main() {
         [10.0, 0.0, 0.0, 0.5],
     ];
     let soa = spheres_soa(&rows_f32);
-    println!("f32 hit  near (5,0,0): {}", query(&soa, [5.2f32, 0.0, 0.0, 0.1])); // true
-    println!("f32 miss near (2,0,0): {}", query(&soa, [2.0f32, 0.0, 0.0, 0.1])); // false
+    println!("f32 hit  near (5,0,0): {}", any_overlap(&soa, [5.2f32, 0.0, 0.0, 0.1])); // true
+    println!("f32 miss near (2,0,0): {}", any_overlap(&soa, [2.0f32, 0.0, 0.0, 0.1])); // false
 
     let rows_f64 = rows_f32.map(|[a, b, c, d]| [a as f64, b as f64, c as f64, d as f64]);
     let soa = spheres_soa(&rows_f64);
-    println!("f64 hit  near (10,0,0): {}", query(&soa, [10.0f64, 0.4, 0.0, 0.2])); // true
+    println!("f64 hit  near (10,0,0): {}", any_overlap(&soa, [10.0f64, 0.4, 0.0, 0.2])); // true
 }

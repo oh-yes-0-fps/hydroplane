@@ -1,4 +1,4 @@
-use hydroplane::{Layout, MatrixBackend, MatrixKernel, Scalar, Simd, dispatch_matrix, run_matrix_scalar};
+use hydroplane::{Layout, MatrixBackend, MatrixKernel, Scalar, Gang, dispatch_matrix, run_matrix_scalar};
 
 struct Gemm<'a, T: Scalar, const M: usize, const N: usize, const K: usize> {
     a: &'a [T],
@@ -10,7 +10,7 @@ impl<T: Scalar, const M: usize, const N: usize, const K: usize> MatrixKernel<T>
     for Gemm<'_, T, M, N, K>
 {
     type Output = ();
-    fn run<S: MatrixBackend<T>>(self, ctx: Simd<T, S>) {
+    fn run<S: MatrixBackend<T>>(self, ctx: Gang<T, S>) {
         let tl = ctx.tiles();
         let a = tl.load_a::<M, K>(self.a, K, Layout::RowMajor);
         let b = tl.load_b::<K, N>(self.b, N, Layout::RowMajor);

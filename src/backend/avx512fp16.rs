@@ -147,6 +147,10 @@ impl Backend<Half> for Avx512Fp16 {
         m == u32::MAX
     }
     #[inline(always)]
+    fn mask_bitmask(self, m: u32) -> u32 {
+        m
+    }
+    #[inline(always)]
     fn reduce_sum(self, v: __m512i) -> Half {
         Half::from_f32(self.fold(v, |acc, x| acc + x, 0.0))
     }

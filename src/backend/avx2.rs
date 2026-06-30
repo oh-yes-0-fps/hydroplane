@@ -99,6 +99,10 @@ impl Backend<f32> for Avx2 {
         unsafe { f32_neg(a) }
     }
     #[inline(always)]
+    fn abs(self, a: __m256) -> __m256 {
+        unsafe { f32_abs(a) }
+    }
+    #[inline(always)]
     fn fma(self, a: __m256, b: __m256, c: __m256) -> __m256 {
         unsafe { f32_fma(a, b, c) }
     }
@@ -156,6 +160,10 @@ impl Backend<f32> for Avx2 {
         unsafe { f32_movemask(m) == 0xFF }
     }
     #[inline(always)]
+    fn mask_bitmask(self, m: __m256) -> u32 {
+        unsafe { f32_movemask(m) as u32 }
+    }
+    #[inline(always)]
     fn reduce_sum(self, v: __m256) -> f32 {
         unsafe { f32_reduce::<0>(v) }
     }
@@ -208,6 +216,12 @@ unsafe fn f32_div(a: __m256, b: __m256) -> __m256 {
 #[inline]
 unsafe fn f32_neg(a: __m256) -> __m256 {
     _mm256_xor_ps(a, _mm256_set1_ps(-0.0))
+}
+/// Clear the sign bit — a single `andps`, cheaper than `max(a, -a)`.
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn f32_abs(a: __m256) -> __m256 {
+    _mm256_and_ps(a, _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF)))
 }
 #[target_feature(enable = "avx2,fma")]
 #[inline]
@@ -327,6 +341,10 @@ impl Backend<f64> for Avx2 {
         unsafe { f64_neg(a) }
     }
     #[inline(always)]
+    fn abs(self, a: __m256d) -> __m256d {
+        unsafe { f64_abs(a) }
+    }
+    #[inline(always)]
     fn fma(self, a: __m256d, b: __m256d, c: __m256d) -> __m256d {
         unsafe { f64_fma(a, b, c) }
     }
@@ -383,6 +401,10 @@ impl Backend<f64> for Avx2 {
         unsafe { f64_movemask(m) == 0xF }
     }
     #[inline(always)]
+    fn mask_bitmask(self, m: __m256d) -> u32 {
+        unsafe { f64_movemask(m) as u32 }
+    }
+    #[inline(always)]
     fn reduce_sum(self, v: __m256d) -> f64 {
         unsafe { f64_reduce::<0>(v) }
     }
@@ -435,6 +457,12 @@ unsafe fn f64_div(a: __m256d, b: __m256d) -> __m256d {
 #[inline]
 unsafe fn f64_neg(a: __m256d) -> __m256d {
     _mm256_xor_pd(a, _mm256_set1_pd(-0.0))
+}
+/// Clear the sign bit — a single `andpd`, cheaper than `max(a, -a)`.
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn f64_abs(a: __m256d) -> __m256d {
+    _mm256_and_pd(a, _mm256_castsi256_pd(_mm256_set1_epi64x(0x7FFF_FFFF_FFFF_FFFF)))
 }
 #[target_feature(enable = "avx2,fma")]
 #[inline]
@@ -562,6 +590,10 @@ mod f16_impl {
             unsafe { f32_neg(a) }
         }
         #[inline(always)]
+        fn abs(self, a: __m256) -> __m256 {
+            unsafe { f32_abs(a) }
+        }
+        #[inline(always)]
         fn fma(self, a: __m256, b: __m256, c: __m256) -> __m256 {
             unsafe { f32_fma(a, b, c) }
         }
@@ -616,6 +648,10 @@ mod f16_impl {
         #[inline(always)]
         fn all(self, m: __m256) -> bool {
             unsafe { f32_movemask(m) == 0xFF }
+        }
+        #[inline(always)]
+        fn mask_bitmask(self, m: __m256) -> u32 {
+            unsafe { f32_movemask(m) as u32 }
         }
         #[inline(always)]
         fn reduce_sum(self, v: __m256) -> f16 {
@@ -714,6 +750,10 @@ mod bf16_impl {
             unsafe { f32_neg(a) }
         }
         #[inline(always)]
+        fn abs(self, a: __m256) -> __m256 {
+            unsafe { f32_abs(a) }
+        }
+        #[inline(always)]
         fn fma(self, a: __m256, b: __m256, c: __m256) -> __m256 {
             unsafe { f32_fma(a, b, c) }
         }
@@ -768,6 +808,10 @@ mod bf16_impl {
         #[inline(always)]
         fn all(self, m: __m256) -> bool {
             unsafe { f32_movemask(m) == 0xFF }
+        }
+        #[inline(always)]
+        fn mask_bitmask(self, m: __m256) -> u32 {
+            unsafe { f32_movemask(m) as u32 }
         }
         #[inline(always)]
         fn reduce_sum(self, v: __m256) -> bf16 {

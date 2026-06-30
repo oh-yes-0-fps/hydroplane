@@ -380,6 +380,9 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         #(#attrs)*
         #[inline]
         #[allow(clippy::multiple_bound_locations)]
+        // Splat-constant scalars arrive as plain params, so kernels routinely exceed clippy's arg
+        // limit; the author can't annotate a generated fn, so the wrapper opts out for them.
+        #[allow(clippy::too_many_arguments)]
         #vis fn #name #w_impl_generics ( #( #field_idents: #field_tys ),* ) -> #ret
         #w_where
         {
@@ -388,6 +391,7 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         #[doc = concat!("Run [`", stringify!(#name), "`]'s body on an already-dispatched context, ")]
         #[doc = "skipping a second dispatch — call this from inside another kernel to reuse its backend."]
         #[inline]
+        #[allow(clippy::too_many_arguments)]
         #vis fn #on_name #on_impl_generics ( #primary_ctx: #primary_ty, #( #field_idents: #field_tys ),* ) -> #ret
         #on_where
         {

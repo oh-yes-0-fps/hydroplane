@@ -43,7 +43,7 @@ pub mod amx;
 /// Read a boolean `hw.optional.*` CPU feature flag via `sysctlbyname` (Apple's stable feature probe;
 /// the std `is_aarch64_feature_detected!` macro and the Linux `HWCAP` bits don't exist here). Returns
 /// `false` if the flag is absent or the query fails.
-#[cfg(all(target_arch = "aarch64", target_vendor = "apple", feature = "std"))]
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
 pub(crate) fn apple_sysctl_flag(name: &core::ffi::CStr) -> bool {
     use core::ffi::{c_char, c_int, c_void};
     unsafe extern "C" {

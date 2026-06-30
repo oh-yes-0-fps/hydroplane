@@ -85,6 +85,10 @@ impl Backend<f32> for Avx512 {
         unsafe { z_sub(z_zero(), a) }
     }
     #[inline(always)]
+    fn abs(self, a: __m512) -> __m512 {
+        unsafe { z_abs(a) }
+    }
+    #[inline(always)]
     fn fma(self, a: __m512, b: __m512, c: __m512) -> __m512 {
         unsafe { z_fma(a, b, c) }
     }
@@ -142,6 +146,10 @@ impl Backend<f32> for Avx512 {
         m == 0xFFFF
     }
     #[inline(always)]
+    fn mask_bitmask(self, m: __mmask16) -> u32 {
+        m as u32
+    }
+    #[inline(always)]
     fn reduce_sum(self, v: __m512) -> f32 {
         unsafe { _mm512_reduce_add_ps(v) }
     }
@@ -184,6 +192,12 @@ unsafe fn z_add(a: __m512, b: __m512) -> __m512 {
 #[inline]
 unsafe fn z_sub(a: __m512, b: __m512) -> __m512 {
     _mm512_sub_ps(a, b)
+}
+/// Native `vandps`-class abs (`_mm512_abs_ps`), one op vs `max(a, -a)`.
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn z_abs(a: __m512) -> __m512 {
+    _mm512_abs_ps(a)
 }
 #[target_feature(enable = "avx512f")]
 #[inline]
@@ -269,6 +283,10 @@ impl Backend<f64> for Avx512 {
         unsafe { zd_sub(zd_zero(), a) }
     }
     #[inline(always)]
+    fn abs(self, a: __m512d) -> __m512d {
+        unsafe { zd_abs(a) }
+    }
+    #[inline(always)]
     fn fma(self, a: __m512d, b: __m512d, c: __m512d) -> __m512d {
         unsafe { zd_fma(a, b, c) }
     }
@@ -325,6 +343,10 @@ impl Backend<f64> for Avx512 {
         m == 0xFF
     }
     #[inline(always)]
+    fn mask_bitmask(self, m: __mmask8) -> u32 {
+        m as u32
+    }
+    #[inline(always)]
     fn reduce_sum(self, v: __m512d) -> f64 {
         unsafe { _mm512_reduce_add_pd(v) }
     }
@@ -367,6 +389,12 @@ unsafe fn zd_add(a: __m512d, b: __m512d) -> __m512d {
 #[inline]
 unsafe fn zd_sub(a: __m512d, b: __m512d) -> __m512d {
     _mm512_sub_pd(a, b)
+}
+/// Native `_mm512_abs_pd`, one op vs `max(a, -a)`.
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zd_abs(a: __m512d) -> __m512d {
+    _mm512_abs_pd(a)
 }
 #[target_feature(enable = "avx512f")]
 #[inline]
@@ -477,6 +505,10 @@ mod bf16_impl {
             unsafe { z_sub(z_zero(), a) }
         }
         #[inline(always)]
+        fn abs(self, a: __m512) -> __m512 {
+            unsafe { z_abs(a) }
+        }
+        #[inline(always)]
         fn fma(self, a: __m512, b: __m512, c: __m512) -> __m512 {
             unsafe { z_fma(a, b, c) }
         }
@@ -533,6 +565,10 @@ mod bf16_impl {
             m == 0xFFFF
         }
         #[inline(always)]
+        fn mask_bitmask(self, m: __mmask16) -> u32 {
+            m as u32
+        }
+        #[inline(always)]
         fn reduce_sum(self, v: __m512) -> bf16 {
             bf16::from_f32(unsafe { _mm512_reduce_add_ps(v) })
         }
@@ -543,6 +579,148 @@ mod bf16_impl {
         #[inline(always)]
         fn reduce_max(self, v: __m512) -> bf16 {
             bf16::from_f32(unsafe { _mm512_reduce_max_ps(v) })
+        }
+    }
+}
+
+// `f16` on AVX-512 (without AVX-512-FP16): `f32x16` widen-compute-narrow, but with hardware
+// `vcvtph2ps`/`vcvtps2ph` boundary conversion (zmm forms are AVX-512F, no F16C needed) instead of
+// bf16's scalar loop. 16 lanes — double the 8-wide AVX2 F16C path that AVX-512-without-FP16 hosts
+// (Cascade Lake / Ice Lake / Zen 4) otherwise fall back to. `Mask = __mmask16` as on f32.
+mod f16_impl {
+    use super::*;
+    use crate::backend::Backend;
+    use half::f16;
+
+    #[target_feature(enable = "avx512f")]
+    #[inline]
+    unsafe fn h_load(s: &[f16]) -> __m512 {
+        _mm512_cvtph_ps(_mm256_loadu_si256(s.as_ptr().cast()))
+    }
+    #[target_feature(enable = "avx512f")]
+    #[inline]
+    unsafe fn h_store(v: __m512, s: &mut [f16]) {
+        let packed = _mm512_cvtps_ph::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(v);
+        _mm256_storeu_si256(s.as_mut_ptr().cast(), packed);
+    }
+
+    impl Backend<f16> for Avx512 {
+        type Vector = __m512;
+        type Mask = __mmask16;
+
+        #[inline(always)]
+        fn lanes(self) -> usize {
+            16
+        }
+        #[inline(always)]
+        fn splat(self, v: f16) -> __m512 {
+            unsafe { z_splat(v.to_f32()) }
+        }
+        #[inline(always)]
+        fn load(self, s: &[f16]) -> __m512 {
+            debug_assert_eq!(s.len(), 16);
+            unsafe { h_load(s) }
+        }
+        #[inline(always)]
+        fn store(self, v: __m512, s: &mut [f16]) {
+            debug_assert_eq!(s.len(), 16);
+            unsafe { h_store(v, s) }
+        }
+        #[inline(always)]
+        fn add(self, a: __m512, b: __m512) -> __m512 {
+            unsafe { z_add(a, b) }
+        }
+        #[inline(always)]
+        fn sub(self, a: __m512, b: __m512) -> __m512 {
+            unsafe { z_sub(a, b) }
+        }
+        #[inline(always)]
+        fn mul(self, a: __m512, b: __m512) -> __m512 {
+            unsafe { z_mul(a, b) }
+        }
+        #[inline(always)]
+        fn div(self, a: __m512, b: __m512) -> __m512 {
+            unsafe { z_div(a, b) }
+        }
+        #[inline(always)]
+        fn neg(self, a: __m512) -> __m512 {
+            unsafe { z_sub(z_zero(), a) }
+        }
+        #[inline(always)]
+        fn abs(self, a: __m512) -> __m512 {
+            unsafe { z_abs(a) }
+        }
+        #[inline(always)]
+        fn fma(self, a: __m512, b: __m512, c: __m512) -> __m512 {
+            unsafe { z_fma(a, b, c) }
+        }
+        #[inline(always)]
+        fn sqrt(self, a: __m512) -> __m512 {
+            unsafe { z_sqrt(a) }
+        }
+        #[inline(always)]
+        fn min(self, a: __m512, b: __m512) -> __m512 {
+            unsafe { z_min(a, b) }
+        }
+        #[inline(always)]
+        fn max(self, a: __m512, b: __m512) -> __m512 {
+            unsafe { z_max(a, b) }
+        }
+        #[inline(always)]
+        fn le(self, a: __m512, b: __m512) -> __mmask16 {
+            unsafe { z_cmp::<_CMP_LE_OQ>(a, b) }
+        }
+        #[inline(always)]
+        fn lt(self, a: __m512, b: __m512) -> __mmask16 {
+            unsafe { z_cmp::<_CMP_LT_OQ>(a, b) }
+        }
+        #[inline(always)]
+        fn ge(self, a: __m512, b: __m512) -> __mmask16 {
+            unsafe { z_cmp::<_CMP_GE_OQ>(a, b) }
+        }
+        #[inline(always)]
+        fn gt(self, a: __m512, b: __m512) -> __mmask16 {
+            unsafe { z_cmp::<_CMP_GT_OQ>(a, b) }
+        }
+        #[inline(always)]
+        fn mask_and(self, a: __mmask16, b: __mmask16) -> __mmask16 {
+            a & b
+        }
+        #[inline(always)]
+        fn mask_or(self, a: __mmask16, b: __mmask16) -> __mmask16 {
+            a | b
+        }
+        #[inline(always)]
+        fn mask_not(self, a: __mmask16) -> __mmask16 {
+            !a
+        }
+        #[inline(always)]
+        fn select(self, m: __mmask16, a: __m512, b: __m512) -> __m512 {
+            unsafe { z_blend(m, b, a) }
+        }
+        #[inline(always)]
+        fn any(self, m: __mmask16) -> bool {
+            m != 0
+        }
+        #[inline(always)]
+        fn all(self, m: __mmask16) -> bool {
+            m == 0xFFFF
+        }
+        #[inline(always)]
+        fn mask_bitmask(self, m: __mmask16) -> u32 {
+            m as u32
+        }
+        #[inline(always)]
+        fn reduce_sum(self, v: __m512) -> f16 {
+            f16::from_f32(unsafe { _mm512_reduce_add_ps(v) })
+        }
+        #[inline(always)]
+        fn reduce_min(self, v: __m512) -> f16 {
+            f16::from_f32(unsafe { _mm512_reduce_min_ps(v) })
+        }
+        #[inline(always)]
+        fn reduce_max(self, v: __m512) -> f16 {
+            f16::from_f32(unsafe { _mm512_reduce_max_ps(v) })
         }
     }
 }

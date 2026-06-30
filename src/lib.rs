@@ -23,9 +23,16 @@ extern crate alloc;
 /// a remainder, and a single inline `[T; MAX_LANES]` buffer holds any one register.
 pub const MAX_LANES: usize = 32;
 
+/// Upper bound on a backend's [`UNROLL`](Backend::UNROLL): the most independent accumulator chains
+/// any reduction unrolls to. Sizes the fixed `[init; MAX_UNROLL]` chain array, so a backend's
+/// `UNROLL` must not exceed it.
+pub const MAX_UNROLL: usize = 16;
+
 pub mod backend;
 pub mod arch;
 pub mod dispatch;
+// The runtime unroll cache; gone when `build.rs` resolved the factor at compile time.
+#[cfg(not(hp_resolved_unroll))]
 pub(crate) mod ilp;
 pub mod kernel_macro;
 pub mod matrix;
@@ -61,11 +68,19 @@ pub use half::{bf16, f16};
 #[cfg(feature = "alloc")]
 pub use soa::Soa;
 
-/// Test hook: the cached runtime unroll factor (`0` until the first multi-accumulator reduction on
-/// a SIMD backend resolves it). Not part of the stable surface.
+/// Test hook: the unroll factor in effect — `0` until the first dispatch resolves it via the runtime
+/// sweep, or the `build.rs`-baked constant when it was resolved at compile time. Not part of the
+/// stable surface.
 #[doc(hidden)]
 pub fn ilp_detected_for_test() -> u8 {
-    ilp::cached()
+    #[cfg(not(hp_resolved_unroll))]
+    {
+        ilp::cached()
+    }
+    #[cfg(hp_resolved_unroll)]
+    {
+        varying::STATIC_UNROLL as u8
+    }
 }
 
 #[cfg(test)]

@@ -61,6 +61,11 @@ where
             assert_eq!(got[i].to_f64(), a[i].neg().to_f64(), "neg lane {i}");
         }
 
+        let got = store(&b, b.abs(va));
+        for i in 0..n {
+            assert_eq!(got[i].to_f64(), a[i].to_f64().abs(), "abs lane {i}");
+        }
+
         let aa: Vec<T> = a.iter().map(|x| T::from_f64(x.to_f64().abs())).collect();
         let got = store(&b, b.sqrt(b.load(&aa)));
         for i in 0..n {
@@ -166,6 +171,15 @@ fn sse4_matches_scalar() {
     match super::sse4::Sse4::detect() {
         Some(b) => check_all(b),
         None => eprintln!("SSE4.1 unavailable; skipping"),
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[test]
+fn avx1_matches_scalar() {
+    match super::avx1::Avx1::detect() {
+        Some(b) => check_all(b),
+        None => eprintln!("AVX unavailable; skipping"),
     }
 }
 

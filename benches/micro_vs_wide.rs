@@ -161,28 +161,6 @@ fn dot_sum<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
     ctx.zip_sum(a, b, |acc, x, y| x.fma(y, acc))
 }
 
-macro_rules! dot_zip_reduce_k {
-    ($name:ident, $k:literal) => {
-        #[kernel]
-        fn $name<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
-            ctx.zip_reduce_k::<$k, _, _, _>(
-                a,
-                b,
-                0.0,
-                0.0,
-                ctx.splat(0.0),
-                |acc, x, y| x.fma(y, acc),
-                |p, q| p + q,
-            )
-            .reduce_sum()
-        }
-    };
-}
-dot_zip_reduce_k!(dot_zip_reduce_k4, 4);
-dot_zip_reduce_k!(dot_zip_reduce_k8, 8);
-dot_zip_reduce_k!(dot_zip_reduce_k12, 12);
-dot_zip_reduce_k!(dot_zip_reduce_k16, 16);
-
 fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
@@ -203,10 +181,6 @@ fn bench(c: &mut Criterion) {
         assert!((dot_wide16(&a, &b) - want).abs() <= tol, "wide16 disagrees at n={n}");
         assert!((dot_zip_reduce(&a, &b) - want).abs() <= tol, "zip_reduce disagrees at n={n}");
         assert!((dot_sum(&a, &b) - want).abs() <= tol, "zip_sum disagrees at n={n}");
-        assert!((dot_zip_reduce_k4(&a, &b) - want).abs() <= tol, "zip_reduce_k4 disagrees at n={n}");
-        assert!((dot_zip_reduce_k8(&a, &b) - want).abs() <= tol, "zip_reduce_k8 disagrees at n={n}");
-        assert!((dot_zip_reduce_k12(&a, &b) - want).abs() <= tol, "zip_reduce_k12 disagrees at n={n}");
-        assert!((dot_zip_reduce_k16(&a, &b) - want).abs() <= tol, "zip_reduce_k16 disagrees at n={n}");
 
         g.bench_with_input(BenchmarkId::new("hydroplane", n), &n, |bch, _| {
             bch.iter(|| dot(black_box(&a), black_box(&b)))
@@ -231,18 +205,6 @@ fn bench(c: &mut Criterion) {
         });
         g.bench_with_input(BenchmarkId::new("zip_sum", n), &n, |bch, _| {
             bch.iter(|| dot_sum(black_box(&a), black_box(&b)))
-        });
-        g.bench_with_input(BenchmarkId::new("zip_reduce_k4", n), &n, |bch, _| {
-            bch.iter(|| dot_zip_reduce_k4(black_box(&a), black_box(&b)))
-        });
-        g.bench_with_input(BenchmarkId::new("zip_reduce_k8", n), &n, |bch, _| {
-            bch.iter(|| dot_zip_reduce_k8(black_box(&a), black_box(&b)))
-        });
-        g.bench_with_input(BenchmarkId::new("zip_reduce_k12", n), &n, |bch, _| {
-            bch.iter(|| dot_zip_reduce_k12(black_box(&a), black_box(&b)))
-        });
-        g.bench_with_input(BenchmarkId::new("zip_reduce_k16", n), &n, |bch, _| {
-            bch.iter(|| dot_zip_reduce_k16(black_box(&a), black_box(&b)))
         });
         g.bench_with_input(BenchmarkId::new("scalar", n), &n, |bch, _| {
             bch.iter(|| dot_scalar(black_box(&a), black_box(&b)))

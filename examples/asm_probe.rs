@@ -36,20 +36,6 @@ fn dot_ilp<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
     .reduce_sum()
 }
 
-#[kernel]
-fn dot_ilp8<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
-    ctx.zip_reduce_k::<8, _, _, _>(
-        a,
-        b,
-        0.0,
-        0.0,
-        ctx.splat(0.0),
-        |acc, x, y| x.fma(y, acc),
-        |p, q| p + q,
-    )
-    .reduce_sum()
-}
-
 #[unsafe(no_mangle)]
 #[inline(never)]
 pub fn probe_hydro(a: &[f32], b: &[f32]) -> f32 {
@@ -66,12 +52,6 @@ pub fn probe_fold(a: &[f32], b: &[f32]) -> f32 {
 #[inline(never)]
 pub fn probe_ilp(a: &[f32], b: &[f32]) -> f32 {
     dot_ilp(a, b)
-}
-
-#[unsafe(no_mangle)]
-#[inline(never)]
-pub fn probe_ilp8(a: &[f32], b: &[f32]) -> f32 {
-    dot_ilp8(a, b)
 }
 
 #[unsafe(no_mangle)]
@@ -96,11 +76,10 @@ fn main() {
     let a: Vec<f32> = (0..64).map(|i| i as f32).collect();
     let b: Vec<f32> = (0..64).map(|i| (64 - i) as f32).collect();
     println!(
-        "{} {} {} {} {}",
+        "{} {} {} {}",
         black_box(probe_hydro(black_box(&a), black_box(&b))),
         black_box(probe_fold(black_box(&a), black_box(&b))),
         black_box(probe_ilp(black_box(&a), black_box(&b))),
-        black_box(probe_ilp8(black_box(&a), black_box(&b))),
         black_box(probe_wide4(black_box(&a), black_box(&b)))
     );
 }

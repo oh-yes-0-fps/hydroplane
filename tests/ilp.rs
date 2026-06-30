@@ -21,53 +21,23 @@ fn dot_zip_reduce<T: Scalar, S: Backend<T>>(g: Gang<T, S>, a: &[T], b: &[T]) -> 
     .to_f64()
 }
 
-macro_rules! dot_k {
-    ($name:ident, $k:literal) => {
-        fn $name<T: Scalar, S: Backend<T>>(g: Gang<T, S>, a: &[T], b: &[T]) -> f64 {
-            g.zip_reduce_k::<$k, _, _, _>(
-                a,
-                b,
-                T::ZERO,
-                T::ZERO,
-                g.splat(T::ZERO),
-                |acc, x, y| x.fma(y, acc),
-                |p, q| p + q,
-            )
-            .reduce_sum()
-            .to_f64()
-        }
-    };
-}
-dot_k!(dot_k1, 1);
-dot_k!(dot_k2, 2);
-dot_k!(dot_k4, 4);
-dot_k!(dot_k8, 8);
-dot_k!(dot_k12, 12);
-dot_k!(dot_k16, 16);
-
 fn sum_reduce<T: Scalar, S: Backend<T>>(g: Gang<T, S>, a: &[T]) -> f64 {
     g.reduce(a, T::ZERO, g.splat(T::ZERO), |acc, x| acc + x, |p, q| p + q)
         .reduce_sum()
         .to_f64()
 }
 
+// The unroll factor K is now chosen automatically (dispatch wraps the backend in `Unroll<S, K>`),
+// so a kernel can't pin K from the outside; both `zip_reduce` and `reduce` exercise whichever K this
+// core resolved. The size sweep below crosses the K*lanes() window and tail boundaries either way.
 struct Variants<'a, T: Scalar> {
     a: &'a [T],
     b: &'a [T],
 }
 impl<T: Scalar> Kernel<T> for Variants<'_, T> {
-    type Output = [f64; 8];
-    fn run<S: Backend<T>>(self, g: Gang<T, S>) -> [f64; 8] {
-        [
-            dot_k1(g, self.a, self.b),
-            dot_k2(g, self.a, self.b),
-            dot_k4(g, self.a, self.b),
-            dot_k8(g, self.a, self.b),
-            dot_k12(g, self.a, self.b),
-            dot_k16(g, self.a, self.b),
-            dot_zip_reduce(g, self.a, self.b),
-            sum_reduce(g, self.a),
-        ]
+    type Output = [f64; 2];
+    fn run<S: Backend<T>>(self, g: Gang<T, S>) -> [f64; 2] {
+        [dot_zip_reduce(g, self.a, self.b), sum_reduce(g, self.a)]
     }
 }
 
@@ -91,16 +61,15 @@ fn check_all<T: Scalar + SimdDispatch>() {
             ("scalar", run_scalar(Variants { a: &a, b: &b })),
             ("dispatch", dispatch(Variants { a: &a, b: &b })),
         ] {
-            for (idx, &got) in outs[..7].iter().enumerate() {
-                assert!(
-                    (got - want).abs() <= tol,
-                    "{label} dot mismatch n={n} variant={idx}: got {got}, want {want}"
-                );
-            }
             assert!(
-                (outs[7] - sum_want).abs() <= sum_tol,
+                (outs[0] - want).abs() <= tol,
+                "{label} dot mismatch n={n}: got {}, want {want}",
+                outs[0]
+            );
+            assert!(
+                (outs[1] - sum_want).abs() <= sum_tol,
                 "{label} sum mismatch n={n}: got {}, want {sum_want}",
-                outs[7]
+                outs[1]
             );
         }
     }

@@ -821,7 +821,11 @@ const AMX_MIN_DIM: usize = 8;
 /// accumulator. The `N` dimension is processed in whole 16-wide column blocks — the caller gates on
 /// `N % 16 == 0`. Each `k`-pair broadcasts the `A` pair and VNNI-packs the two `B` rows
 /// ([`crate::arch::avx512bf16`]); an odd final `k` folds in one `f32` FMA.
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(any(no_avx, no_avx512)),
+    any(feature = "std", static_dispatch)
+))]
 #[target_feature(enable = "avx512bf16,avx512f,avx512bw")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn bf16_dpbf16_gemm<const M: usize, const N: usize, const K: usize>(
@@ -1149,15 +1153,29 @@ where
     // x86_64: bf16 tiles on an AVX-512-BF16 host take the `vdpbf16ps` packed dot-product, keeping
     // operands in bf16 (full-rate multiply-accumulate) instead of the f32 widen path. Gated to whole
     // 16-wide column blocks; other `N` fall through to the f32 SIMD GEMM below.
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(any(no_avx, no_avx512)),
+        any(feature = "std", static_dispatch)
+    ))]
     if N >= 16 && N.is_multiple_of(16) && K >= 2 {
         use core::any::TypeId;
+        // `static_dispatch` reads the guaranteed `target_feature`s at compile time instead of probing
+        // the CPU, so the dpbf16 path needs no runtime feature branch (and works without std).
+        #[cfg(not(static_dispatch))]
+        let avx512bf16 = is_x86_feature_detected!("avx512bf16")
+            && is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw");
+        #[cfg(static_dispatch)]
+        let avx512bf16 = cfg!(all(
+            target_feature = "avx512bf16",
+            target_feature = "avx512f",
+            target_feature = "avx512bw"
+        ));
         if let (Some(adp), Some(bdp)) = (a_dense, b_dense)
             && TypeId::of::<T>() == TypeId::of::<half::bf16>()
             && TypeId::of::<T::Compute>() == TypeId::of::<f32>()
-            && is_x86_feature_detected!("avx512bf16")
-            && is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx512bw")
+            && avx512bf16
         {
             // SAFETY: `T == bf16` and `T::Compute == f32` (TypeId-checked), inputs dense row-major, so
             // each reinterpret is an identity layout cast; the CPU has avx512bf16+f+bw (detected above).
@@ -1322,6 +1340,8 @@ macro_rules! impl_array_matrix_backend {
 
 impl_array_matrix_backend!(crate::backend::ScalarBackend, simd);
 
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+impl_array_matrix_backend!(crate::backend::avx1::Avx1, simd);
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 impl_array_matrix_backend!(crate::backend::avx2::Avx2, simd);
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
@@ -1610,17 +1630,79 @@ macro_rules! impl_matrix_dispatch_simd {
             #[inline]
             #[allow(unreachable_code)]
             fn dispatch_matrix<K: MatrixKernel<Self>>(kernel: K) -> K::Output {
-                #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "std"))]
+                #[cfg(all(
+                    any(target_arch = "x86_64", target_arch = "x86"),
+                    feature = "std",
+                    not(static_dispatch)
+                ))]
                 {
+                    #[cfg(not(any(no_avx, no_avx512)))]
                     if let Some(b) = crate::backend::avx512::Avx512::detect() {
                         return kernel.run(Gang::new(b));
                     }
+                    #[cfg(not(no_avx))]
                     if let Some(b) = crate::backend::avx2::Avx2::detect() {
+                        return kernel.run(Gang::new(b));
+                    }
+                    #[cfg(not(no_avx))]
+                    if let Some(b) = crate::backend::avx1::Avx1::detect() {
                         return kernel.run(Gang::new(b));
                     }
                     if let Some(b) = crate::backend::sse4::Sse4::detect() {
                         return kernel.run(Gang::new(b));
                     }
+                }
+                // Compile-time selection — no-std, or `static_dispatch` on std: the widest
+                // `target_feature`-guaranteed tier surviving the `no_avx*` cfgs, with no branch.
+                #[cfg(all(
+                    any(target_arch = "x86_64", target_arch = "x86"),
+                    any(not(feature = "std"), static_dispatch),
+                    target_feature = "avx512f",
+                    not(any(no_avx, no_avx512))
+                ))]
+                {
+                    // SAFETY: target compiled with avx512f.
+                    let b = unsafe { crate::backend::avx512::Avx512::new_unchecked() };
+                    return kernel.run(Gang::new(b));
+                }
+                #[cfg(all(
+                    any(target_arch = "x86_64", target_arch = "x86"),
+                    any(not(feature = "std"), static_dispatch),
+                    not(all(target_feature = "avx512f", not(any(no_avx, no_avx512)))),
+                    target_feature = "avx2",
+                    target_feature = "fma",
+                    not(no_avx)
+                ))]
+                {
+                    // SAFETY: target compiled with avx2+fma.
+                    let b = unsafe { crate::backend::avx2::Avx2::new_unchecked() };
+                    return kernel.run(Gang::new(b));
+                }
+                #[cfg(all(
+                    any(target_arch = "x86_64", target_arch = "x86"),
+                    any(not(feature = "std"), static_dispatch),
+                    not(all(target_feature = "avx512f", not(any(no_avx, no_avx512)))),
+                    not(all(target_feature = "avx2", target_feature = "fma", not(no_avx))),
+                    target_feature = "avx",
+                    not(no_avx)
+                ))]
+                {
+                    // SAFETY: target compiled with avx.
+                    let b = unsafe { crate::backend::avx1::Avx1::new_unchecked() };
+                    return kernel.run(Gang::new(b));
+                }
+                #[cfg(all(
+                    any(target_arch = "x86_64", target_arch = "x86"),
+                    any(not(feature = "std"), static_dispatch),
+                    not(all(target_feature = "avx512f", not(any(no_avx, no_avx512)))),
+                    not(all(target_feature = "avx2", target_feature = "fma", not(no_avx))),
+                    not(all(target_feature = "avx", not(no_avx))),
+                    target_feature = "sse4.1"
+                ))]
+                {
+                    // SAFETY: target compiled with sse4.1.
+                    let b = unsafe { crate::backend::sse4::Sse4::new_unchecked() };
+                    return kernel.run(Gang::new(b));
                 }
                 // aarch64: non-Apple SVE token (its `mma` lands on the SME ZA engine where present),
                 // else NEON. Apple → NEON, whose large-tile `mma` delegates to Accelerate.
@@ -1653,11 +1735,30 @@ mod half_matrix_dispatch {
         #[inline]
         #[allow(unreachable_code)]
         fn dispatch_matrix<K: MatrixKernel<Self>>(kernel: K) -> K::Output {
-            #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "std"))]
+            #[cfg(all(
+                any(target_arch = "x86_64", target_arch = "x86"),
+                feature = "std",
+                not(static_dispatch),
+                not(no_avx)
+            ))]
             {
                 if let Some(b) = crate::backend::avx2::Avx2::detect() {
                     return kernel.run(Gang::new(b));
                 }
+            }
+            // Compile-time AVX2 F16C widen tile — no-std, or `static_dispatch` on std.
+            #[cfg(all(
+                any(target_arch = "x86_64", target_arch = "x86"),
+                any(not(feature = "std"), static_dispatch),
+                target_feature = "avx2",
+                target_feature = "fma",
+                target_feature = "f16c",
+                not(no_avx)
+            ))]
+            {
+                // SAFETY: target compiled with avx2+fma+f16c.
+                let b = unsafe { crate::backend::avx2::Avx2::new_unchecked() };
+                return kernel.run(Gang::new(b));
             }
             crate::dispatch::aarch64_dispatch_tail!(kernel, crate::backend::ScalarBackend);
             kernel.run(Gang::new(crate::backend::ScalarBackend))
@@ -1670,14 +1771,46 @@ mod half_matrix_dispatch {
         #[inline]
         #[allow(unreachable_code)]
         fn dispatch_matrix<K: MatrixKernel<Self>>(kernel: K) -> K::Output {
-            #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "std"))]
+            #[cfg(all(
+                any(target_arch = "x86_64", target_arch = "x86"),
+                feature = "std",
+                not(static_dispatch)
+            ))]
             {
+                #[cfg(not(any(no_avx, no_avx512)))]
                 if let Some(b) = crate::backend::avx512::Avx512::detect() {
                     return kernel.run(Gang::new(b));
                 }
+                #[cfg(not(no_avx))]
                 if let Some(b) = crate::backend::avx2::Avx2::detect() {
                     return kernel.run(Gang::new(b));
                 }
+            }
+            // Compile-time bf16 widen tile — no-std, or `static_dispatch` on std: AVX-512 widen if the
+            // build guarantees `avx512f` (and AVX-512 is enabled), else the AVX2 widen path.
+            #[cfg(all(
+                any(target_arch = "x86_64", target_arch = "x86"),
+                any(not(feature = "std"), static_dispatch),
+                target_feature = "avx512f",
+                not(any(no_avx, no_avx512))
+            ))]
+            {
+                // SAFETY: target compiled with avx512f.
+                let b = unsafe { crate::backend::avx512::Avx512::new_unchecked() };
+                return kernel.run(Gang::new(b));
+            }
+            #[cfg(all(
+                any(target_arch = "x86_64", target_arch = "x86"),
+                any(not(feature = "std"), static_dispatch),
+                not(all(target_feature = "avx512f", not(any(no_avx, no_avx512)))),
+                target_feature = "avx2",
+                target_feature = "fma",
+                not(no_avx)
+            ))]
+            {
+                // SAFETY: target compiled with avx2+fma.
+                let b = unsafe { crate::backend::avx2::Avx2::new_unchecked() };
+                return kernel.run(Gang::new(b));
             }
             crate::dispatch::aarch64_dispatch_tail!(kernel, crate::backend::neon::Neon::new());
             crate::dispatch::wasm_dispatch_tail!(kernel);

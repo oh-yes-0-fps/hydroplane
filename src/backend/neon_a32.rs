@@ -179,6 +179,22 @@ unsafe fn neg(a: &F32x4) -> F32x4 {
     o
 }
 
+/// Absolute value via `vabs.f32` — a single NEON op, cheaper than `max(a, -a)`.
+#[inline]
+unsafe fn abs(a: &F32x4) -> F32x4 {
+    let mut o = F32x4::zeroed();
+    asm!(
+        ".fpu neon",
+        "vld1.32 {{q0}}, [{a}]",
+        "vabs.f32 q0, q0",
+        "vst1.32 {{q0}}, [{o}]",
+        a = in(reg) a.0.as_ptr(), o = in(reg) o.0.as_mut_ptr(),
+        out("q0") _,
+        options(nostack),
+    );
+    o
+}
+
 /// `a * b + c`, via `vmla.f32` (NEON multiply-accumulate; two roundings, not IEEE-fused).
 #[inline]
 unsafe fn fma(a: &F32x4, b: &F32x4, c: &F32x4) -> F32x4 {
@@ -346,6 +362,10 @@ impl Backend<f32> for Neon {
     #[inline(always)]
     fn neg(self, a: F32x4) -> F32x4 {
         unsafe { neg(&a) }
+    }
+    #[inline(always)]
+    fn abs(self, a: F32x4) -> F32x4 {
+        unsafe { abs(&a) }
     }
     #[inline(always)]
     fn fma(self, a: F32x4, b: F32x4, c: F32x4) -> F32x4 {

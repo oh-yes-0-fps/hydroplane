@@ -7,6 +7,8 @@ struct Out<T> {
     all: bool,
     zip_any: bool,
     zip_all: bool,
+    any_n: bool,
+    all_n: bool,
     zip3: f64,
     total: f64,
     dot: f64,
@@ -44,6 +46,11 @@ impl<T: Scalar> Kernel<T> for Helpers<'_, T> {
             x.le(y)
         });
 
+        // N-column (3) any/all — active-masked tail, no sentinel fills.
+        let ten = g.splat(T::from_f64(10.0));
+        let any_n = g.any_n([a, b, c], |[x, y, z]| (x + y + z).gt(g.splat(three)));
+        let all_n = g.all_n([a, b, c], |[x, y, z]| (x + y + z).lt(ten));
+
         let zip3 = g
             .zip3_fold(
                 a,
@@ -65,6 +72,8 @@ impl<T: Scalar> Kernel<T> for Helpers<'_, T> {
             all,
             zip_any,
             zip_all,
+            any_n,
+            all_n,
             zip3,
             total: g.total(a).to_f64(),
             dot: g.dot(a, b).to_f64(),
@@ -102,6 +111,8 @@ fn check_all<T: Scalar + SimdDispatch>() {
         let all_want = a.iter().all(|&x| x.to_f64() < 3.0);
         let zip_any_want = a.iter().zip(&b).any(|(&x, &y)| x.to_f64() > y.to_f64());
         let zip_all_want = a.iter().zip(&b).all(|(&x, &y)| x.to_f64() <= y.to_f64());
+        let any_n_want = (0..n).any(|i| a[i].to_f64() + b[i].to_f64() + c[i].to_f64() > 3.0);
+        let all_n_want = (0..n).all(|i| a[i].to_f64() + b[i].to_f64() + c[i].to_f64() < 10.0);
         let zip3_want: f64 = a
             .iter()
             .zip(&b)
@@ -139,6 +150,8 @@ fn check_all<T: Scalar + SimdDispatch>() {
             assert_eq!(out.all, all_want, "{label} all mismatch n={n}");
             assert_eq!(out.zip_any, zip_any_want, "{label} zip_any mismatch n={n}");
             assert_eq!(out.zip_all, zip_all_want, "{label} zip_all mismatch n={n}");
+            assert_eq!(out.any_n, any_n_want, "{label} any_n mismatch n={n}");
+            assert_eq!(out.all_n, all_n_want, "{label} all_n mismatch n={n}");
             assert!(
                 close(out.zip3, zip3_want),
                 "{label} zip3_fold mismatch n={n}: got {}, want {zip3_want}",
@@ -176,4 +189,57 @@ fn helpers_match_oracle_f32() {
 #[test]
 fn helpers_match_oracle_f64() {
     check_all::<f64>();
+}
+
+struct MaskAbs<'a, T: Scalar> {
+    a: &'a [T],
+    cnt: usize,
+}
+
+impl<T: Scalar> Kernel<T> for MaskAbs<'_, T> {
+    type Output = (Vec<T>, usize, Vec<T>);
+    fn run<S: Backend<T>>(self, g: Gang<T, S>) -> (Vec<T>, usize, Vec<T>) {
+        let lanes = g.lanes();
+        let active = self.cnt.min(lanes);
+        let m = g.active_mask(active);
+        let mut flags = vec![T::ZERO; lanes];
+        g.splat(T::ONE).select(m, g.splat(T::ZERO)).store(&mut flags);
+
+        let mut absv = vec![T::ZERO; self.a.len()];
+        g.map(self.a, &mut absv, T::ZERO, |x| x.abs());
+        (flags, active, absv)
+    }
+}
+
+fn check_mask_abs<T: Scalar + SimdDispatch>() {
+    for &cnt in &[0usize, 1, 2, 5, 8, 100] {
+        for &n in SIZES {
+            let a: Vec<T> = (0..n)
+                .map(|i| T::from_f64((i % 11) as f64 * 0.5 - 2.5))
+                .collect();
+            for (label, (flags, active, absv)) in [
+                ("scalar", run_scalar(MaskAbs { a: &a, cnt })),
+                ("dispatch", dispatch(MaskAbs { a: &a, cnt })),
+            ] {
+                for (i, f) in flags.iter().enumerate() {
+                    let want = if i < active { 1.0 } else { 0.0 };
+                    assert_eq!(f.to_f64(), want, "{label} active_mask cnt={cnt} lane={i}");
+                }
+                assert_eq!(absv.len(), a.len());
+                for (i, got) in absv.iter().enumerate() {
+                    assert_eq!(got.to_f64(), a[i].to_f64().abs(), "{label} abs n={n} i={i}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mask_abs_match_oracle_f32() {
+    check_mask_abs::<f32>();
+}
+
+#[test]
+fn mask_abs_match_oracle_f64() {
+    check_mask_abs::<f64>();
 }

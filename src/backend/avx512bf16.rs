@@ -153,6 +153,10 @@ impl Backend<bf16> for Avx512Bf16 {
         self.f32().all(m)
     }
     #[inline(always)]
+    fn mask_bitmask(self, m: __mmask16) -> u32 {
+        m as u32
+    }
+    #[inline(always)]
     fn reduce_sum(self, v: __m512) -> bf16 {
         bf16::from_f32(self.f32().reduce_sum(v))
     }

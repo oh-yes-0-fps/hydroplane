@@ -15,10 +15,49 @@
 //! and monomorphizes per `(Backend, Scalar)` — the ergonomics cost nothing at runtime.
 
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::ops::{Add, BitAnd, BitOr, Div, Mul, Neg, Not, Sub};
 
 use crate::backend::Backend;
 use crate::scalar::Scalar;
+
+/// The unroll factor `build.rs` resolved for a `static_dispatch` + pinned-cpu build (the
+/// `hp_resolved_unroll` cfg). `HP_STATIC_UNROLL` is the decimal `K`; if it is somehow unset under the
+/// cfg, fall back to 4. A compile-time constant, so the dispatch wrapper and reductions take one fixed
+/// `K` with no runtime sweep.
+#[cfg(hp_resolved_unroll)]
+pub(crate) const STATIC_UNROLL: usize = {
+    const fn parse(s: &str) -> usize {
+        let b = s.as_bytes();
+        let (mut v, mut i) = (0usize, 0usize);
+        while i < b.len() {
+            v = v * 10 + (b[i] - b'0') as usize;
+            i += 1;
+        }
+        v
+    }
+    match option_env!("HP_STATIC_UNROLL") {
+        Some(s) => parse(s),
+        None => 4,
+    }
+};
+
+/// The independent-chain count for the streaming element-wise loops (`map`/`zip_map`/`map_n`):
+/// the backend's [`UNROLL`](Backend::UNROLL) constant, except `1` under `no_ilp` or on SPIR-V where
+/// there are no FP pipes to fill. Folds to a literal, so the inner `while j < k` unrolls to exactly
+/// `k` chains. Unlike the reductions, consecutive element-wise iterations are already independent, so
+/// this only adds software pipelining on top of what the out-of-order core extracts on its own.
+#[cfg(not(any(no_ilp, target_arch = "spirv")))]
+#[inline(always)]
+fn unroll_k<T: Scalar, S: Backend<T>>() -> usize {
+    <S as Backend<T>>::UNROLL
+}
+#[cfg(any(no_ilp, target_arch = "spirv"))]
+#[inline(always)]
+#[allow(clippy::extra_unused_type_parameters)] // `S` keeps the call sites uniform with the ILP variant.
+fn unroll_k<T: Scalar, S: Backend<T>>() -> usize {
+    1
+}
 
 /// The execution *context* for scalar `T` on backend `S` — the "gang" of lanes that step through
 /// the kernel together (the ISPC term for the group of program instances running in lockstep). It is
@@ -122,6 +161,31 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
     #[inline(always)]
     pub fn backend(self) -> S {
         self.backend
+    }
+
+    /// A mask with the first `cnt` lanes active (`true`) and the rest inactive — the general,
+    /// always-correct tail handler for a short final [`chunks`](Self::chunks) step or a fixed-`N`
+    /// batch. Combine it with [`select`](Varying::select) or the mask algebra (`&`/`|`/`!`) to drop
+    /// padding lanes from a result.
+    ///
+    /// Prefer this to the "poison the tail with a sentinel" idiom (a NaN-filled
+    /// [`load_partial`](Self::load_partial)) whenever a [`min`](Varying::min)/[`max`](Varying::max) —
+    /// including [`abs`](Varying::abs), which is `max(x, -x)` — sits between the fill and the compare:
+    /// those ops are non-NaN-propagating, so they scrub the poison and let padding contaminate the
+    /// reduction. An explicit active mask has no such hazard.
+    ///
+    /// `cnt` must not exceed [`lanes()`](Self::lanes). The lane ramp is a constant-width `[0, 1, …]`
+    /// stack array plus one compare, so for a concrete backend (constant `lanes()`) it folds to a
+    /// vector constant and a single `cmp` — the same code a hand-rolled lane ramp emits.
+    #[inline]
+    pub fn active_mask(self, cnt: usize) -> Mask<T, S> {
+        let n = self.backend.lanes();
+        debug_assert!(cnt <= n, "Gang::active_mask: cnt must not exceed lanes()");
+        let mut ramp = [T::ZERO; crate::MAX_LANES];
+        for (i, slot) in ramp[..n].iter_mut().enumerate() {
+            *slot = T::from_f64(i as f64);
+        }
+        self.load(&ramp[..n]).lt(self.splat(T::from_f64(cnt as f64)))
     }
 
     /// Fold a kernel over one column without writing the loop. The library walks full registers at a
@@ -235,7 +299,19 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
     pub fn map(self, a: &[T], out: &mut [T], fill: T, mut f: impl FnMut(Varying<T, S>) -> Varying<T, S>) {
         let n = self.backend.lanes();
         let len = a.len().min(out.len());
+        let k = unroll_k::<T, S>();
         let mut off = 0;
+        // `k` independent load→f→store groups per step: disjoint memory, so the groups carry no
+        // dependency and the core (and the unrolled schedule) keeps several in flight.
+        while off + k * n <= len {
+            let mut j = 0;
+            while j < k {
+                let o = off + j * n;
+                f(self.load(&a[o..o + n])).store(&mut out[o..o + n]);
+                j += 1;
+            }
+            off += k * n;
+        }
         while off + n <= len {
             f(self.load(&a[off..off + n])).store(&mut out[off..off + n]);
             off += n;
@@ -260,7 +336,19 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
     ) {
         let n = self.backend.lanes();
         let len = a.len().min(b.len()).min(out.len());
+        let k = unroll_k::<T, S>();
         let mut off = 0;
+        while off + k * n <= len {
+            let mut j = 0;
+            while j < k {
+                let o = off + j * n;
+                let va = self.load(&a[o..o + n]);
+                let vb = self.load(&b[o..o + n]);
+                f(va, vb).store(&mut out[o..o + n]);
+                j += 1;
+            }
+            off += k * n;
+        }
         while off + n <= len {
             let va = self.load(&a[off..off + n]);
             let vb = self.load(&b[off..off + n]);
@@ -271,6 +359,51 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
             let va = self.load_partial(&a[off..len], fill_a);
             let vb = self.load_partial(&b[off..len], fill_b);
             f(va, vb).store_partial(&mut out[off..len]);
+        }
+    }
+
+    /// In-place `N`-column element-wise transform: load one register from each of the `N` columns,
+    /// hand the `[Varying; N]` lane-tuple to `f`, and write its `[Varying; N]` result back to the
+    /// same columns. The multi-channel companion to [`map`](Self::map) for the case where every
+    /// output channel depends on every input channel — an SoA point transform (`(xs, ys, zs)`
+    /// rotated/translated together) that a per-column [`map`](Self::map) cannot express. All columns
+    /// must be the same length; each channel's inactive tail is filled with `fill` for the load and
+    /// dropped by the partial store. Uses the same `K`-chain ILP unrolling as [`map`](Self::map).
+    #[inline]
+    pub fn map_n<const N: usize>(
+        self,
+        cols: [&mut [T]; N],
+        fill: T,
+        mut f: impl FnMut([Varying<T, S>; N]) -> [Varying<T, S>; N],
+    ) {
+        let n = self.backend.lanes();
+        let len = if N == 0 { 0 } else { cols[0].len() };
+        let k = unroll_k::<T, S>();
+        let mut off = 0;
+        while off + k * n <= len {
+            let mut j = 0;
+            while j < k {
+                let o = off + j * n;
+                let rs = f(core::array::from_fn(|c| self.load(&cols[c][o..o + n])));
+                for c in 0..N {
+                    rs[c].store(&mut cols[c][o..o + n]);
+                }
+                j += 1;
+            }
+            off += k * n;
+        }
+        while off + n <= len {
+            let rs = f(core::array::from_fn(|c| self.load(&cols[c][off..off + n])));
+            for c in 0..N {
+                rs[c].store(&mut cols[c][off..off + n]);
+            }
+            off += n;
+        }
+        if off < len {
+            let rs = f(core::array::from_fn(|c| self.load_partial(&cols[c][off..len], fill)));
+            for c in 0..N {
+                rs[c].store_partial(&mut cols[c][off..len]);
+            }
         }
     }
 
@@ -375,112 +508,301 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
         true
     }
 
-    /// Two-column reduction across `K` independent accumulator chains — the ILP/superscalar shape
-    /// from `future/ILP_SUPERSCALAR.md`. The body advances `K` chains with no data dependency
-    /// between them per iteration (stride `K * lanes()`), so a wide out-of-order core can keep one
-    /// FMA in flight per pipe instead of stalling on a single latency-bound chain. `step` runs once
-    /// per chain per loaded register pair; `combine` folds the `K` chains as a balanced tree (depth
-    /// `~log2(K)`, correct for non-power-of-two `K`). A single masked tail handles the remainder.
-    ///
-    /// Prefer [`zip_reduce`](Self::zip_reduce), which picks `K` from the cached runtime saturation
-    /// point; reach for this directly to pin a specific factor (benchmarking the knee, or a target
-    /// whose `K` you already know).
+    /// `N`-column [`any`](Self::any): `true` as soon as some lane satisfies `pred`, over `N` columns
+    /// loaded in lockstep. `core::array::from_fn` unrolls the per-column loads for const `N`, so this
+    /// monomorphizes to the same flat code as a hand-unrolled [`zip_any`](Self::zip_any) — for any
+    /// arity. The inactive lanes of the final partial register are discarded automatically via
+    /// [`active_mask`](Self::active_mask), so — unlike [`any`](Self::any)/[`zip_any`](Self::zip_any) —
+    /// **no sentinel fill is needed**: columns load with `T::ZERO` and the tail mask drops them. This
+    /// makes it correct even when no value can be chosen that `pred` rejects (e.g. a plane test whose
+    /// normal may point either way). All columns are assumed the same length (`cols[0].len()`).
     #[inline]
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(not(any(no_ilp, target_arch = "spirv")))]
-    pub fn zip_reduce_k<const K: usize, A: Copy, FS, FC>(
+    pub fn any_n<const N: usize>(
         self,
-        a: &[T],
-        b: &[T],
-        fill_a: T,
-        fill_b: T,
-        init: A,
-        step: FS,
-        combine: FC,
-    ) -> A
-    where
-        FS: Fn(A, Varying<T, S>, Varying<T, S>) -> A,
-        FC: Fn(A, A) -> A,
-    {
+        cols: [&[T]; N],
+        mut pred: impl FnMut([Varying<T, S>; N]) -> Mask<T, S>,
+    ) -> bool {
         let n = self.backend.lanes();
-        let len = a.len().min(b.len());
-        let mut acc = [init; K];
+        let len = if N == 0 { 0 } else { cols[0].len() };
         let mut off = 0;
-        // `while off + K*n <= len` (not a counted `0..len/(K*n)`) keeps the window load in bounds from
-        // the guard alone. The per-iteration `K*n`-wide reborrow is the trick that drops *every*
-        // per-chain bounds check: within a window of constant length `K*n`, each `[o..o + n]` with
-        // `o = j*n < K*n` is in bounds by constants only, where indexing the original slices at
-        // `off + j*n` leaves the optimizer unable to prove `off + j*n + n <= len` for `j < K-1`.
-        while off + K * n <= len {
-            let aw = &a[off..off + K * n];
-            let bw = &b[off..off + K * n];
+        while off + n <= len {
+            let vs = core::array::from_fn(|j| self.load(&cols[j][off..off + n]));
+            if pred(vs).any() {
+                return true;
+            }
+            off += n;
+        }
+        if off < len {
+            let cnt = len - off;
+            let vs = core::array::from_fn(|j| self.load_partial(&cols[j][off..len], T::ZERO));
+            return (pred(vs) & self.active_mask(cnt)).any();
+        }
+        false
+    }
+
+    /// `N`-column [`all`](Self::all): the mirror of [`any_n`](Self::any_n). Inactive tail lanes are
+    /// forced *true* (via `!active_mask`), so no sentinel fill is needed. All columns are assumed the
+    /// same length (`cols[0].len()`).
+    #[inline]
+    pub fn all_n<const N: usize>(
+        self,
+        cols: [&[T]; N],
+        mut pred: impl FnMut([Varying<T, S>; N]) -> Mask<T, S>,
+    ) -> bool {
+        let n = self.backend.lanes();
+        let len = if N == 0 { 0 } else { cols[0].len() };
+        let mut off = 0;
+        while off + n <= len {
+            let vs = core::array::from_fn(|j| self.load(&cols[j][off..off + n]));
+            if !pred(vs).all() {
+                return false;
+            }
+            off += n;
+        }
+        if off < len {
+            let cnt = len - off;
+            let vs = core::array::from_fn(|j| self.load_partial(&cols[j][off..len], T::ZERO));
+            return (pred(vs) | !self.active_mask(cnt)).all();
+        }
+        true
+    }
+
+    /// `N`-column count: the tallying sibling of [`any_n`](Self::any_n)/[`all_n`](Self::all_n).
+    /// Returns how many lanes across the whole column set satisfy `pred`, rather than
+    /// short-circuiting. Inactive tail lanes are dropped via [`active_mask`](Self::active_mask), so no
+    /// sentinel fill is needed. All columns are assumed the same length (`cols[0].len()`).
+    ///
+    /// Unlike the short-circuiting `any_n`/`all_n` (whose latency hides behind the early-out branch),
+    /// a full count is a loop-carried add chain — latency-bound on one accumulator. So this engages
+    /// the same `K`-independent-chain ILP as [`reduce`](Self::reduce): `K` is `S::UNROLL` (the factor
+    /// the dispatch adapter resolved and baked into the backend), small inputs stay single-chain, and
+    /// under `--cfg no_ilp` it collapses to the single accumulator with no scaffolding.
+    #[inline]
+    #[cfg(not(any(no_ilp, target_arch = "spirv")))]
+    pub fn count_n<const N: usize>(
+        self,
+        cols: [&[T]; N],
+        mut pred: impl FnMut([Varying<T, S>; N]) -> Mask<T, S>,
+    ) -> usize {
+        let n = self.backend.lanes();
+        let len = if N == 0 { 0 } else { cols[0].len() };
+        // `K` is the backend's compile-time chain count: `S::UNROLL` is a constant (`Unroll<_, K>`
+        // carries the factor the dispatch adapter resolved by detection), so the `while j < k` bounds
+        // and `k * n` stride below fold to literals and the loops unroll to exactly `k` chains — no
+        // const-generic helper needed. `K == 1` (and too-small inputs) take the single-chain fold.
+        let k = <S as Backend<T>>::UNROLL;
+        if k == 1 || len / n < 8 {
+            return self.count_n_fold(cols, pred).reduce_sum().to_f64() as usize;
+        }
+        let one = self.splat(T::ONE);
+        let zero = self.splat(T::ZERO);
+        let mut acc = [zero; crate::MAX_UNROLL];
+        let mut off = 0;
+        while off + k * n <= len {
+            // Reborrow a `k*n`-wide window per column so each `[o..o + n]` is in bounds by constants
+            // alone — drops the per-chain bounds checks the optimizer can't prove on the raw slices.
+            let w: [&[T]; N] = core::array::from_fn(|c| &cols[c][off..off + k * n]);
             let mut j = 0;
-            while j < K {
+            while j < k {
                 let o = j * n;
-                acc[j] = step(acc[j], self.load(&aw[o..o + n]), self.load(&bw[o..o + n]));
+                let vs = core::array::from_fn(|c| self.load(&w[c][o..o + n]));
+                acc[j] = acc[j] + one.select(pred(vs), zero);
                 j += 1;
             }
-            off += K * n;
+            off += k * n;
         }
-        // The `< K` leftover registers go to *distinct* chains, not all into `acc[0]` — dumping them
-        // serially would rebuild a long dependency chain and undo the ILP for any `len` that isn't a
-        // multiple of `K * lanes()`.
+        // Leftover `< k` full chunks go to *distinct* chains, not all into `acc[0]` — collapsing them
+        // would rebuild the latency chain the unroll just broke.
         let mut j = 0;
         while off + n <= len {
-            acc[j] = step(acc[j], self.load(&a[off..off + n]), self.load(&b[off..off + n]));
+            let vs = core::array::from_fn(|c| self.load(&cols[c][off..off + n]));
+            acc[j] = acc[j] + one.select(pred(vs), zero);
             off += n;
             j += 1;
         }
-        let mut width = K;
+        let mut width = k;
         while width > 1 {
             let half = width / 2;
             let mut j = 0;
             while j < half {
-                acc[j] = combine(acc[j], acc[width - half + j]);
+                acc[j] = acc[j] + acc[width - half + j];
                 j += 1;
             }
             width -= half;
         }
         let mut result = acc[0];
         if off < len {
-            let va = self.load_partial(&a[off..len], fill_a);
-            let vb = self.load_partial(&b[off..len], fill_b);
-            result = step(result, va, vb);
+            let cnt = len - off;
+            let vs = core::array::from_fn(|c| self.load_partial(&cols[c][off..len], T::ZERO));
+            let mask = pred(vs) & self.active_mask(cnt);
+            result = result + one.select(mask, zero);
         }
-        result
+        result.reduce_sum().to_f64() as usize
     }
 
-    /// ILP compiled out (`--cfg no_ilp` or the SPIR-V target): the multi-accumulator loop, the
-    /// `[init; K]` chain array and the tree-combine all collapse to the single-chain [`zip_fold`](Self::zip_fold),
-    /// so even an explicit `zip_reduce_k::<K>` emits no superscalar scaffolding. `K` and `combine` are
-    /// inert.
+    /// ILP compiled out: the single-accumulator chain is the whole story.
     #[inline]
-    #[allow(clippy::too_many_arguments)]
     #[cfg(any(no_ilp, target_arch = "spirv"))]
-    pub fn zip_reduce_k<const K: usize, A: Copy, FS, FC>(
+    pub fn count_n<const N: usize>(
         self,
-        a: &[T],
-        b: &[T],
-        fill_a: T,
-        fill_b: T,
-        init: A,
-        step: FS,
-        combine: FC,
-    ) -> A
-    where
-        FS: Fn(A, Varying<T, S>, Varying<T, S>) -> A,
-        FC: Fn(A, A) -> A,
-    {
-        let _ = combine;
-        self.zip_fold(a, b, fill_a, fill_b, init, step)
+        cols: [&[T]; N],
+        pred: impl FnMut([Varying<T, S>; N]) -> Mask<T, S>,
+    ) -> usize {
+        self.count_n_fold(cols, pred).reduce_sum().to_f64() as usize
     }
 
-    /// Two-column multi-accumulator reduction with `K` chosen from the cached runtime saturation
-    /// point ([`unroll`](Self::unroll)). The warm path is a single relaxed atomic load plus the
-    /// `match` below, then the `K`-unrolled [`zip_reduce_k`](Self::zip_reduce_k) loop — the per-call
-    /// dispatch cost stays negligible in a hot loop. `step` is the per-chain combinator (use
-    /// [`Varying::fma`] for a dot/AXPY-style update — one rounding, the throughput-bound op);
-    /// `combine` folds two chains.
+    /// Single-chain count accumulator (the shared tail/small-input path), returning the per-lane
+    /// partial sums to be reduced once by the caller — never a per-chunk horizontal `reduce_sum`,
+    /// which would put a cross-lane add in the hot loop that a hand-written SIMD count avoids.
+    #[inline]
+    fn count_n_fold<const N: usize>(
+        self,
+        cols: [&[T]; N],
+        mut pred: impl FnMut([Varying<T, S>; N]) -> Mask<T, S>,
+    ) -> Varying<T, S> {
+        let n = self.backend.lanes();
+        let len = if N == 0 { 0 } else { cols[0].len() };
+        let one = self.splat(T::ONE);
+        let zero = self.splat(T::ZERO);
+        let mut acc = zero;
+        let mut off = 0;
+        while off + n <= len {
+            let vs = core::array::from_fn(|j| self.load(&cols[j][off..off + n]));
+            acc = acc + one.select(pred(vs), zero);
+            off += n;
+        }
+        if off < len {
+            let cnt = len - off;
+            let vs = core::array::from_fn(|j| self.load_partial(&cols[j][off..len], T::ZERO));
+            let mask = pred(vs) & self.active_mask(cnt);
+            acc = acc + one.select(mask, zero);
+        }
+        acc
+    }
+
+    /// `N`-column hit visitor: like [`any_n`](Self::any_n), but instead of short-circuiting it calls
+    /// `on_hit(index)` for every lane (`index` in `0..cols[0].len()`) where `pred` holds, in order.
+    /// Returns whether any lane matched. Inactive tail lanes are masked out via
+    /// [`active_mask`](Self::active_mask), so no sentinel fill is needed. This is the index-collecting
+    /// shape — broadphase "mark every overlapping element" — that otherwise has to hand-roll the
+    /// chunk loop and a `select`-into-scratch lane scan. All columns are assumed the same length.
+    #[inline]
+    pub fn for_each_hit_n<const N: usize>(
+        self,
+        cols: [&[T]; N],
+        mut pred: impl FnMut([Varying<T, S>; N]) -> Mask<T, S>,
+        mut on_hit: impl FnMut(usize),
+    ) -> bool {
+        let len = if N == 0 { 0 } else { cols[0].len() };
+        let mut any = false;
+        for (off, cnt, active) in self.masked_chunks(len) {
+            let vs = core::array::from_fn(|j| self.load_partial(&cols[j][off..off + cnt], T::ZERO));
+            // Walk only the set lanes: `trailing_zeros` jumps to the next hit and the bit is
+            // cleared, so a sparse chunk costs one step per hit instead of a scan of every lane.
+            let mut bits = (pred(vs) & active).to_bitmask();
+            any |= bits != 0;
+            while bits != 0 {
+                on_hit(off + bits.trailing_zeros() as usize);
+                bits &= bits - 1;
+            }
+        }
+        any
+    }
+
+    /// Per-chunk [`active_mask`](Self::active_mask) alongside the [`chunks`](Self::chunks) walk:
+    /// yields `(offset, count, active)` per step. The two-phase collision kernels (broadphase reject,
+    /// then narrowphase on the survivors) need the same tail mask for both `any()` reductions while
+    /// keeping their own `continue`-on-empty control flow — which a single-predicate `any_n` can't
+    /// express. This collapses the hand-written `base`/`cnt`/`active_mask`/`base += n` loop — the most
+    /// repeated shape in those kernels — to `for (off, cnt, active) in ctx.masked_chunks(len)`.
+    #[inline]
+    pub fn masked_chunks(self, len: usize) -> impl Iterator<Item = (usize, usize, Mask<T, S>)> {
+        self.chunks(len).map(move |(off, cnt)| (off, cnt, self.active_mask(cnt)))
+    }
+
+    /// Splat each element of a fixed-size array to its own [`Varying`], returning them as an array —
+    /// the multi-channel companion to [`splat`](Self::splat). Collapses the ubiquitous
+    /// `let [cx, cy, cz] = ctx.splat_n([q[0], q[1], q[2]]);` (three near-identical splats of one
+    /// position/normal) into a single call that destructures.
+    #[inline]
+    pub fn splat_n<const N: usize>(self, vals: [T; N]) -> [Varying<T, S>; N] {
+        core::array::from_fn(|i| self.splat(vals[i]))
+    }
+
+    /// [`load`](Self::load) one full register from each of `N` columns. Every slice must be exactly
+    /// [`lanes()`](Self::lanes) long. The multi-channel companion to `load` for hand-written chunk
+    /// loops over several columns at once.
+    #[inline]
+    pub fn load_n<const N: usize>(self, cols: [&[T]; N]) -> [Varying<T, S>; N] {
+        core::array::from_fn(|i| self.load(cols[i]))
+    }
+
+    /// [`load_partial`](Self::load_partial) up to one register from each of `N` columns, filling the
+    /// inactive tail of every channel with `fill`. The multi-channel companion to `load_partial`:
+    /// turns the three-line `let x = ctx.load_partial(&xs[r], 0.0); let y = …; let z = …;` stanza into
+    /// `let [x, y, z] = ctx.load_partial_n([&xs[r], &ys[r], &zs[r]], 0.0);`.
+    #[inline]
+    pub fn load_partial_n<const N: usize>(self, cols: [&[T]; N], fill: T) -> [Varying<T, S>; N] {
+        core::array::from_fn(|i| self.load_partial(cols[i], fill))
+    }
+
+    /// Gather up to one register's worth of rows from an array-of-structures slice into `N` column
+    /// [`Varying`]s, via a caller-supplied row extractor. `items.len()` must not exceed
+    /// [`lanes()`](Self::lanes); `extract` maps each element to its `N` field values, and column `c`'s
+    /// inactive tail lanes are filled with `fills[c]`. This is the generic, dependency-free form of the
+    /// "scatter an `&[Vec3]` / `&[(Vec3, f32)]` chunk into per-channel lanes" idiom — the extractor
+    /// pulls the fields, so no geometry type leaks into this crate.
+    ///
+    /// Per-column fills let a kernel pick a sentinel that makes inactive lanes self-reject (e.g. a
+    /// radius of `NaN`, so a distance compare on the tail is always false), dropping the need for an
+    /// [`active_mask`](Self::active_mask) `&` after the predicate — the same trick a hand-written SIMD
+    /// gather uses to avoid masking the tail.
+    #[inline]
+    #[allow(clippy::needless_range_loop)]
+    pub fn gather_n<E, const N: usize>(
+        self,
+        items: &[E],
+        fills: [T; N],
+        mut extract: impl FnMut(&E) -> [T; N],
+    ) -> [Varying<T, S>; N] {
+        let n = self.backend.lanes();
+        let cnt = items.len();
+        debug_assert!(cnt <= n, "Gang::gather_n: more rows than lanes()");
+        // Stage exactly one register per column, then a single full-width `load`. Going through
+        // `load_partial` would re-copy the active prefix into a *second* staging buffer for tail
+        // chunks (double work); filling the inactive lanes in place here keeps it to one transpose
+        // pass + one load — the shape a hand-written SIMD gather compiles to.
+        let mut scratch = [[MaybeUninit::<T>::uninit(); crate::MAX_LANES]; N];
+        for (i, item) in items.iter().enumerate() {
+            let row = extract(item);
+            for c in 0..N {
+                scratch[c][i] = MaybeUninit::new(row[c]);
+            }
+        }
+        if cnt < n {
+            for c in 0..N {
+                for slot in &mut scratch[c][cnt..n] {
+                    *slot = MaybeUninit::new(fills[c]);
+                }
+            }
+        }
+        core::array::from_fn(|c| {
+            // SAFETY: lanes `0..cnt` were written from `items` and `cnt..n` from `fills` above.
+            let lane = unsafe { core::slice::from_raw_parts(scratch[c].as_ptr().cast::<T>(), n) };
+            self.load(lane)
+        })
+    }
+
+    /// Two-column multi-accumulator reduction across `K` independent chains — the ILP/superscalar
+    /// shape from `future/ILP_SUPERSCALAR.md`. `K` is chosen automatically: it is `S::UNROLL`, the
+    /// per-core saturation factor the dispatch adapter resolved and baked into the backend. Because
+    /// it's a compile-time constant, the `while j < k` bounds and the `k * lanes()` stride fold to
+    /// literals and the body unrolls to exactly `K` chains — a wide out-of-order core keeps one FMA in
+    /// flight per pipe instead of stalling on a single latency-bound chain — then a balanced tree folds
+    /// them (depth `~log2(K)`, correct for non-power-of-two `K`). `K == 1` (and inputs too small to
+    /// amortize the tree-combine) take the single-chain [`zip_fold`](Self::zip_fold). `step` is the
+    /// per-chain combinator (use [`Varying::fma`] for a dot/AXPY-style update — one rounding, the
+    /// throughput-bound op); `combine` folds two chains.
     #[inline]
     #[allow(clippy::too_many_arguments)]
     #[cfg(not(any(no_ilp, target_arch = "spirv")))]
@@ -498,28 +820,58 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
         FS: Fn(A, Varying<T, S>, Varying<T, S>) -> A,
         FC: Fn(A, A) -> A,
     {
-        // Too few registers for ILP's tree-combine to amortize: take the single-chain `zip_fold`
-        // directly — same fast loop as a hand-written reduction, and no atomic load or detection
-        // probe, so a tiny kernel is never slower than `fold`/`opt`.
-        let avail = a.len().min(b.len()) / self.backend.lanes();
-        if avail < 8 {
+        let n = self.backend.lanes();
+        let len = a.len().min(b.len());
+        let k = <S as Backend<T>>::UNROLL;
+        // One chain, or too few registers for the tree-combine to amortize: the single-chain
+        // `zip_fold` directly — same fast loop as a hand-written reduction, no scaffolding.
+        if k == 1 || len / n < 8 {
             return self.zip_fold(a, b, fill_a, fill_b, init, step);
         }
-        // Engage the cached chain count once a full K-stride window fits; otherwise one chain. The
-        // `K == 1` arm is `zip_fold` (not `zip_reduce_k::<1>`) so the no-ILP case carries none of the
-        // multi-accumulator scaffolding.
-        let k = {
-            let c = self.unroll();
-            if avail >= c { c } else { 1 }
-        };
-        match k {
-            2 => self.zip_reduce_k::<2, A, _, _>(a, b, fill_a, fill_b, init, &step, &combine),
-            4 => self.zip_reduce_k::<4, A, _, _>(a, b, fill_a, fill_b, init, &step, &combine),
-            8 => self.zip_reduce_k::<8, A, _, _>(a, b, fill_a, fill_b, init, &step, &combine),
-            12 => self.zip_reduce_k::<12, A, _, _>(a, b, fill_a, fill_b, init, &step, &combine),
-            16 => self.zip_reduce_k::<16, A, _, _>(a, b, fill_a, fill_b, init, &step, &combine),
-            _ => self.zip_fold(a, b, fill_a, fill_b, init, step),
+        let mut acc = [init; crate::MAX_UNROLL];
+        let mut off = 0;
+        // `while off + k*n <= len` (not a counted loop) keeps the window load in bounds from the guard
+        // alone. The per-iteration `k*n`-wide reborrow drops *every* per-chain bounds check: within a
+        // window of constant length `k*n`, each `[o..o + n]` with `o = j*n < k*n` is in bounds by
+        // constants only, where indexing the original slices at `off + j*n` leaves the optimizer unable
+        // to prove `off + j*n + n <= len` for `j < k-1`.
+        while off + k * n <= len {
+            let aw = &a[off..off + k * n];
+            let bw = &b[off..off + k * n];
+            let mut j = 0;
+            while j < k {
+                let o = j * n;
+                acc[j] = step(acc[j], self.load(&aw[o..o + n]), self.load(&bw[o..o + n]));
+                j += 1;
+            }
+            off += k * n;
         }
+        // The `< k` leftover registers go to *distinct* chains, not all into `acc[0]` — dumping them
+        // serially would rebuild a long dependency chain and undo the ILP for any `len` that isn't a
+        // multiple of `k * lanes()`.
+        let mut j = 0;
+        while off + n <= len {
+            acc[j] = step(acc[j], self.load(&a[off..off + n]), self.load(&b[off..off + n]));
+            off += n;
+            j += 1;
+        }
+        let mut width = k;
+        while width > 1 {
+            let half = width / 2;
+            let mut j = 0;
+            while j < half {
+                acc[j] = combine(acc[j], acc[width - half + j]);
+                j += 1;
+            }
+            width -= half;
+        }
+        let mut result = acc[0];
+        if off < len {
+            let va = self.load_partial(&a[off..len], fill_a);
+            let vb = self.load_partial(&b[off..len], fill_b);
+            result = step(result, va, vb);
+        }
+        result
     }
 
     /// ILP compiled out: no cached-`K` lookup, no dispatch `match` — straight to the single-chain
@@ -545,35 +897,33 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
         self.zip_fold(a, b, fill_a, fill_b, init, step)
     }
 
-    /// Single-column counterpart of [`zip_reduce_k`](Self::zip_reduce_k) — `K` independent chains
-    /// over one slice (sum, norm, max-style kernels). Same loop discipline and tail handling.
+    /// Single-column counterpart of [`zip_reduce`](Self::zip_reduce) — `K` independent chains over one
+    /// slice (sum, norm, max-style kernels), `K = S::UNROLL` chosen automatically. Same loop discipline
+    /// and tail handling; `K == 1` and tiny inputs take the single-chain [`fold`](Self::fold).
     #[inline]
     #[cfg(not(any(no_ilp, target_arch = "spirv")))]
-    pub fn reduce_k<const K: usize, A: Copy, FS, FC>(
-        self,
-        a: &[T],
-        fill: T,
-        init: A,
-        step: FS,
-        combine: FC,
-    ) -> A
+    pub fn reduce<A: Copy, FS, FC>(self, a: &[T], fill: T, init: A, step: FS, combine: FC) -> A
     where
         FS: Fn(A, Varying<T, S>) -> A,
         FC: Fn(A, A) -> A,
     {
         let n = self.backend.lanes();
         let len = a.len();
-        let mut acc = [init; K];
+        let k = <S as Backend<T>>::UNROLL;
+        if k == 1 || len / n < 8 {
+            return self.fold(a, fill, init, step);
+        }
+        let mut acc = [init; crate::MAX_UNROLL];
         let mut off = 0;
-        while off + K * n <= len {
-            let aw = &a[off..off + K * n];
+        while off + k * n <= len {
+            let aw = &a[off..off + k * n];
             let mut j = 0;
-            while j < K {
+            while j < k {
                 let o = j * n;
                 acc[j] = step(acc[j], self.load(&aw[o..o + n]));
                 j += 1;
             }
-            off += K * n;
+            off += k * n;
         }
         let mut j = 0;
         while off + n <= len {
@@ -581,7 +931,7 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
             off += n;
             j += 1;
         }
-        let mut width = K;
+        let mut width = k;
         while width > 1 {
             let half = width / 2;
             let mut j = 0;
@@ -596,53 +946,6 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
             result = step(result, self.load_partial(&a[off..len], fill));
         }
         result
-    }
-
-    /// ILP compiled out: the `K` chains collapse to the single-chain [`fold`](Self::fold), so an
-    /// explicit `reduce_k::<K>` emits no superscalar scaffolding. `K` and `combine` are inert.
-    #[inline]
-    #[cfg(any(no_ilp, target_arch = "spirv"))]
-    pub fn reduce_k<const K: usize, A: Copy, FS, FC>(
-        self,
-        a: &[T],
-        fill: T,
-        init: A,
-        step: FS,
-        combine: FC,
-    ) -> A
-    where
-        FS: Fn(A, Varying<T, S>) -> A,
-        FC: Fn(A, A) -> A,
-    {
-        let _ = combine;
-        self.fold(a, fill, init, step)
-    }
-
-    /// Single-column multi-accumulator reduction with `K` from the cached saturation point — the
-    /// [`zip_reduce`](Self::zip_reduce) dispatcher for one slice.
-    #[inline]
-    #[cfg(not(any(no_ilp, target_arch = "spirv")))]
-    pub fn reduce<A: Copy, FS, FC>(self, a: &[T], fill: T, init: A, step: FS, combine: FC) -> A
-    where
-        FS: Fn(A, Varying<T, S>) -> A,
-        FC: Fn(A, A) -> A,
-    {
-        let avail = a.len() / self.backend.lanes();
-        if avail < 8 {
-            return self.fold(a, fill, init, step);
-        }
-        let k = {
-            let c = self.unroll();
-            if avail >= c { c } else { 1 }
-        };
-        match k {
-            2 => self.reduce_k::<2, A, _, _>(a, fill, init, &step, &combine),
-            4 => self.reduce_k::<4, A, _, _>(a, fill, init, &step, &combine),
-            8 => self.reduce_k::<8, A, _, _>(a, fill, init, &step, &combine),
-            12 => self.reduce_k::<12, A, _, _>(a, fill, init, &step, &combine),
-            16 => self.reduce_k::<16, A, _, _>(a, fill, init, &step, &combine),
-            _ => self.fold(a, fill, init, step),
-        }
     }
 
     /// ILP compiled out: no cached-`K` lookup, no dispatch `match` — straight to the single-chain
@@ -729,7 +1032,7 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
     /// multiple chains but the reduction tail, so it opts out. Also read by the matrix micro-kernel
     /// to size its register block (the same saturation count, taken to 2-D).
     #[inline]
-    #[cfg(not(any(no_ilp, target_arch = "spirv")))]
+    #[cfg(all(not(no_ilp), not(target_arch = "spirv"), not(hp_resolved_unroll)))]
     pub(crate) fn unroll(self) -> usize {
         if self.backend.lanes() == 1 {
             return 1;
@@ -738,6 +1041,18 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
             0 => self.detect_unroll(),
             k => k as usize,
         }
+    }
+
+    /// Build-resolved (`static_dispatch` + pinned cpu): the factor `build.rs` baked into
+    /// [`STATIC_UNROLL`] — a compile-time constant, no atomic and no startup sweep, so the matrix
+    /// micro-kernel and the dispatch wrapper both see one fixed `K`. The scalar backend still opts out.
+    #[inline(always)]
+    #[cfg(hp_resolved_unroll)]
+    pub(crate) fn unroll(self) -> usize {
+        if self.backend.lanes() == 1 {
+            return 1;
+        }
+        STATIC_UNROLL
     }
 
     /// ILP compiled out (`--cfg no_ilp` / SPIR-V): one chain, no atomic and no startup sweep. The
@@ -752,53 +1067,43 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
     /// timing a fixed-buffer dot, picking the fastest — the saturation point of the actual core,
     /// which folds in register-spill effects for free. Out-of-line and `#[cold]`: it runs at most
     /// once per process, never on the warm path.
-    #[cfg(all(feature = "std", not(any(no_ilp, target_arch = "spirv"))))]
+    #[cfg(all(feature = "std", not(no_ilp), not(target_arch = "spirv"), not(hp_resolved_unroll)))]
     #[cold]
     #[inline(never)]
     fn detect_unroll(self) -> usize {
         use std::hint::black_box;
         use std::time::Instant;
 
+        use crate::backend::Unroll;
+
         let probe: std::vec::Vec<T> = (0..4096)
             .map(|i| T::from_f64((i % 17) as f64 * 0.5 - 4.0))
             .collect();
         let a = probe.as_slice();
         let zero = T::ZERO;
-        let init = self.splat(zero);
-        let step =
-            |acc: Varying<T, S>, x: Varying<T, S>, y: Varying<T, S>| -> Varying<T, S> { x.fma(y, acc) };
-        let combine = |p: Varying<T, S>, q: Varying<T, S>| -> Varying<T, S> { p + q };
+        let b = self.backend();
 
-        let warm = Instant::now();
-        let r = self.zip_reduce_k::<1, _, _, _>(
-            black_box(a),
-            black_box(a),
-            zero,
-            zero,
-            init,
-            &step,
-            &combine,
-        );
-        black_box(r.reduce_sum());
-        let one_ns = warm.elapsed().as_nanos().max(1) as u64;
-        // Aim ~0.5 ms per timed run so `Instant` overhead is amortized; bound the count both ways.
-        let iters = (500_000u64 / one_ns).clamp(1, 100_000) as u32;
-
+        // Time the same FMA dot at each candidate factor by wrapping the backend in `Unroll<S, $k>`,
+        // so `zip_reduce` takes its `$k`-chain path — exactly what dispatch will run at that factor.
+        // `init`/`step`/`combine` are rebuilt per `$k` because their `Varying` is over the wrapped
+        // backend type.
         macro_rules! time_k {
-            ($k:literal) => {{
+            ($k:literal, $iters:expr) => {{
+                let g = Gang::new(Unroll::<S, $k>(b));
+                let init = g.splat(zero);
                 let mut best = u64::MAX;
                 for _ in 0..3 {
                     let t = Instant::now();
                     let mut sink = 0.0f64;
-                    for _ in 0..iters {
-                        let r = self.zip_reduce_k::<$k, _, _, _>(
+                    for _ in 0..$iters {
+                        let r = g.zip_reduce(
                             black_box(a),
                             black_box(a),
                             zero,
                             zero,
                             init,
-                            &step,
-                            &combine,
+                            |acc, x, y| x.fma(y, acc),
+                            |p, q| p + q,
                         );
                         sink += r.reduce_sum().to_f64();
                     }
@@ -812,13 +1117,17 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
             }};
         }
 
+        let one_ns = time_k!(1, 1).max(1);
+        // Aim ~0.5 ms per timed run so `Instant` overhead is amortized; bound the count both ways.
+        let iters = (500_000u64 / one_ns).clamp(1, 100_000) as u32;
+
         let cands = [
-            (1u8, time_k!(1)),
-            (2u8, time_k!(2)),
-            (4u8, time_k!(4)),
-            (8u8, time_k!(8)),
-            (12u8, time_k!(12)),
-            (16u8, time_k!(16)),
+            (1u8, time_k!(1, iters)),
+            (2u8, time_k!(2, iters)),
+            (4u8, time_k!(4, iters)),
+            (8u8, time_k!(8, iters)),
+            (12u8, time_k!(12, iters)),
+            (16u8, time_k!(16, iters)),
         ];
         let mut best = cands[0];
         for &c in &cands[1..] {
@@ -833,7 +1142,7 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
     /// No-std build: no timer/allocator for a sweep, so fall back to a per-target default that lands
     /// near each family's `latency × pipes` saturation point (Apple's wide NEON FP wants more chains
     /// than x86's 2–3 vector pipes).
-    #[cfg(all(not(feature = "std"), not(any(no_ilp, target_arch = "spirv"))))]
+    #[cfg(all(not(feature = "std"), not(no_ilp), not(target_arch = "spirv"), not(hp_resolved_unroll)))]
     #[cold]
     #[inline(never)]
     fn detect_unroll(self) -> usize {
@@ -940,10 +1249,26 @@ impl<T: Scalar, S: Backend<T>> Varying<T, S> {
     pub fn sqrt(self) -> Self {
         Self::wrap(self.backend, self.backend.sqrt(self.v))
     }
+    /// Absolute value. Backends with a dedicated abs instruction (NEON `fabs`, wasm `f*.abs`,
+    /// AVX-512 `vabs`) or a single sign-bit clear use it; the rest fall back to `max(self, -self)`,
+    /// which is non-NaN-propagating — see the [`max`](Self::max) note before relying on `abs` to keep
+    /// a NaN-poisoned tail out of a later comparison, and reach for
+    /// [`Gang::active_mask`](crate::Gang::active_mask) there instead.
+    #[inline(always)]
+    pub fn abs(self) -> Self {
+        Self::wrap(self.backend, self.backend.abs(self.v))
+    }
+    /// Lane-wise minimum. **Non-NaN-propagating**, matching the hardware `min`/`max` and the scalar
+    /// oracle: a NaN operand is not guaranteed to survive — the result may take the other operand.
     #[inline(always)]
     pub fn min(self, o: Self) -> Self {
         Self::wrap(self.backend, self.backend.min(self.v, o.v))
     }
+    /// Lane-wise maximum, with the same **non-NaN-propagating** rule as [`min`](Self::min). The sharp
+    /// edge: a NaN-poisoned tail (a `load_partial` NaN fill, used to make a compare reject padding) is
+    /// silently scrubbed if a `min`/`max`/[`abs`](Self::abs) sits between the fill and that compare, so
+    /// the padding then leaks into the reduction. Use [`Gang::active_mask`](crate::Gang::active_mask)
+    /// whenever such an op intervenes.
     #[inline(always)]
     pub fn max(self, o: Self) -> Self {
         Self::wrap(self.backend, self.backend.max(self.v, o.v))
@@ -1066,6 +1391,15 @@ impl<T: Scalar, S: Backend<T>> Mask<T, S> {
     #[inline(always)]
     pub fn all(self) -> bool {
         self.backend.all(self.m)
+    }
+
+    /// The set lanes packed into the low [`lanes`](Gang::lanes) bits of a `u32`: bit `i` set iff
+    /// lane `i` is set. `count_ones()` then gives an exact set-lane count and `trailing_zeros()` the
+    /// first set lane — replacing a per-lane `select`/`store`/scan with a single native movemask on
+    /// the fixed-width backends. Bits at and above `lanes()` are zero.
+    #[inline(always)]
+    pub fn to_bitmask(self) -> u32 {
+        self.backend.mask_bitmask(self.m)
     }
 }
 

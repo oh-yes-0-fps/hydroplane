@@ -195,6 +195,37 @@ fn concrete_scalar_kernel_matches_oracle() {
     }
 }
 
+// Splat-constant scalars arrive as separate fields, so kernels routinely exceed clippy's argument
+// limit; the generated wrapper and `_on` fn carry their own opt-out (the author can't annotate them),
+// so `cargo clippy` over this file stays clean.
+#[kernel]
+pub fn scale7<'a>(
+    ctx: Gang<f32>,
+    xs: &'a [f32],
+    a0: f32,
+    a1: f32,
+    a2: f32,
+    a3: f32,
+    a4: f32,
+    a5: f32,
+    a6: f32,
+) -> f32 {
+    let mut acc = ctx.splat(0.0);
+    for (off, cnt) in ctx.chunks(xs.len()) {
+        let v = ctx.load_partial(&xs[off..off + cnt], 0.0);
+        acc = acc + v * a0 * a1 * a2 * a3 * a4 * a5 * a6;
+    }
+    acc.reduce_sum()
+}
+
+#[test]
+fn many_arg_kernel_matches_oracle() {
+    let xs = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+    let got = scale7(&xs, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0);
+    let want: f32 = xs.iter().sum::<f32>() * 2.0;
+    assert!((got - want).abs() < 1e-4, "got {got} want {want}");
+}
+
 #[test]
 fn matrix_macro_kernel() {
     const M: usize = 3;

@@ -1,6 +1,8 @@
 //! Runtime unroll-factor (K) cache — the count of independent FP accumulator chains that saturates
 //! this core's FMA pipes. Resolved once (a startup sweep, see [`Gang::detect_unroll`]), a relaxed
-//! atomic load thereafter. See ../future/ILP_SUPERSCALAR.md.
+//! atomic load thereafter. The dispatch adapter reads it to pick the `Unroll<_, K>` backend wrapper,
+//! so the chosen `K` reaches each reduction as a compile-time constant. See
+//! ../future/ILP_SUPERSCALAR.md.
 //!
 //! Building with `--cfg no_ilp` (and always on the SPIR-V target, whose lanes are the GPU's, not a
 //! CPU's FMA pipes) compiles the whole multi-accumulator path out: this cache, the startup sweep,

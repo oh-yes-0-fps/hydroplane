@@ -25,7 +25,13 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(no_sme)',
     'cfg(no_amx)',
     'cfg(no_ilp)',
+    'cfg(no_avx)',
+    'cfg(no_avx512)',
+    'cfg(static_dispatch)',
     'cfg(neon_over_sve)',
+    # Set by build.rs when static_dispatch + a pinned target-cpu let the unroll factor be resolved at
+    # build time instead of by the runtime sweep.
+    'cfg(hp_resolved_unroll)',
 ] }
 
 [dependencies]
@@ -67,5 +73,18 @@ harness = false
 # `#[kernel]` micro-kernel (cached dispatch) vs hand-written `wide` SIMD vs scalar.
 [[bench]]
 name = "micro_vs_wide"
+harness = false
+required-features = ["macros"]
+
+# New fixed-`N` column combinators (`count_n`, `for_each_hit_n`, `masked_chunks` + `gather_n`) vs
+# hand-written `wide` SIMD vs scalar — the zero-cost check.
+[[bench]]
+name = "combinators_vs_wide"
+harness = false
+required-features = ["macros"]
+
+# `Gang::map`/`map_n` ILP unroll: unrolled (default) vs `--cfg no_ilp` (K=1) vs hand-written `wide`.
+[[bench]]
+name = "map_ilp"
 harness = false
 required-features = ["macros"]

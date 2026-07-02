@@ -586,3 +586,11 @@ unsafe fn f64_reduce<const OP: i32>(v: __m256d) -> f64 {
     let r = combine::<OP>(p, sh);
     _mm_cvtsd_f64(r)
 }
+
+// Elements AVX1 has no native lanes for (256-bit integer ops are AVX2; f16/bf16 have no AVX1
+// ALU): correctness-only emulation so the token satisfies `BackendAll` when a kernel mixes
+// these elements in. Their own dispatch ladders never pick Avx1.
+crate::backend::emulated_float_element!(Avx1, half::f16, 8);
+crate::backend::emulated_float_element!(Avx1, half::bf16, 8);
+crate::backend::emulated_int_element!(Avx1, u32, 8);
+crate::backend::emulated_int_element!(Avx1, i32, 8);

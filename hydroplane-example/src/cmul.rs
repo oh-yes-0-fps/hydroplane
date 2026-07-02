@@ -16,7 +16,7 @@ pub fn inputs(n: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
 // drives the full-register pass, masked tail, and ILP; the closure is just the complex product.
 #[kernel]
 pub fn cmul_hp<'a>(
-    ctx: Gang<f32>,
+    ctx: Gang,
     ar: &'a [f32],
     ai: &'a [f32],
     br: &'a [f32],
@@ -24,7 +24,7 @@ pub fn cmul_hp<'a>(
     outr: &'a mut [f32],
     outi: &'a mut [f32],
 ) {
-    ctx.map_cols::<4, 2>(
+    ctx.map_cols::<f32, 4, 2>(
         [ar, ai, br, bi],
         [outr, outi],
         0.0,

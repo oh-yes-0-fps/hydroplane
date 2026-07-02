@@ -22,7 +22,7 @@ fn heavy_scalar(x: f32) -> f32 {
 }
 
 #[kernel]
-fn map_heavy_k<'a>(ctx: Gang<f32>, a: &'a [f32], out: &'a mut [f32]) {
+fn map_heavy_k<'a>(ctx: Gang, a: &'a [f32], out: &'a mut [f32]) {
     ctx.map(a, out, 1.0, |x| {
         let a = (x + 1.0).sqrt();
         let b = (a + 1.0).sqrt();
@@ -32,7 +32,7 @@ fn map_heavy_k<'a>(ctx: Gang<f32>, a: &'a [f32], out: &'a mut [f32]) {
 }
 
 #[kernel]
-fn map_cheap_k<'a>(ctx: Gang<f32>, a: &'a [f32], out: &'a mut [f32]) {
+fn map_cheap_k<'a>(ctx: Gang, a: &'a [f32], out: &'a mut [f32]) {
     ctx.map(a, out, 0.0, |x| x + ctx.splat(1.5));
 }
 

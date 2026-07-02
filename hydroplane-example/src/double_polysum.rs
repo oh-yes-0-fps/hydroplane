@@ -21,7 +21,7 @@ pub fn inputs(n: usize) -> (Vec<f32>, Vec<f32>) {
 /// Degree-8 Horner evaluation on a whole register — eight serial FMAs, the register-heavy step that
 /// makes `polystep` (and therefore the composed `double_polysum`) want a low unroll factor.
 #[inline(always)]
-fn horner8<S: Backend<f32>>(ctx: Gang<f32, S>, x: Varying<f32, S>) -> Varying<f32, S> {
+fn horner8<S: Backend<f32>>(ctx: Gang<S>, x: Varying<f32, S>) -> Varying<f32, S> {
     let mut acc = ctx.splat(COEFFS[8]);
     for k in (0..8).rev() {
         acc = acc.fma(x, ctx.splat(COEFFS[k]));
@@ -32,7 +32,7 @@ fn horner8<S: Backend<f32>>(ctx: Gang<f32, S>, x: Varying<f32, S>) -> Varying<f3
 /// The heavy inner reduction, reused by the outer kernel through its `_on` companion: sum the
 /// degree-8 polynomial over one column with the auto-tuned ILP `sum` supplies.
 #[kernel]
-pub fn polystep<'a>(ctx: Gang<f32>, x: &'a [f32]) -> f32 {
+pub fn polystep<'a>(ctx: Gang, x: &'a [f32]) -> f32 {
     // `sum` zero-fills the inactive tail lanes, and `horner8(0) == COEFFS[0]`, so those padding lanes
     // would each add `COEFFS[0]` to the reduction. Subtract it per lane (padding then contributes 0)
     // and add back the `COEFFS[0]·n` that removes from the real lanes.
@@ -43,7 +43,7 @@ pub fn polystep<'a>(ctx: Gang<f32>, x: &'a [f32]) -> f32 {
 /// backend, then an add. One dispatch, and the inner reduction's register cost is what governs the
 /// unroll factor here — not the two-call-plus-add surface.
 #[kernel]
-pub fn double_polysum_hp<'a>(ctx: Gang<f32>, x: &'a [f32], y: &'a [f32]) -> f32 {
+pub fn double_polysum_hp<'a>(ctx: Gang, x: &'a [f32], y: &'a [f32]) -> f32 {
     polystep_on(ctx, x) + polystep_on(ctx, y)
 }
 

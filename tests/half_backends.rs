@@ -2,13 +2,13 @@
 //! wide backend (8-wide NEON FEAT_FP16, 16/32-wide AVX-512(-FP16)) when the CPU supports it rather
 //! than falling back to the 1-lane `ScalarBackend`.
 
-use hydroplane::{Backend, Gang, Kernel, SimdDispatch, bf16, dispatch, f16, kernel};
+use hydroplane::{BackendAll, Backend, Gang, Kernel, SimdDispatch, bf16, dispatch, f16, kernel};
 
 struct Lanes<T>(core::marker::PhantomData<T>);
 impl<T: hydroplane::Scalar> Kernel<T> for Lanes<T> {
     type Output = usize;
-    fn run<S: Backend<T>>(self, ctx: Gang<T, S>) -> usize {
-        ctx.lanes()
+    fn run<S: BackendAll + Backend<T>>(self, ctx: Gang<S>) -> usize {
+        ctx.lanes::<T>()
     }
 }
 fn lanes<T: hydroplane::Scalar + SimdDispatch>() -> usize {
@@ -27,7 +27,7 @@ fn f16_reaches_native_wide_backend() {
 }
 
 #[kernel]
-fn f16_count_sum_k<'a>(ctx: Gang<f16>, xs: &'a [f16], t: f16) -> usize {
+fn f16_count_sum_k<'a>(ctx: Gang, xs: &'a [f16], t: f16) -> usize {
     // counts and a reduction in one pass exercise load / compare / mask-bitmask / horizontal add.
     let tv = ctx.splat(t);
     ctx.count_n([xs], |[x]| x.gt(tv))
@@ -46,7 +46,7 @@ fn f16_count_matches_scalar_oracle() {
 }
 
 #[kernel]
-fn f16_dot_k<'a>(ctx: Gang<f16>, a: &'a [f16], b: &'a [f16]) -> f16 {
+fn f16_dot_k<'a>(ctx: Gang, a: &'a [f16], b: &'a [f16]) -> f16 {
     ctx.dot(a, b)
 }
 
@@ -63,7 +63,7 @@ fn f16_dot_matches_scalar_oracle() {
 }
 
 #[kernel]
-fn bf16_count_k<'a>(ctx: Gang<bf16>, xs: &'a [bf16], t: bf16) -> usize {
+fn bf16_count_k<'a>(ctx: Gang, xs: &'a [bf16], t: bf16) -> usize {
     let tv = ctx.splat(t);
     ctx.count_n([xs], |[x]| x.gt(tv))
 }

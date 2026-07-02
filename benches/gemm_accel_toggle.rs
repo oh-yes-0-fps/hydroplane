@@ -28,7 +28,7 @@ impl<T: FloatScalar, const M: usize, const N: usize, const K: usize> MatrixKerne
     for Gemm<'_, T, M, N, K>
 {
     type Output = ();
-    fn run<S: MatrixBackend<T>>(self, ctx: Gang<T, S>) {
+    fn run<S: MatrixBackend<T>>(self, ctx: Gang<S>) {
         let tl = ctx.tiles();
         let a = tl.load_a::<M, K>(self.a, K, Layout::RowMajor);
         let b = tl.load_b::<K, N>(self.b, N, Layout::RowMajor);

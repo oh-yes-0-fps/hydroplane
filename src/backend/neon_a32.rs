@@ -480,3 +480,11 @@ impl Backend<f32> for Neon {
         v.0.iter().copied().fold(f32::NAN, f32::max)
     }
 }
+
+// armv7 NEON is f32-only (no f64/f16/bf16 vector unit; the integer asm is not written):
+// correctness-only emulation for `BackendAll` at the token's 4-lane geometry.
+crate::backend::emulated_float_element!(Neon, f64, 4);
+crate::backend::emulated_float_element!(Neon, half::f16, 4);
+crate::backend::emulated_float_element!(Neon, half::bf16, 4);
+crate::backend::emulated_int_element!(Neon, u32, 4);
+crate::backend::emulated_int_element!(Neon, i32, 4);

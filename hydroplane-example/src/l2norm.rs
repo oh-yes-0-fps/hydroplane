@@ -14,7 +14,7 @@ pub fn inputs(n: usize) -> Vec<f32> {
 }
 
 #[kernel]
-pub fn l2norm_hp<'a>(ctx: Gang<f32>, x: &'a [f32]) -> f32 {
+pub fn l2norm_hp<'a>(ctx: Gang, x: &'a [f32]) -> f32 {
     ctx.sum(x, |acc, v| v.fma(v, acc))
 }
 

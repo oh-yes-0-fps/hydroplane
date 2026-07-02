@@ -185,3 +185,20 @@ impl Backend<bf16> for Avx512Bf16 {
         bf16::from_f32(self.f32().reduce_max(v))
     }
 }
+
+// `avx512bf16` implies `avx512f`, so every non-bf16 element rides the plain AVX-512 impls.
+crate::backend::delegate_float_element!(Avx512Bf16, f32, crate::backend::avx512::Avx512, unsafe {
+    crate::backend::avx512::Avx512::new_unchecked()
+});
+crate::backend::delegate_float_element!(Avx512Bf16, f64, crate::backend::avx512::Avx512, unsafe {
+    crate::backend::avx512::Avx512::new_unchecked()
+});
+crate::backend::delegate_float_element!(Avx512Bf16, half::f16, crate::backend::avx512::Avx512, unsafe {
+    crate::backend::avx512::Avx512::new_unchecked()
+});
+crate::backend::delegate_int_element!(Avx512Bf16, u32, crate::backend::avx512::Avx512, unsafe {
+    crate::backend::avx512::Avx512::new_unchecked()
+});
+crate::backend::delegate_int_element!(Avx512Bf16, i32, crate::backend::avx512::Avx512, unsafe {
+    crate::backend::avx512::Avx512::new_unchecked()
+});

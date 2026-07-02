@@ -192,3 +192,10 @@ impl_rvv_backend!(
     sqrt_f64, min_f64, max_f64, le_f64, lt_f64, ge_f64, gt_f64, select_f64, reduce_sum_f64,
     reduce_min_f64, reduce_max_f64
 );
+
+// Elements base "V" has no vector ALU for (f16/bf16 need Zvfh/Zvfbfmin; integer primitives are
+// not written yet): correctness-only emulation for `BackendAll`.
+crate::backend::emulated_float_element!([const C: usize] Rvv<C>, half::f16, C / 4);
+crate::backend::emulated_float_element!([const C: usize] Rvv<C>, half::bf16, C / 4);
+crate::backend::emulated_int_element!([const C: usize] Rvv<C>, u32, C / 4);
+crate::backend::emulated_int_element!([const C: usize] Rvv<C>, i32, C / 4);

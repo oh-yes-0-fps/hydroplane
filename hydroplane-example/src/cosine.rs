@@ -14,14 +14,14 @@ pub fn inputs(n: usize) -> (Vec<f32>, Vec<f32>) {
 }
 
 #[kernel]
-fn dotp<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
+fn dotp<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     ctx.dot(a, b)
 }
 
 /// Three `dotp` passes on the *same* dispatched backend via the `dotp_on` companion — one dispatch,
 /// three fully-ILP'd reductions, then a scalar combine.
 #[kernel]
-pub fn cosine_hp<'a>(ctx: Gang<f32>, x: &'a [f32], y: &'a [f32]) -> f32 {
+pub fn cosine_hp<'a>(ctx: Gang, x: &'a [f32], y: &'a [f32]) -> f32 {
     let d = dotp_on(ctx, x, y);
     let nx = dotp_on(ctx, x, x);
     let ny = dotp_on(ctx, y, y);

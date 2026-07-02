@@ -34,7 +34,7 @@ fn activation_coeffs() -> [f32; 9] {
 /// Non-kernel generic **Varying** helper: the activation evaluated per lane. Called from inside
 /// `activate_hp`'s map closure — a non-kernel call, so not a cross-kernel edge.
 #[inline]
-fn activate_poly<S: Backend<f32>>(ctx: Gang<f32, S>, v: Varying<f32, S>) -> Varying<f32, S> {
+fn activate_poly<S: Backend<f32>>(ctx: Gang<S>, v: Varying<f32, S>) -> Varying<f32, S> {
     let c = activation_coeffs();
     let mut acc = ctx.splat(c[8]);
     for k in (0..8).rev() {
@@ -51,20 +51,20 @@ fn finalize(energy: f32, n: usize) -> f32 {
 /// Stage 1 — elementwise, one FMA/element (memory-bound), so it uses the streaming (auto-vectorized)
 /// combinator rather than SIMD `map`. Calls the non-kernel `gains`.
 #[kernel]
-pub fn scale_bias_hp<'a>(ctx: Gang<f32>, x: &'a [f32], out: &'a mut [f32]) {
+pub fn scale_bias_hp<'a>(ctx: Gang, x: &'a [f32], out: &'a mut [f32]) {
     let (g, b) = gains();
     ctx.stream_map(x, out, |xi| g * xi + b);
 }
 
 /// Stage 2 — elementwise, eight FMAs/element (compute-bound). Calls the non-kernel `activate_poly`.
 #[kernel]
-pub fn activate_hp<'a>(ctx: Gang<f32>, x: &'a [f32], out: &'a mut [f32]) {
+pub fn activate_hp<'a>(ctx: Gang, x: &'a [f32], out: &'a mut [f32]) {
     ctx.map(x, out, 0.0, |v| activate_poly(ctx, v));
 }
 
 /// Stage 3 — a reduction (sum of squares).
 #[kernel]
-pub fn energy_hp<'a>(ctx: Gang<f32>, x: &'a [f32]) -> f32 {
+pub fn energy_hp<'a>(ctx: Gang, x: &'a [f32]) -> f32 {
     ctx.sum(x, |acc, v| v.fma(v, acc))
 }
 
@@ -73,7 +73,7 @@ pub fn energy_hp<'a>(ctx: Gang<f32>, x: &'a [f32]) -> f32 {
 /// non-kernel functions; its unroll cap must compose to satisfy every stage.
 #[kernel]
 pub fn feature_score_hp<'a>(
-    ctx: Gang<f32>,
+    ctx: Gang,
     x: &'a [f32],
     scratch_a: &'a mut [f32],
     scratch_b: &'a mut [f32],

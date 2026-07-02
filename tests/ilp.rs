@@ -1,4 +1,4 @@
-use hydroplane::{FloatScalar, Backend, Gang, Kernel, SimdDispatch, dispatch, run_scalar};
+use hydroplane::{BackendAll, FloatScalar, Backend, Gang, Kernel, SimdDispatch, dispatch, run_scalar};
 
 fn oracle_dot<T: FloatScalar>(a: &[T], b: &[T]) -> f64 {
     a.iter()
@@ -7,7 +7,7 @@ fn oracle_dot<T: FloatScalar>(a: &[T], b: &[T]) -> f64 {
         .sum()
 }
 
-fn dot_zip_reduce<T: FloatScalar, S: Backend<T>>(g: Gang<T, S>, a: &[T], b: &[T]) -> f64 {
+fn dot_zip_reduce<T: FloatScalar, S: Backend<T>>(g: Gang<S>, a: &[T], b: &[T]) -> f64 {
     g.zip_reduce(
         a,
         b,
@@ -21,7 +21,7 @@ fn dot_zip_reduce<T: FloatScalar, S: Backend<T>>(g: Gang<T, S>, a: &[T], b: &[T]
     .into_f64()
 }
 
-fn sum_reduce<T: FloatScalar, S: Backend<T>>(g: Gang<T, S>, a: &[T]) -> f64 {
+fn sum_reduce<T: FloatScalar, S: Backend<T>>(g: Gang<S>, a: &[T]) -> f64 {
     g.reduce(a, T::ZERO, g.splat(T::ZERO), |acc, x| acc + x, |p, q| p + q)
         .reduce_sum()
         .into_f64()
@@ -36,7 +36,7 @@ struct Variants<'a, T: FloatScalar> {
 }
 impl<T: FloatScalar> Kernel<T> for Variants<'_, T> {
     type Output = [f64; 2];
-    fn run<S: Backend<T>>(self, g: Gang<T, S>) -> [f64; 2] {
+    fn run<S: BackendAll + Backend<T>>(self, g: Gang<S>) -> [f64; 2] {
         [dot_zip_reduce(g, self.a, self.b), sum_reduce(g, self.a)]
     }
 }
@@ -88,7 +88,7 @@ fn zip_reduce_matches_oracle_f64() {
 struct DetectProbe;
 impl Kernel<f32> for DetectProbe {
     type Output = f64;
-    fn run<S: Backend<f32>>(self, g: Gang<f32, S>) -> f64 {
+    fn run<S: BackendAll + Backend<f32>>(self, g: Gang<S>) -> f64 {
         let a: Vec<f32> = (0..257).map(|i| (i % 13) as f32 * 0.25 - 1.5).collect();
         dot_zip_reduce(g, &a, &a)
     }

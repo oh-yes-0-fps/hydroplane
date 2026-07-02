@@ -27,6 +27,10 @@ pub struct Metrics {
     /// arithmetic-intensity proxy. A compute-bound step already saturates the FP units on one chain,
     /// so extra unrolled chains only add load/address overhead; high compute ⇒ cap K low.
     pub compute: u64,
+    /// Element-type bitmask (`Scalar::TYPE_BITS` values) the kernel's MIR actually touches —
+    /// `Varying`/`Backend` usages, seen through generics and helper calls, so it is tighter than
+    /// the macro's token scan. `0` when the driver predates this field or found nothing.
+    pub types: u64,
 }
 
 /// Below this statement count, and free of calls and heavy memory traffic, a kernel is small enough
@@ -55,6 +59,11 @@ impl Metrics {
     /// Keep the `noalias` boundary unless the kernel is genuinely a micro-kernel.
     pub fn noalias(&self) -> bool {
         !(self.stmts < TINY_STMTS && self.calls == 0 && self.mem_ops < MEM_THRESH)
+    }
+
+    /// The measured element-type bitmask, when the driver recorded one.
+    pub fn type_bits(&self) -> Option<u8> {
+        (self.types != 0).then_some(self.types as u8)
     }
 
     /// Largest unroll factor whose per-chain cost still fits the compute budget, snapped to a dispatch
@@ -98,6 +107,7 @@ fn parse_line(line: &str) -> Option<(String, Metrics)> {
         calls: 0,
         stmts: 0,
         compute: 0,
+        types: 0,
     };
     for kv in fields {
         let (key, val) = kv.split_once('=')?;
@@ -110,6 +120,7 @@ fn parse_line(line: &str) -> Option<(String, Metrics)> {
             "calls" => m.calls = val,
             "stmts" => m.stmts = val,
             "compute" => m.compute = val,
+            "types" => m.types = val,
             _ => {}
         }
     }

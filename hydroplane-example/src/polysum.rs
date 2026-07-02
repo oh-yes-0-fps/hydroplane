@@ -16,7 +16,7 @@ pub fn inputs(n: usize) -> Vec<f32> {
 }
 
 #[kernel]
-pub fn polysum_hp<'a>(ctx: Gang<f32>, c: [f32; 9], x: &'a [f32]) -> f32 {
+pub fn polysum_hp<'a>(ctx: Gang, c: [f32; 9], x: &'a [f32]) -> f32 {
     // `sum` zero-fills the inactive tail lanes, and `P(0) = c[0] ≠ 0`, so accumulating `P` directly
     // would let each padding lane leak a `c[0]` into the total. Summing `P(x) − c[0]` (which vanishes
     // at the fill value) keeps the tail clean; the dropped constant returns as `c[0]·n` at the end.

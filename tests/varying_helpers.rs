@@ -1,4 +1,4 @@
-use hydroplane::{FloatScalar, Backend, Gang, Kernel, SimdDispatch, dispatch, run_scalar};
+use hydroplane::{BackendAll, FloatScalar, Backend, Gang, Kernel, SimdDispatch, dispatch, run_scalar};
 
 struct Out<T> {
     map: Vec<T>,
@@ -24,7 +24,7 @@ struct Helpers<'a, T: FloatScalar> {
 
 impl<T: FloatScalar> Kernel<T> for Helpers<'_, T> {
     type Output = Out<T>;
-    fn run<S: Backend<T>>(self, g: Gang<T, S>) -> Out<T> {
+    fn run<S: BackendAll + Backend<T>>(self, g: Gang<S>) -> Out<T> {
         let (a, b, c) = (self.a, self.b, self.c);
 
         let mut map = vec![T::ZERO; a.len()];
@@ -198,8 +198,8 @@ struct MaskAbs<'a, T: FloatScalar> {
 
 impl<T: FloatScalar> Kernel<T> for MaskAbs<'_, T> {
     type Output = (Vec<T>, usize, Vec<T>);
-    fn run<S: Backend<T>>(self, g: Gang<T, S>) -> (Vec<T>, usize, Vec<T>) {
-        let lanes = g.lanes();
+    fn run<S: BackendAll + Backend<T>>(self, g: Gang<S>) -> (Vec<T>, usize, Vec<T>) {
+        let lanes = g.lanes::<T>();
         let active = self.cnt.min(lanes);
         let m = g.active_mask(active);
         let mut flags = vec![T::ZERO; lanes];
@@ -252,11 +252,11 @@ struct ExactCovers {
 
 impl Kernel<f32> for ExactCovers {
     type Output = bool;
-    fn run<S: Backend<f32>>(self, g: Gang<f32, S>) -> bool {
-        let n = g.lanes();
+    fn run<S: BackendAll + Backend<f32>>(self, g: Gang<S>) -> bool {
+        let n = g.lanes::<f32>();
         let len = self.len;
-        let it = g.chunks_exact(len);
-        if it.remainder() != g.remainder(len) {
+        let it = g.chunks_exact::<f32>(len);
+        if it.remainder() != g.remainder::<f32>(len) {
             return false;
         }
         let mut expect = 0usize;
@@ -266,7 +266,7 @@ impl Kernel<f32> for ExactCovers {
             }
             expect += n;
         }
-        match g.remainder(len) {
+        match g.remainder::<f32>(len) {
             Some((off, cnt)) => off == expect && cnt > 0 && cnt < n && off + cnt == len,
             None => expect == len,
         }
@@ -279,13 +279,13 @@ struct SumExact<'a> {
 
 impl Kernel<f32> for SumExact<'_> {
     type Output = f32;
-    fn run<S: Backend<f32>>(self, g: Gang<f32, S>) -> f32 {
-        let n = g.lanes();
+    fn run<S: BackendAll + Backend<f32>>(self, g: Gang<S>) -> f32 {
+        let n = g.lanes::<f32>();
         let mut acc = g.splat(0.0);
-        for off in g.chunks_exact(self.xs.len()) {
+        for off in g.chunks_exact::<f32>(self.xs.len()) {
             acc = acc + g.load(&self.xs[off..off + n]);
         }
-        if let Some((off, cnt)) = g.remainder(self.xs.len()) {
+        if let Some((off, cnt)) = g.remainder::<f32>(self.xs.len()) {
             acc = acc + g.load_partial(&self.xs[off..off + cnt], 0.0);
         }
         acc.reduce_sum()

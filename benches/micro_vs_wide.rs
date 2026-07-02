@@ -18,9 +18,9 @@ use wide::{f32x4, f32x8};
 // full-register loop (`cnt` constant there, so `load_partial` folds to `load`) and once for the
 // tail — should match `dot_exact`/`dot_opt` despite the uniform `(off, cnt)` body.
 #[kernel]
-fn dot<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
+fn dot<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     let mut acc = ctx.splat(0.0);
-    ctx.for_each_chunk(a.len(), |off, cnt| {
+    ctx.for_each_chunk::<f32>(a.len(), |off, cnt| {
         let x = ctx.load_partial(&a[off..off + cnt], 0.0);
         let y = ctx.load_partial(&b[off..off + cnt], 0.0);
         acc = acc + x * y;
@@ -31,13 +31,13 @@ fn dot<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
 // `chunks_exact` + `remainder`: the branch-free iterator form of `dot_opt`'s hand-written loop —
 // should close the gap to it (and leave `chunks` behind).
 #[kernel]
-fn dot_exact<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
-    let n = ctx.lanes();
+fn dot_exact<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
+    let n = ctx.lanes::<f32>();
     let mut acc = ctx.splat(0.0);
-    for off in ctx.chunks_exact(a.len()) {
+    for off in ctx.chunks_exact::<f32>(a.len()) {
         acc = acc + ctx.load(&a[off..off + n]) * ctx.load(&b[off..off + n]);
     }
-    if let Some((off, cnt)) = ctx.remainder(a.len()) {
+    if let Some((off, cnt)) = ctx.remainder::<f32>(a.len()) {
         let x = ctx.load_partial(&a[off..off + cnt], 0.0);
         let y = ctx.load_partial(&b[off..off + cnt], 0.0);
         acc = acc + x * y;
@@ -48,7 +48,7 @@ fn dot_exact<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
 // Naive-looking, but the loop shape is the library's: `zip_fold` does the fixed-stride full-register
 // pass + masked tail internally, so this one expression should compile like `dot_opt`.
 #[kernel]
-fn dot_fold<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
+fn dot_fold<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     ctx.zip_fold(a, b, 0.0, 0.0, ctx.splat(0.0), |acc, x, y| acc + x * y)
         .reduce_sum()
 }
@@ -56,8 +56,8 @@ fn dot_fold<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
 // Optimal hand-pattern: a fixed-stride full-register loop bounded by `min(len)` (so both slices are
 // provably in bounds — no per-iteration checks) plus a single masked tail.
 #[kernel]
-fn dot_opt<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
-    let n = ctx.lanes();
+fn dot_opt<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
+    let n = ctx.lanes::<f32>();
     let len = a.len().min(b.len());
     let mut acc = ctx.splat(0.0);
     let mut i = 0;
@@ -76,8 +76,8 @@ fn dot_opt<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
 // Identical body to `dot_opt`, but `tiny` opts out of the default `noalias` (`#[inline(never)]` `_on`)
 // boundary — measures whether that per-invocation call taxes a tiny scalar-returning kernel.
 #[kernel(tiny)]
-fn dot_opt_tiny<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
-    let n = ctx.lanes();
+fn dot_opt_tiny<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
+    let n = ctx.lanes::<f32>();
     let len = a.len().min(b.len());
     let mut acc = ctx.splat(0.0);
     let mut i = 0;
@@ -179,7 +179,7 @@ fn dot_wide16(a: &[f32], b: &[f32]) -> f32 {
 // path is one atomic load + a match, then the K-unrolled FMA loop. The library equivalent of
 // `dot_wide16`, but with `K` measured per core instead of pinned at four.
 #[kernel]
-fn dot_zip_reduce<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
+fn dot_zip_reduce<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     ctx.zip_reduce(
         a,
         b,
@@ -195,7 +195,7 @@ fn dot_zip_reduce<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
 // The transparent form: a plain sum kernel. No K, no combine, no fills, no init — `zip_sum` implies
 // all of them and dispatches the cached per-core unroll factor. Should match `dot_zip_reduce`.
 #[kernel]
-fn dot_sum<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
+fn dot_sum<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     ctx.zip_sum(a, b, |acc, x, y| x.fma(y, acc))
 }
 

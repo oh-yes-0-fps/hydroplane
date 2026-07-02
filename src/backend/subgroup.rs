@@ -228,23 +228,23 @@ mod device {
                 }
                 #[inline]
                 fn add(self, a: $ty, b: $ty) -> $ty {
-                    a.add(b)
+                    a.wadd(b)
                 }
                 #[inline]
                 fn sub(self, a: $ty, b: $ty) -> $ty {
-                    a.sub(b)
+                    a.wsub(b)
                 }
                 #[inline]
                 fn mul(self, a: $ty, b: $ty) -> $ty {
-                    a.mul(b)
+                    a.wmul(b)
                 }
                 #[inline]
                 fn div(self, a: $ty, b: $ty) -> $ty {
-                    a.div(b)
+                    a / b
                 }
                 #[inline]
                 fn neg(self, a: $ty) -> $ty {
-                    a.neg()
+                    crate::scalar::Scalar::neg(a)
                 }
                 #[inline]
                 fn fma(self, a: $ty, b: $ty, c: $ty) -> $ty {
@@ -260,11 +260,11 @@ mod device {
                 }
                 #[inline]
                 fn min(self, a: $ty, b: $ty) -> $ty {
-                    a.min(b)
+                    crate::scalar::Scalar::min(a, b)
                 }
                 #[inline]
                 fn max(self, a: $ty, b: $ty) -> $ty {
-                    a.max(b)
+                    crate::scalar::Scalar::max(a, b)
                 }
                 #[inline]
                 fn le(self, a: $ty, b: $ty) -> bool {
@@ -327,6 +327,156 @@ mod device {
             }
         };
     }
+
+/// Integer elements on the subgroup backend: per-invocation scalar ops with the same warp
+    /// collectives for the cross-lane surface (`OpGroupNonUniform` integer arithmetic).
+    macro_rules! subgroup_int_backend {
+        ($ty:ty, $umin:ident, $umax:ident) => {
+            impl Backend<$ty> for Subgroup {
+                type Vector = $ty;
+                type Mask = bool;
+
+                type IVector = u32;
+                #[inline]
+                fn iload(self, s: &[u32]) -> u32 {
+                    s[0]
+                }
+                #[inline]
+                fn istore(self, v: u32, out: &mut [u32]) {
+                    out[0] = v;
+                }
+
+                #[inline]
+                fn lanes(self) -> usize {
+                    subgroup_size() as usize
+                }
+                #[inline]
+                fn splat(self, v: $ty) -> $ty {
+                    v
+                }
+                #[inline]
+                fn load(self, s: &[$ty]) -> $ty {
+                    s[0]
+                }
+                #[inline]
+                fn store(self, v: $ty, s: &mut [$ty]) {
+                    s[0] = v;
+                }
+                #[inline]
+                fn add(self, a: $ty, b: $ty) -> $ty {
+                    a.wadd(b)
+                }
+                #[inline]
+                fn sub(self, a: $ty, b: $ty) -> $ty {
+                    a.wsub(b)
+                }
+                #[inline]
+                fn mul(self, a: $ty, b: $ty) -> $ty {
+                    a.wmul(b)
+                }
+                #[inline]
+                fn neg(self, a: $ty) -> $ty {
+                    crate::scalar::Scalar::neg(a)
+                }
+                #[inline]
+                fn abs(self, a: $ty) -> $ty {
+                    crate::scalar::Scalar::abs(a)
+                }
+                #[inline]
+                fn min(self, a: $ty, b: $ty) -> $ty {
+                    crate::scalar::Scalar::min(a, b)
+                }
+                #[inline]
+                fn max(self, a: $ty, b: $ty) -> $ty {
+                    crate::scalar::Scalar::max(a, b)
+                }
+                #[inline]
+                fn le(self, a: $ty, b: $ty) -> bool {
+                    a <= b
+                }
+                #[inline]
+                fn lt(self, a: $ty, b: $ty) -> bool {
+                    a < b
+                }
+                #[inline]
+                fn ge(self, a: $ty, b: $ty) -> bool {
+                    a >= b
+                }
+                #[inline]
+                fn gt(self, a: $ty, b: $ty) -> bool {
+                    a > b
+                }
+                #[inline]
+                fn mask_and(self, a: bool, b: bool) -> bool {
+                    a & b
+                }
+                #[inline]
+                fn mask_or(self, a: bool, b: bool) -> bool {
+                    a | b
+                }
+                #[inline]
+                fn mask_not(self, a: bool) -> bool {
+                    !a
+                }
+                #[inline]
+                fn select(self, m: bool, a: $ty, b: $ty) -> $ty {
+                    if m { a } else { b }
+                }
+                #[inline]
+                fn any(self, m: bool) -> bool {
+                    cap_group_vote();
+                    spirv_std::arch::subgroup_any(m)
+                }
+                #[inline]
+                fn all(self, m: bool) -> bool {
+                    cap_group_vote();
+                    spirv_std::arch::subgroup_all(m)
+                }
+                #[inline]
+                fn reduce_sum(self, v: $ty) -> $ty {
+                    cap_group_arithmetic();
+                    spirv_std::arch::subgroup_i_add(v)
+                }
+                #[inline]
+                fn reduce_min(self, v: $ty) -> $ty {
+                    cap_group_arithmetic();
+                    spirv_std::arch::$umin(v)
+                }
+                #[inline]
+                fn reduce_max(self, v: $ty) -> $ty {
+                    cap_group_arithmetic();
+                    spirv_std::arch::$umax(v)
+                }
+                #[inline]
+                fn shl(self, a: $ty, k: u32) -> $ty {
+                    num_traits::PrimInt::unsigned_shl(a, k)
+                }
+                #[inline]
+                fn shr(self, a: $ty, k: u32) -> $ty {
+                    a >> (k as usize)
+                }
+                #[inline]
+                fn bit_and(self, a: $ty, b: $ty) -> $ty {
+                    a & b
+                }
+                #[inline]
+                fn bit_or(self, a: $ty, b: $ty) -> $ty {
+                    a | b
+                }
+                #[inline]
+                fn bit_xor(self, a: $ty, b: $ty) -> $ty {
+                    a ^ b
+                }
+                #[inline]
+                fn bit_not(self, a: $ty) -> $ty {
+                    !a
+                }
+            }
+        };
+    }
+
+    subgroup_int_backend!(u32, subgroup_u_min, subgroup_u_max);
+    subgroup_int_backend!(i32, subgroup_s_min, subgroup_s_max);
 
     subgroup_backend!(f32, cap_none);
     subgroup_backend!(f64, cap_float64);

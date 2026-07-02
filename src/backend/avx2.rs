@@ -564,6 +564,7 @@ macro_rules! avx2_int_backend {
                 unsafe { yi_neg(a) }
             }
             #[inline(always)]
+            #[allow(unused_unsafe)] // identity for the u32 arm, intrinsic for i32
             fn abs(self, a: __m256i) -> __m256i {
                 unsafe { ($abs)(a) }
             }

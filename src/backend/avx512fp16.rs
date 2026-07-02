@@ -189,3 +189,20 @@ impl Avx512Fp16 {
         tmp.iter().fold(init, |acc, x| f(acc, x.to_f32()))
     }
 }
+
+// `avx512fp16` implies `avx512f`, so every non-f16 element rides the plain AVX-512 impls.
+crate::backend::delegate_float_element!(Avx512Fp16, f32, crate::backend::avx512::Avx512, unsafe {
+    crate::backend::avx512::Avx512::new_unchecked()
+});
+crate::backend::delegate_float_element!(Avx512Fp16, f64, crate::backend::avx512::Avx512, unsafe {
+    crate::backend::avx512::Avx512::new_unchecked()
+});
+crate::backend::delegate_float_element!(Avx512Fp16, half::bf16, crate::backend::avx512::Avx512, unsafe {
+    crate::backend::avx512::Avx512::new_unchecked()
+});
+crate::backend::delegate_int_element!(Avx512Fp16, u32, crate::backend::avx512::Avx512, unsafe {
+    crate::backend::avx512::Avx512::new_unchecked()
+});
+crate::backend::delegate_int_element!(Avx512Fp16, i32, crate::backend::avx512::Avx512, unsafe {
+    crate::backend::avx512::Avx512::new_unchecked()
+});

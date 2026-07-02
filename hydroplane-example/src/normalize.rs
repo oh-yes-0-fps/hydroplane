@@ -14,7 +14,7 @@ pub fn inputs(n: usize) -> [Vec<f32>; 3] {
 
 #[kernel]
 pub fn normalize_hp<'a>(
-    ctx: Gang<f32>,
+    ctx: Gang,
     x: &'a [f32],
     y: &'a [f32],
     z: &'a [f32],
@@ -23,7 +23,7 @@ pub fn normalize_hp<'a>(
     oz: &'a mut [f32],
 ) {
     let n = x.len();
-    let lanes = ctx.lanes();
+    let lanes = ctx.lanes::<f32>();
     let mut off = 0;
     while off + lanes <= n {
         let r = off..off + lanes;

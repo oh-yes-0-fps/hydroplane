@@ -176,6 +176,11 @@ pub trait Scalar:
     const ZERO: Self;
     const ONE: Self;
 
+    /// This element's bit in a kernel's *type-combo* bitmask — the set of elements a kernel
+    /// touches, which drives the combo-dispatch tier choice (see
+    /// [`dispatch::combo_tier`](crate::dispatch::combo_tier)).
+    const TYPE_BITS: u8;
+
     /// Build from an `f64` literal (for in-kernel constants like `4.0`). Truncating for the
     /// integer elements.
     fn from_f64(v: f64) -> Self;
@@ -289,6 +294,7 @@ macro_rules! impl_float_core_scalar {
 impl Scalar for f32 {
     const ZERO: Self = 0.0;
     const ONE: Self = 1.0;
+    const TYPE_BITS: u8 = 1;
     #[inline(always)]
     fn from_f64(v: f64) -> Self {
         v as f32
@@ -327,6 +333,7 @@ impl FloatScalar for f32 {
 impl Scalar for f64 {
     const ZERO: Self = 0.0;
     const ONE: Self = 1.0;
+    const TYPE_BITS: u8 = 2;
     #[inline(always)]
     fn from_f64(v: f64) -> Self {
         v
@@ -363,10 +370,11 @@ impl FloatScalar for f64 {
 }
 
 macro_rules! impl_int_scalar {
-    ($ty:ident, $abs:expr) => {
+    ($ty:ident, $bits:expr, $abs:expr) => {
         impl Scalar for $ty {
             const ZERO: Self = 0;
             const ONE: Self = 1;
+            const TYPE_BITS: u8 = $bits;
             #[inline(always)]
             fn from_f64(v: f64) -> Self {
                 v as $ty
@@ -418,18 +426,19 @@ macro_rules! impl_int_scalar {
     };
 }
 
-impl_int_scalar!(u32, |x| x);
-impl_int_scalar!(i32, |x: i32| x.wrapping_abs());
+impl_int_scalar!(u32, 16, |x| x);
+impl_int_scalar!(i32, 32, |x: i32| x.wrapping_abs());
 
 mod half_impls {
     use super::{FloatScalar, Scalar};
     use half::{bf16, f16};
 
     macro_rules! impl_half {
-        ($ty:ident) => {
+        ($ty:ident, $bits:expr) => {
             impl Scalar for $ty {
                 const ZERO: Self = $ty::from_f32_const(0.0);
                 const ONE: Self = $ty::from_f32_const(1.0);
+                const TYPE_BITS: u8 = $bits;
                 #[inline(always)]
                 fn from_f64(v: f64) -> Self {
                     $ty::from_f64(v)
@@ -513,8 +522,8 @@ mod half_impls {
         };
     }
 
-    impl_half!(f16);
-    impl_half!(bf16);
+    impl_half!(f16, 4);
+    impl_half!(bf16, 8);
 }
 
 #[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]

@@ -7,7 +7,7 @@
 
 use std::time::Instant;
 
-use hydroplane::{Backend, Scalar, Gang, Soa};
+use hydroplane::{BackendAll, Backend, Scalar, Gang, Soa};
 
 fn spheres_soa<T: Scalar>(rows: &[[T; 4]]) -> Soa<T> {
     let mut soa = Soa::with_pad_fills(&[T::ZERO, T::ZERO, T::ZERO, T::from_f64(f64::NAN)]);
@@ -17,8 +17,8 @@ fn spheres_soa<T: Scalar>(rows: &[[T; 4]]) -> Soa<T> {
     soa
 }
 
-fn any_overlap<T: Scalar, S: Backend<T>>(ctx: Gang<T, S>, soa: &Soa<T>, q: [T; 4]) -> bool {
-    let lanes = ctx.lanes();
+fn any_overlap<T: Scalar, S: Backend<T>>(ctx: Gang<S>, soa: &Soa<T>, q: [T; 4]) -> bool {
+    let lanes = ctx.lanes::<T>();
     let (cx, cy, cz, sr) = (
         ctx.splat(q[0]),
         ctx.splat(q[1]),
@@ -97,7 +97,7 @@ struct Query<'a, T: Scalar> {
 }
 impl<T: Scalar> hydroplane::Kernel<T> for Query<'_, T> {
     type Output = bool;
-    fn run<S: Backend<T>>(self, simd: Gang<T, S>) -> bool {
+    fn run<S: BackendAll + Backend<T>>(self, simd: Gang<S>) -> bool {
         any_overlap(simd, self.soa, self.q)
     }
 }

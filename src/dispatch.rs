@@ -28,7 +28,7 @@
 //!   at AVX2 — runtime detection never probes for them and a statically-`avx512f` build won't take them.
 //! * `--cfg no_avx` drops the whole AVX family (implies `no_avx512`), flooring x86 at SSE4.
 
-use crate::backend::{Backend, ScalarBackend};
+use crate::backend::{Backend, BackendAll, ScalarBackend};
 use crate::scalar::Scalar;
 use crate::varying::Gang;
 
@@ -225,7 +225,7 @@ pub trait Kernel<T: Scalar> {
     /// as a const and cannot be per-kernel-capped on stable.
     const K_CAP: usize = crate::MAX_UNROLL;
 
-    fn run<S: Backend<T>>(self, simd: Gang<T, S>) -> Self::Output;
+    fn run<S: BackendAll + Backend<T>>(self, simd: Gang<S>) -> Self::Output;
 }
 
 /// Per-scalar dispatch policy. `f32`/`f64` try a SIMD backend then fall back to scalar;
@@ -256,7 +256,7 @@ impl<T: Scalar, K: Kernel<T>> Kernel<T> for UnrollSelect<K> {
 
     #[inline]
     #[cfg(all(not(no_ilp), not(target_arch = "spirv"), not(hp_resolved_unroll)))]
-    fn run<S: Backend<T>>(self, g: Gang<T, S>) -> Self::Output {
+    fn run<S: BackendAll + Backend<T>>(self, g: Gang<S>) -> Self::Output {
         use crate::backend::Unroll;
         let b = g.backend();
         match g.unroll().min(<K as Kernel<T>>::K_CAP) {
@@ -274,7 +274,7 @@ impl<T: Scalar, K: Kernel<T>> Kernel<T> for UnrollSelect<K> {
     /// exactly one `Unroll<S, K>` — the fully-static counterpart to the runtime path above.
     #[inline]
     #[cfg(hp_resolved_unroll)]
-    fn run<S: Backend<T>>(self, g: Gang<T, S>) -> Self::Output {
+    fn run<S: BackendAll + Backend<T>>(self, g: Gang<S>) -> Self::Output {
         use crate::backend::Unroll;
         self.0
             .run(Gang::new(Unroll::<S, { crate::varying::STATIC_UNROLL }>(g.backend())))
@@ -284,7 +284,7 @@ impl<T: Scalar, K: Kernel<T>> Kernel<T> for UnrollSelect<K> {
     /// (whose reductions take the single-chain fold).
     #[inline]
     #[cfg(any(no_ilp, target_arch = "spirv"))]
-    fn run<S: Backend<T>>(self, g: Gang<T, S>) -> Self::Output {
+    fn run<S: BackendAll + Backend<T>>(self, g: Gang<S>) -> Self::Output {
         self.0.run(g)
     }
 }
@@ -294,6 +294,202 @@ impl<T: Scalar, K: Kernel<T>> Kernel<T> for UnrollSelect<K> {
 #[inline]
 pub fn run_scalar<T: Scalar, K: Kernel<T>>(kernel: K) -> K::Output {
     kernel.run(Gang::new(ScalarBackend))
+}
+
+/// Element bits a kernel's type-combo bitmask is built from (`Scalar::TYPE_BITS`).
+pub(crate) const F16_BIT: u8 = 4;
+pub(crate) const BF16_BIT: u8 = 8;
+pub(crate) const INT_BITS: u8 = 48;
+
+/// The ISA tiers combo dispatch can select. Each tier is a `BackendAll` token whose per-element
+/// impls encode the best unit *that tier guarantees* — the fp16/bf16 tiers serve f32/f64/ints
+/// through plain AVX-512, so a kernel whose combo lacks halves canonicalizes down to
+/// [`TIER_AVX512`] and never monomorphizes for them.
+#[doc(hidden)]
+pub mod tier {
+    pub const SCALAR: u8 = 1;
+    pub const SSE4: u8 = 2;
+    pub const AVX1: u8 = 3;
+    pub const AVX2: u8 = 4;
+    pub const AVX512: u8 = 5;
+    pub const AVX512FP16: u8 = 6;
+    pub const AVX512BF16: u8 = 7;
+    pub const NEON: u8 = 8;
+    pub const SVE16: u8 = 9;
+    pub const SVE32: u8 = 10;
+    pub const SVE64: u8 = 11;
+    pub const SIMD128: u8 = 12;
+    pub const RELAXED: u8 = 13;
+}
+
+/// What the host guarantees, as seen by [`canonical_tier`]. Pure data so the policy is
+/// unit-testable off-target.
+#[doc(hidden)]
+#[derive(Clone, Copy, Default)]
+pub struct Caps {
+    pub sse4: bool,
+    pub avx1: bool,
+    pub avx2: bool,
+    pub avx512: bool,
+    pub fp16: bool,
+    pub bf16: bool,
+    pub neon: bool,
+    /// SVE vector length in bytes; `0` when absent (or policy-disabled).
+    pub sve_vl: u16,
+    pub simd128: bool,
+    pub relaxed: bool,
+}
+
+/// The canonical tier for a `(host, type-combo)` pair — the policy that lets kernels
+/// monomorphize only for tiers *distinct on the elements they use*:
+/// - the fp16/bf16 towers are chosen only when the combo contains that half type (their other
+///   elements are identical to plain AVX-512);
+/// - AVX1 is chosen only for pure `f32`/`f64` combos (its integer/half lanes are emulated,
+///   while SSE4's are native);
+/// - SVE is chosen only for integer-free combos (its integer lanes are emulated; NEON's are
+///   native).
+#[doc(hidden)]
+pub fn canonical_tier(caps: &Caps, combo: u8) -> u8 {
+    if caps.avx512 {
+        if combo & F16_BIT != 0 && caps.fp16 {
+            return tier::AVX512FP16;
+        }
+        if combo & BF16_BIT != 0 && caps.bf16 {
+            return tier::AVX512BF16;
+        }
+        return tier::AVX512;
+    }
+    if caps.avx2 {
+        return tier::AVX2;
+    }
+    if caps.avx1 && combo & (INT_BITS | F16_BIT | BF16_BIT) == 0 {
+        return tier::AVX1;
+    }
+    if caps.sse4 {
+        return tier::SSE4;
+    }
+    if caps.sve_vl > 0 && combo & INT_BITS == 0 {
+        return if caps.sve_vl >= 64 {
+            tier::SVE64
+        } else if caps.sve_vl >= 32 {
+            tier::SVE32
+        } else {
+            tier::SVE16
+        };
+    }
+    if caps.neon {
+        return tier::NEON;
+    }
+    if caps.relaxed {
+        return tier::RELAXED;
+    }
+    if caps.simd128 {
+        return tier::SIMD128;
+    }
+    tier::SCALAR
+}
+
+fn host_caps() -> Caps {
+    #[allow(unused_mut)]
+    let mut caps = Caps::default();
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    {
+        #[cfg(all(feature = "std", not(static_dispatch)))]
+        {
+            caps.sse4 = std::arch::is_x86_feature_detected!("sse4.1");
+            #[cfg(not(no_avx))]
+            {
+                caps.avx1 = std::arch::is_x86_feature_detected!("avx");
+                caps.avx2 = std::arch::is_x86_feature_detected!("avx2")
+                    && std::arch::is_x86_feature_detected!("fma");
+            }
+            #[cfg(not(any(no_avx, no_avx512)))]
+            {
+                caps.avx512 = std::arch::is_x86_feature_detected!("avx512f")
+                    && std::arch::is_x86_feature_detected!("avx512bw");
+                caps.fp16 = caps.avx512 && std::arch::is_x86_feature_detected!("avx512fp16");
+                caps.bf16 = caps.avx512 && std::arch::is_x86_feature_detected!("avx512bf16");
+            }
+        }
+        #[cfg(any(not(feature = "std"), static_dispatch))]
+        {
+            caps.sse4 = cfg!(target_feature = "sse4.1");
+            caps.avx1 = cfg!(all(target_feature = "avx", not(no_avx)));
+            caps.avx2 = cfg!(all(target_feature = "avx2", target_feature = "fma", not(no_avx)));
+            caps.avx512 = cfg!(all(target_feature = "avx512f", not(any(no_avx, no_avx512))));
+            caps.fp16 = caps.avx512 && cfg!(target_feature = "avx512fp16");
+            caps.bf16 = caps.avx512 && cfg!(target_feature = "avx512bf16");
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        caps.neon = true;
+        #[cfg(all(not(target_vendor = "apple"), not(no_sve), not(neon_over_sve)))]
+        {
+            let have_sve = cfg!(target_feature = "sve")
+                || {
+                    #[cfg(all(feature = "std", not(static_dispatch)))]
+                    {
+                        std::arch::is_aarch64_feature_detected!("sve")
+                    }
+                    #[cfg(any(not(feature = "std"), static_dispatch))]
+                    {
+                        false
+                    }
+                };
+            if have_sve {
+                caps.sve_vl = crate::arch::sve2::vl_bytes() as u16;
+            }
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        caps.simd128 = cfg!(target_feature = "simd128");
+        caps.relaxed = cfg!(target_feature = "relaxed-simd");
+    }
+    caps
+}
+
+/// The dispatch tier for a kernel's type-combo, resolved once per `(process, combo)` and cached
+/// in a 64-slot atomic table (6 element bits → one `AtomicU8` per subset). The hot path is a
+/// relaxed load + the caller's `match`; the first call per combo pays one feature-detection
+/// pass. Generated `#[kernel]` wrappers pass their compile-time combo and match on the result
+/// with arms pruned to the tiers this function can actually return for that combo — which is
+/// what keeps a pure-`f32` kernel from monomorphizing for the fp16/bf16 towers.
+#[doc(hidden)]
+#[inline]
+pub fn combo_tier(combo: u8) -> u8 {
+    let combo = combo & 63;
+    #[cfg(all(feature = "std", not(static_dispatch)))]
+    {
+        use core::sync::atomic::{AtomicU8, Ordering};
+        static COMBO_TIERS: [AtomicU8; 64] = [const { AtomicU8::new(0) }; 64];
+        let slot = &COMBO_TIERS[combo as usize];
+        match slot.load(Ordering::Relaxed) {
+            0 => {
+                let t = canonical_tier(&host_caps(), combo);
+                slot.store(t, Ordering::Relaxed);
+                t
+            }
+            t => t,
+        }
+    }
+    #[cfg(not(all(feature = "std", not(static_dispatch))))]
+    {
+        // Compile-time capabilities: folds to a constant per combo after inlining.
+        canonical_tier(&host_caps(), combo)
+    }
+}
+
+/// Run a kernel on an explicit backend with the standard unroll-factor resolution — the arm body
+/// the `#[kernel]` combo-dispatch match uses.
+#[doc(hidden)]
+#[inline]
+pub fn run_kernel_on<T: Scalar, K: Kernel<T>, S: BackendAll + Backend<T>>(
+    kernel: K,
+    backend: S,
+) -> K::Output {
+    UnrollSelect(kernel).run(Gang::new(backend))
 }
 
 /// Resolve-once cache for the x86 runtime backend tier. The detected tier is immutable for the life

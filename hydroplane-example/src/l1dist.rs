@@ -13,7 +13,7 @@ pub fn inputs(n: usize) -> (Vec<f32>, Vec<f32>) {
 }
 
 #[kernel]
-pub fn l1dist_hp<'a>(ctx: Gang<f32>, x: &'a [f32], y: &'a [f32]) -> f32 {
+pub fn l1dist_hp<'a>(ctx: Gang, x: &'a [f32], y: &'a [f32]) -> f32 {
     ctx.zip_reduce(
         x,
         y,

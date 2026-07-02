@@ -48,7 +48,7 @@ pub mod soa;
 #[cfg(feature = "glam")]
 pub mod glam_ext;
 
-pub use backend::{Backend, ScalarBackend};
+pub use backend::{Backend, BackendAll, ScalarBackend};
 pub use dispatch::{Kernel, SimdDispatch, dispatch, run_scalar};
 
 /// The on-device entry point (rust-gpu / SPIR-V target): mirrors [`dispatch`], but branches
@@ -84,6 +84,27 @@ pub use soa::Soa;
 
 #[cfg(feature = "glam")]
 pub use glam_ext::{GangGlamExt, Mat3Wide, Vec3Wide};
+
+/// The combo-dispatch tier tokens and codes, reachable by `#[kernel]`-generated wrappers.
+/// Implementation detail: application code never names a backend — the generated match does.
+#[doc(hidden)]
+pub mod towers {
+    pub use crate::dispatch::tier::*;
+    pub use crate::ScalarBackend;
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    pub use crate::backend::{
+        avx1::Avx1, avx2::Avx2, avx512::Avx512, avx512bf16::Avx512Bf16, avx512fp16::Avx512Fp16,
+        sse4::Sse4,
+    };
+    #[cfg(target_arch = "aarch64")]
+    pub use crate::backend::neon::Neon;
+    #[cfg(target_arch = "aarch64")]
+    pub use crate::backend::sve::Sve;
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    pub use crate::backend::wasm::Simd128;
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", target_feature = "relaxed-simd"))]
+    pub use crate::backend::wasm::RelaxedSimd;
+}
 
 /// Test hook: the unroll factor in effect — `0` until the first dispatch resolves it via the runtime
 /// sweep, or the `build.rs`-baked constant when it was resolved at compile time. Not part of the
@@ -146,7 +167,7 @@ mod tests {
     }
     impl<T: Scalar> Kernel<T> for AnyWithin<'_, T> {
         type Output = bool;
-        fn run<S: Backend<T>>(self, simd: Gang<T, S>) -> bool {
+        fn run<S: backend::BackendAll + Backend<T>>(self, simd: Gang<S>) -> bool {
             any_within(simd.backend(), self.xs, self.r)
         }
     }

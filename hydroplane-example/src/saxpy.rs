@@ -15,7 +15,7 @@ pub fn inputs(n: usize) -> (f32, Vec<f32>, Vec<f32>) {
 // closure over an auto-vectorized loop — rather than the SIMD `map` family. `#[hint_cnt]` records the
 // expected length (thrown out for now).
 #[kernel]
-pub fn saxpy_hp<'a>(ctx: Gang<f32>, a: f32, #[hint_cnt(4096)] x: &'a [f32], y: &'a mut [f32]) {
+pub fn saxpy_hp<'a>(ctx: Gang, a: f32, #[hint_cnt(4096)] x: &'a [f32], y: &'a mut [f32]) {
     ctx.stream_zip_inplace(x, y, |xi, yi| a * xi + yi);
 }
 

@@ -18,7 +18,7 @@ pub fn inputs(n: usize) -> (Vec<f32>, Vec<f32>) {
 }
 
 #[kernel]
-pub fn mandelbrot_hp<'a>(ctx: Gang<f32>, cx: &'a [f32], cy: &'a [f32], max_iter: u32, out: &'a mut [f32]) {
+pub fn mandelbrot_hp<'a>(ctx: Gang, cx: &'a [f32], cy: &'a [f32], max_iter: u32, out: &'a mut [f32]) {
     let (zero, one, four) = (ctx.splat(0.0), ctx.splat(1.0), ctx.splat(4.0));
     // Elementwise `(cx, cy) -> escape count`; `zip_map` handles the chunking and masked tail, and the
     // closure is the escape-time iteration itself — the active mask and early-exit stay per lane.

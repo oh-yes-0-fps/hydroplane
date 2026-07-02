@@ -30,7 +30,7 @@ fn data(n: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
 const Q: [f32; 4] = [1.0, -2.0, 0.5, 4.0];
 
 #[kernel]
-fn count_hp<'a>(ctx: Gang<f32>, xs: &'a [f32], ys: &'a [f32], zs: &'a [f32], rs: &'a [f32], q: [f32; 4]) -> usize {
+fn count_hp<'a>(ctx: Gang, xs: &'a [f32], ys: &'a [f32], zs: &'a [f32], rs: &'a [f32], q: [f32; 4]) -> usize {
     let [cx, cy, cz, sr] = ctx.splat_n(q);
     ctx.count_n([xs, ys, zs, rs], |[x, y, z, r]| {
         let (dx, dy, dz) = (cx - x, cy - y, cz - z);
@@ -130,11 +130,11 @@ fn count_scalar(xs: &[f32], ys: &[f32], zs: &[f32], rs: &[f32], q: [f32; 4]) -> 
 // Full-scan count over an AoS `&[[f32; 4]]` via `gather_n` — deterministic throughput (no early
 // exit). Masked variant: `masked_chunks` active mask `&`-ed into the predicate (always correct).
 #[kernel]
-fn gather_count_hp<'a>(ctx: Gang<f32>, pts: &'a [[f32; 4]], q: [f32; 4]) -> usize {
+fn gather_count_hp<'a>(ctx: Gang, pts: &'a [[f32; 4]], q: [f32; 4]) -> usize {
     let [cx, cy, cz, sr] = ctx.splat_n(q);
     let (one, zero) = (ctx.splat(1.0), ctx.splat(0.0));
     let mut acc = zero;
-    for (off, cnt, active) in ctx.masked_chunks(pts.len()) {
+    for (off, cnt, active) in ctx.masked_chunks::<f32>(pts.len()) {
         let [x, y, z, r] = ctx.gather_n(&pts[off..off + cnt], [0.0; 4], |p| *p);
         let (dx, dy, dz) = (cx - x, cy - y, cz - z);
         let rsum = sr + r;
@@ -146,11 +146,11 @@ fn gather_count_hp<'a>(ctx: Gang<f32>, pts: &'a [[f32; 4]], q: [f32; 4]) -> usiz
 // Sentinel variant: NaN-fill the radius lane so inactive tail lanes self-reject — no active mask,
 // matching the hand-written `wide` strategy exactly.
 #[kernel]
-fn gather_count_sentinel_hp<'a>(ctx: Gang<f32>, pts: &'a [[f32; 4]], q: [f32; 4]) -> usize {
+fn gather_count_sentinel_hp<'a>(ctx: Gang, pts: &'a [[f32; 4]], q: [f32; 4]) -> usize {
     let [cx, cy, cz, sr] = ctx.splat_n(q);
     let (one, zero) = (ctx.splat(1.0), ctx.splat(0.0));
     let mut acc = zero;
-    ctx.for_each_chunk(pts.len(), |off, cnt| {
+    ctx.for_each_chunk::<f32>(pts.len(), |off, cnt| {
         let [x, y, z, r] = ctx.gather_n(&pts[off..off + cnt], [0.0, 0.0, 0.0, f32::NAN], |p| *p);
         let (dx, dy, dz) = (cx - x, cy - y, cz - z);
         let rsum = sr + r;

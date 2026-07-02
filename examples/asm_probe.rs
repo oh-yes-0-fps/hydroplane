@@ -6,9 +6,9 @@ use std::hint::black_box;
 use wide::f32x4;
 
 #[kernel]
-fn dot<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
+fn dot<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     let mut acc = ctx.splat(0.0);
-    ctx.for_each_chunk(a.len(), |off, cnt| {
+    ctx.for_each_chunk::<f32>(a.len(), |off, cnt| {
         let x = ctx.load_partial(&a[off..off + cnt], 0.0);
         let y = ctx.load_partial(&b[off..off + cnt], 0.0);
         acc = acc + x * y;
@@ -17,13 +17,13 @@ fn dot<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
 }
 
 #[kernel]
-fn dot_fold<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
+fn dot_fold<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     ctx.zip_fold(a, b, 0.0, 0.0, ctx.splat(0.0), |acc, x, y| acc + x * y)
         .reduce_sum()
 }
 
 #[kernel]
-fn dot_ilp<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
+fn dot_ilp<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     ctx.zip_reduce(
         a,
         b,

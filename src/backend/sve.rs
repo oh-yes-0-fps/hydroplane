@@ -206,3 +206,8 @@ impl_sve_backend!(
     sqrt_f32, min_f32, max_f32, le_f32, lt_f32, ge_f32, gt_f32, select_f32, reduce_sum_bf16,
     reduce_min_bf16, reduce_max_bf16
 );
+
+// Integer elements: no SVE integer asm primitives yet — correctness-only emulation for
+// `BackendAll`; the integer dispatch ladders never pick SVE.
+crate::backend::emulated_int_element!([const C: usize] Sve<C>, u32, C / 4);
+crate::backend::emulated_int_element!([const C: usize] Sve<C>, i32, C / 4);

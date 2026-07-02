@@ -16,7 +16,7 @@ pub fn inputs(n: usize) -> ([Vec<f32>; 9], [Vec<f32>; 3]) {
 
 #[kernel]
 pub fn transform_hp<'a>(
-    ctx: Gang<f32>,
+    ctx: Gang,
     m: [&'a [f32]; 9],
     vx: &'a [f32],
     vy: &'a [f32],
@@ -28,7 +28,7 @@ pub fn transform_hp<'a>(
     // Twelve input columns (nine column-major matrix components + the vector's x/y/z) into three
     // outputs — `M·v` per lane, matching `Mat3Wide::mul_vec3`. `map_cols` drives the full-register
     // pass, the masked tail, and the ILP; the closure is just the math.
-    ctx.map_cols::<12, 3>(
+    ctx.map_cols::<f32, 12, 3>(
         [m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], vx, vy, vz],
         [ox, oy, oz],
         0.0,

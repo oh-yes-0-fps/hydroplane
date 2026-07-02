@@ -31,7 +31,7 @@ fn overlaps(
 }
 
 #[kernel]
-fn count_k<'a>(ctx: Gang<f32>, xs: &'a [f32], ys: &'a [f32], zs: &'a [f32], rs: &'a [f32], q: [f32; 4]) -> usize {
+fn count_k<'a>(ctx: Gang, xs: &'a [f32], ys: &'a [f32], zs: &'a [f32], rs: &'a [f32], q: [f32; 4]) -> usize {
     let [cx, cy, cz, sr] = ctx.splat_n(q);
     ctx.count_n([xs, ys, zs, rs], |[x, y, z, r]| {
         let (dx, dy, dz) = (cx - x, cy - y, cz - z);
@@ -42,7 +42,7 @@ fn count_k<'a>(ctx: Gang<f32>, xs: &'a [f32], ys: &'a [f32], zs: &'a [f32], rs: 
 
 #[kernel]
 fn collect_k<'a>(
-    ctx: Gang<f32>,
+    ctx: Gang,
     xs: &'a [f32],
     ys: &'a [f32],
     zs: &'a [f32],
@@ -65,9 +65,9 @@ fn collect_k<'a>(
 /// Two-phase loop over `masked_chunks` + `gather_n` from an AoS `&[(x,y,z,r)]`, mirroring the
 /// broadphase-reject-then-narrowphase shape — must match the scalar any-overlap.
 #[kernel]
-fn gather_any_k<'a>(ctx: Gang<f32>, pts: &'a [(f32, f32, f32, f32)], q: [f32; 4]) -> bool {
+fn gather_any_k<'a>(ctx: Gang, pts: &'a [(f32, f32, f32, f32)], q: [f32; 4]) -> bool {
     let [cx, cy, cz, sr] = ctx.splat_n(q);
-    for (off, cnt, active) in ctx.masked_chunks(pts.len()) {
+    for (off, cnt, active) in ctx.masked_chunks::<f32>(pts.len()) {
         let [x, y, z, r] = ctx.gather_n(&pts[off..off + cnt], [0.0; 4], |p| [p.0, p.1, p.2, p.3]);
         let (dx, dy, dz) = (cx - x, cy - y, cz - z);
         let rsum = sr + r;
@@ -127,8 +127,8 @@ fn gather_n_matches_scalar() {
 }
 
 #[kernel]
-fn load_roundtrip_k<'a>(ctx: Gang<f32>, xs: &'a [f32], ys: &'a [f32], zs: &'a [f32]) -> f32 {
-    let n = ctx.lanes();
+fn load_roundtrip_k<'a>(ctx: Gang, xs: &'a [f32], ys: &'a [f32], zs: &'a [f32]) -> f32 {
+    let n = ctx.lanes::<f32>();
     debug_assert!(xs.len() == n);
     let [vx, vy, vz] = ctx.load_n([xs, ys, zs]);
     let [px, py, pz] = ctx.load_partial_n([xs, ys, zs], 0.0);
@@ -153,14 +153,14 @@ fn array_loaders_match_manual() {
 struct LanesProbe;
 impl hydroplane::Kernel<f32> for LanesProbe {
     type Output = usize;
-    fn run<S: hydroplane::Backend<f32>>(self, ctx: Gang<f32, S>) -> usize {
-        ctx.lanes()
+    fn run<S: hydroplane::Backend<f32>>(self, ctx: Gang<S>) -> usize {
+        ctx.lanes::<f32>()
     }
 }
 
 #[kernel]
-fn bitmask_k<'a>(ctx: Gang<f32>, xs: &'a [f32], thresh: f32) -> u32 {
-    debug_assert!(xs.len() == ctx.lanes());
+fn bitmask_k<'a>(ctx: Gang, xs: &'a [f32], thresh: f32) -> u32 {
+    debug_assert!(xs.len() == ctx.lanes::<f32>());
     ctx.load(xs).gt(ctx.splat(thresh)).to_bitmask()
 }
 
@@ -177,7 +177,7 @@ fn to_bitmask_matches_lane_predicate() {
 }
 
 #[kernel]
-fn rotate3_k<'a>(ctx: Gang<f32>, xs: &'a mut [f32], ys: &'a mut [f32], zs: &'a mut [f32], m: [f32; 9]) {
+fn rotate3_k<'a>(ctx: Gang, xs: &'a mut [f32], ys: &'a mut [f32], zs: &'a mut [f32], m: [f32; 9]) {
     ctx.map_n([xs, ys, zs], 0.0, |[x, y, z]| {
         [
             x * m[0] + y * m[1] + z * m[2],

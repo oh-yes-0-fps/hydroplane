@@ -1208,7 +1208,7 @@ where
         } else {
             16
         };
-        let k = crate::varying::Gang::<T::Compute, S>::new(backend).unroll();
+        let k = crate::varying::Gang::new(backend).unroll_for::<T::Compute>();
         let by_regs = (REGS - 3) / 5;
         let nr = k.div_ceil(4).clamp(2, by_regs).min(4);
         return match nr {
@@ -1441,10 +1441,14 @@ pub struct Tile<
     _p: PhantomData<(T, Ro)>,
 }
 
-impl<T: FloatScalar, S: MatrixBackend<T>> Gang<T, S> {
-    /// Gateway to the tile / matrix-multiply surface.
+impl<S: Copy> Gang<S> {
+    /// Gateway to the tile / matrix-multiply surface for element `T` (usually inferred from the
+    /// tile loads that follow).
     #[inline(always)]
-    pub fn tiles(self) -> Tiles<T, S> {
+    pub fn tiles<T: FloatScalar>(self) -> Tiles<T, S>
+    where
+        S: MatrixBackend<T>,
+    {
         Tiles {
             backend: self.backend(),
             _t: PhantomData,
@@ -1603,7 +1607,7 @@ impl<'a, T: FloatScalar, S: MatrixBackend<T>, E: Scalar, const R: usize, const C
 /// also supports tiles. Run with [`run_matrix_scalar`] (oracle) or `dispatch`-style selection.
 pub trait MatrixKernel<T: FloatScalar> {
     type Output;
-    fn run<S: MatrixBackend<T>>(self, ctx: Gang<T, S>) -> Self::Output;
+    fn run<S: MatrixBackend<T>>(self, ctx: Gang<S>) -> Self::Output;
 }
 
 /// Run a matmul kernel on the always-available scalar backend (correctness oracle / baseline).
@@ -1853,7 +1857,7 @@ mod packed_parity {
     struct Probe;
     impl Kernel<f32> for Probe {
         type Output = ();
-        fn run<S: Backend<f32>>(self, ctx: Gang<f32, S>) {
+        fn run<S: crate::backend::BackendAll + Backend<f32>>(self, ctx: Gang<S>) {
             let be = ctx.backend();
             let (a, b, c) = data();
             // Every register-block width the dispatcher can pick must match `simd_gemm` exactly —

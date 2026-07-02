@@ -5,7 +5,7 @@
 //! Run with `cargo run --example soa_rs_interop`.
 
 use soa_rs::{Soars, soa};
-use hydroplane::{Backend, Kernel, Gang, dispatch};
+use hydroplane::{BackendAll, Kernel, Gang, dispatch};
 
 #[derive(Soars, Debug, Clone, Copy)]
 struct Sphere {
@@ -27,15 +27,15 @@ struct AnyOverlap<'a> {
 }
 impl Kernel<f32> for AnyOverlap<'_> {
     type Output = bool;
-    fn run<S: Backend<f32>>(self, ctx: Gang<f32, S>) -> bool {
+    fn run<S: BackendAll>(self, ctx: Gang<S>) -> bool {
         let (cx, cy, cz, sr) = (
             ctx.splat(self.q[0]),
             ctx.splat(self.q[1]),
             ctx.splat(self.q[2]),
             ctx.splat(self.q[3]),
         );
-        let n = ctx.lanes();
-        for k in ctx.chunks_exact(self.xs.len()) {
+        let n = ctx.lanes::<f32>();
+        for k in ctx.chunks_exact::<f32>(self.xs.len()) {
             let dx = cx - ctx.load(&self.xs[k..k + n]);
             let dy = cy - ctx.load(&self.ys[k..k + n]);
             let dz = cz - ctx.load(&self.zs[k..k + n]);
@@ -46,7 +46,7 @@ impl Kernel<f32> for AnyOverlap<'_> {
                 return true;
             }
         }
-        if let Some((k, cnt)) = ctx.remainder(self.xs.len()) {
+        if let Some((k, cnt)) = ctx.remainder::<f32>(self.xs.len()) {
             let dx = cx - ctx.load_partial(&self.xs[k..k + cnt], 0.0);
             let dy = cy - ctx.load_partial(&self.ys[k..k + cnt], 0.0);
             let dz = cz - ctx.load_partial(&self.zs[k..k + cnt], 0.0);

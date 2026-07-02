@@ -521,6 +521,7 @@ macro_rules! sse4_int_backend {
                 unsafe { si_neg(a) }
             }
             #[inline(always)]
+            #[allow(unused_unsafe)] // identity for the u32 arm, intrinsic for i32
             fn abs(self, a: __m128i) -> __m128i {
                 unsafe { ($abs)(a) }
             }
@@ -978,7 +979,8 @@ macro_rules! sse4_widen_half {
                     unsafe { s_xor(a, s_splat(-0.0)) }
                 }
                 #[inline(always)]
-                fn abs(self, a: __m128) -> __m128 {
+                #[allow(unused_unsafe)] // identity for the u32 arm, intrinsic for i32
+            fn abs(self, a: __m128) -> __m128 {
                     unsafe { s_abs(a) }
                 }
                 #[inline(always)]

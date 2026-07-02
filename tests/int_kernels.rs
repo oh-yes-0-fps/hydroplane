@@ -6,14 +6,14 @@ use hydroplane::{Gang, IntScalar, kernel};
 /// SWAR popcount per lane, summed — exercises shifts, bitwise ops, wrapping mul, and reduce_sum
 /// on a `u32` gang.
 #[kernel]
-fn popcount_sum<'a>(ctx: Gang<u32>, xs: &'a [u32]) -> u32 {
-    let n = ctx.lanes();
+fn popcount_sum<'a>(ctx: Gang, xs: &'a [u32]) -> u32 {
+    let n = ctx.lanes::<u32>();
     let m1 = ctx.splat(0x5555_5555);
     let m2 = ctx.splat(0x3333_3333);
     let m4 = ctx.splat(0x0f0f_0f0f);
     let h01 = ctx.splat(0x0101_0101);
     let mut acc = ctx.splat(0);
-    ctx.for_each_chunk(xs.len(), |off, cnt| {
+    ctx.for_each_chunk::<u32>(xs.len(), |off, cnt| {
         let x = ctx.load_partial(&xs[off..off + cnt], 0);
         let x = x - ((x >> 1) & m1);
         let x = (x & m2) + ((x >> 2) & m2);
@@ -28,19 +28,19 @@ fn popcount_sum<'a>(ctx: Gang<u32>, xs: &'a [u32]) -> u32 {
 /// Min/max/abs over a signed gang, with a masked count of negatives — `Ord` semantics and the
 /// same `Mask` machinery the float kernels use.
 #[kernel]
-fn signed_stats<'a>(ctx: Gang<i32>, xs: &'a [i32]) -> (i32, i32, u32) {
-    let n = ctx.lanes();
+fn signed_stats<'a>(ctx: Gang, xs: &'a [i32]) -> (i32, i32, u32) {
+    let n = ctx.lanes::<i32>();
     let zero = ctx.splat(0);
     let mut lo = ctx.splat(i32::MAX);
     let mut hi = ctx.splat(i32::MIN);
     let mut neg = 0u32;
-    for off in ctx.chunks_exact(xs.len()) {
+    for off in ctx.chunks_exact::<i32>(xs.len()) {
         let v = ctx.load(&xs[off..off + n]);
         lo = lo.min(v);
         hi = hi.max(v);
         neg += v.lt(zero).to_bitmask().count_ones();
     }
-    if let Some((off, cnt)) = ctx.remainder(xs.len()) {
+    if let Some((off, cnt)) = ctx.remainder::<i32>(xs.len()) {
         let v = ctx.load_partial(&xs[off..off + cnt], i32::MAX);
         lo = lo.min(v);
         let v = ctx.load_partial(&xs[off..off + cnt], i32::MIN);
@@ -54,9 +54,9 @@ fn signed_stats<'a>(ctx: Gang<i32>, xs: &'a [i32]) -> (i32, i32, u32) {
 /// Generic over the integer family — the macro finds the scalar through the `IntScalar` bound
 /// exactly as it does for `FloatScalar`.
 #[kernel]
-fn wrapping_sum<'a, T: IntScalar>(ctx: Gang<T>, xs: &'a [T]) -> T {
+fn wrapping_sum<'a, T: IntScalar>(ctx: Gang, xs: &'a [T]) -> T {
     let mut acc = ctx.splat(T::ZERO);
-    ctx.for_each_chunk(xs.len(), |off, cnt| {
+    ctx.for_each_chunk::<T>(xs.len(), |off, cnt| {
         acc = acc + ctx.load_partial(&xs[off..off + cnt], T::ZERO);
     });
     acc.reduce_sum()

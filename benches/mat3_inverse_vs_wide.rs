@@ -45,9 +45,9 @@ fn cols_ref(s: &Soa9) -> [&[f32]; 9] {
 }
 
 #[kernel]
-fn invert_hp<'a>(ctx: Gang<f32>, m: [&'a [f32]; 9], out: [&'a mut [f32]; 9]) {
+fn invert_hp<'a>(ctx: Gang, m: [&'a [f32]; 9], out: [&'a mut [f32]; 9]) {
     let n = m[0].len();
-    let lanes = ctx.lanes();
+    let lanes = ctx.lanes::<f32>();
     let mut out = out;
     let mut off = 0;
     while off + lanes <= n {

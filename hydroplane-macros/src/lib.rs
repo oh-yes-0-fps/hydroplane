@@ -8,17 +8,27 @@
 //!
 //! ```ignore
 //! #[hydroplane::kernel]
-//! pub fn any_overlap<'a, T: Scalar>(ctx: Gang<T>, soa: &'a Soa<T>, q: [T; 4]) -> bool {
+//! pub fn any_overlap<'a, T: Scalar>(ctx: Gang, soa: &'a Soa<T>, q: [T; 4]) -> bool {
 //!     // `ctx`, `soa`, `q` are all in scope; write the kernel body directly.
 //! }
 //! // call site — no struct, no impl, no `dispatch`:
 //! let hit = any_overlap(&soa, q);
 //! ```
 //!
-//! The leading parameters are contexts: annotate each `Gang<T>` (the backend is filled in by
-//! dispatch, so the second type argument is left off). Every parameter after the contexts becomes a
-//! field carried across the dispatch boundary. The scalar type parameter is the one bound by
-//! `Scalar` (or, failing that, the one named `T`); override the choice with `#[kernel(scalar = U)]`.
+//! The leading parameters are contexts, written bare (`ctx: Gang` — the gang is element-free;
+//! the backend is filled in by dispatch). Every parameter after the contexts becomes a field
+//! carried across the dispatch boundary. The dispatch element is the generic bound by
+//! `Scalar`/`FloatScalar`/`IntScalar` (or the one named `T`); for concrete kernels it is
+//! inferred from the elements the body touches; override with `#[kernel(scalar = U)]`.
+//!
+//! ## Element attributes and combo dispatch
+//!
+//! A kernel's *type-combo* — the set of elements its body touches — decides which ISA tier the
+//! generated wrapper can dispatch to (see `hydroplane::dispatch::combo_tier`). It is discovered
+//! by a token scan (or measured MIR when the `hydroplane-auto` analysis ran). List element names
+//! in the attribute to guarantee bits the scan cannot see — e.g. integer-companion work hidden
+//! inside a helper: `#[kernel(tiny, u32, f32)]`. Attribute elements are OR'd into the combo
+//! unconditionally, even over the measured set.
 //!
 //! ## Surface
 //!
@@ -86,7 +96,7 @@ use hydroplane_auto::analysis;
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
-use quote::{format_ident, quote};
+use quote::{ToTokens, format_ident, quote};
 use syn::parse::Parser;
 use syn::spanned::Spanned;
 use syn::{
@@ -127,6 +137,22 @@ struct KernelOpts {
     /// whose register pressure the analysis can't measure — a `map_cols` transform that keeps its
     /// varyings in a closure the register proxy under-counts, so the author pins `unroll = 1`.
     unroll: Option<usize>,
+    /// Element names listed in the attribute (`#[kernel(u32, f32)]`): unconditionally OR'd into
+    /// the type-combo bitmask (even over MIR-measured sets — the author's guarantee wins), and
+    /// the first listed doubles as the dispatch element when nothing else names one.
+    types: Vec<Ident>,
+}
+
+fn element_bits(name: &str) -> Option<u8> {
+    Some(match name {
+        "f32" => 1,
+        "f64" => 2,
+        "f16" => 4,
+        "bf16" => 8,
+        "u32" => 16,
+        "i32" => 32,
+        _ => return None,
+    })
 }
 
 impl KernelOpts {
@@ -137,9 +163,15 @@ impl KernelOpts {
         let mut tiny_span = None;
         let mut noalias_span = None;
         let mut unroll = None;
+        let mut types = Vec::new();
         let metas = Punctuated::<Meta, Token![,]>::parse_terminated.parse2(tokens)?;
         for meta in metas {
             match meta {
+                Meta::Path(p)
+                    if p.get_ident().is_some_and(|i| element_bits(&i.to_string()).is_some()) =>
+                {
+                    types.push(p.get_ident().unwrap().clone());
+                }
                 Meta::Path(p) if p.is_ident("matrix") => {
                     if matrix {
                         return Err(syn::Error::new(p.span(), "duplicate `matrix`"));
@@ -202,11 +234,12 @@ impl KernelOpts {
             return Err(e);
         }
         let explicit_boundary = tiny_span.is_some() || noalias_span.is_some();
-        Ok(KernelOpts { matrix, scalar, noalias, explicit_boundary, unroll })
+        Ok(KernelOpts { matrix, scalar, noalias, explicit_boundary, unroll, types })
     }
 }
 
 fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
+    let func_tokens = func.to_token_stream();
     let ItemFn {
         attrs,
         vis,
@@ -298,7 +331,15 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
     };
 
     // Scalar precedence: explicit `scalar = …` > the `Scalar`-bound / `T`-named generic > the
-    // context's element type (lets a concrete `ctx: Gang<f32>` kernel skip a generic parameter).
+    // context's element type (a legacy `ctx: Gang<f32>`) > the first attribute element
+    // (`#[kernel(u32, …)]`) > the lowest element the token scan finds > `f32`. With combo
+    // dispatch the element only keys the `Kernel<T>` trait and the generic fallback ladder, so
+    // any element the kernel touches is a correct choice.
+    let scanned_bits_early = {
+        let mut ts = TokenStream2::new();
+        func_tokens.to_tokens(&mut ts);
+        scan_type_bits(&ts)
+    };
     let detected = detect_scalar(&sig.generics)?;
     let scalar = if let Some(s) = &opts.scalar {
         quote!(#s)
@@ -306,12 +347,18 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         quote!(#s)
     } else if let Some(t) = &ctx_scalar {
         quote!(#t)
+    } else if let Some(first) = opts.types.first() {
+        quote!(#first)
     } else {
-        return Err(syn::Error::new_spanned(
-            &sig.ident,
-            "could not determine the scalar type: bind a generic with `Scalar` (e.g. `T: Scalar`), \
-             give the context an explicit element (`ctx: Gang<f32>`), or pass `#[kernel(scalar = X)]`",
-        ));
+        match 1u8 << scanned_bits_early.trailing_zeros().min(6) {
+            1 => quote!(f32),
+            2 => quote!(f64),
+            4 => quote!(::hydroplane::f16),
+            8 => quote!(::hydroplane::bf16),
+            16 => quote!(u32),
+            32 => quote!(i32),
+            _ => quote!(f32),
+        }
     };
 
     let generics = sig.generics;
@@ -363,6 +410,12 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
             quote!(::hydroplane::dispatch),
             quote!(::hydroplane::SimdDispatch),
         )
+    };
+
+    let run_bound = if matrix_present {
+        quote!(#bbound<#scalar>)
+    } else {
+        quote!(::hydroplane::BackendAll + ::hydroplane::Backend<#scalar>)
     };
 
     let mut wrapper_generics = generics.clone();
@@ -431,7 +484,7 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
     // (no dispatch bound); takes the primary context plus the data parameters.
     let on_name = format_ident!("{}_on", name);
     let mut on_generics = generics.clone();
-    on_generics.params.push(parse_quote!(__S: #bbound<#scalar>));
+    on_generics.params.push(syn::GenericParam::Type(parse_quote!(__S: #run_bound)));
     let (on_impl_generics, _, on_where) = on_generics.split_for_impl();
 
     // Default (`!tiny`): run the body inside `_on` — whose data parameters are real function
@@ -471,8 +524,116 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         )
     };
 
-    let dispatch_call =
-        quote!(#dispatch_fn(#name::__Kernel #turbofish { #( #field_idents, )* #phantom_init }));
+    // Type-combo for combo dispatch: the scanned (or MIR-measured) element set plus the dispatch
+    // element's own bits, as a compile-time constant in the wrapper. Matrix kernels keep the
+    // element-keyed `dispatch_matrix` path.
+    let attr_bits: u8 = opts
+        .types
+        .iter()
+        .filter_map(|i| element_bits(&i.to_string()))
+        .fold(0, |a, b| a | b);
+    let combo_bits = metrics.and_then(|m| m.type_bits()).unwrap_or(scanned_bits_early) | attr_bits;
+    // Whether the scalar is a generic parameter (then the tier arms cannot be pruned by the
+    // half/int bits — the element is only known at monomorphization).
+    let scalar_str = quote!(#scalar).to_string();
+    let scalar_is_generic = generics.params.iter().any(|p| match p {
+        GenericParam::Type(t) => t.ident == scalar_str,
+        _ => false,
+    });
+    let may_half_f16 = combo_bits & 4 != 0;
+    let may_half_bf16 = combo_bits & 8 != 0;
+    let pure_float = combo_bits & 60 == 0;
+    let no_ints = combo_bits & 48 == 0;
+
+    let fp16_arm = may_half_f16.then(|| quote! {
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+        // SAFETY (all arms): `combo_tier` returns a tier code only after the matching feature
+        // detection (or compile-time guarantee) confirmed the host supports it.
+        ::hydroplane::towers::AVX512FP16 => ::hydroplane::dispatch::run_kernel_on(
+            __kernel,
+            unsafe { ::hydroplane::towers::Avx512Fp16::new_unchecked() },
+        ),
+    });
+    let bf16_arm = may_half_bf16.then(|| quote! {
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+        ::hydroplane::towers::AVX512BF16 => ::hydroplane::dispatch::run_kernel_on(
+            __kernel,
+            unsafe { ::hydroplane::towers::Avx512Bf16::new_unchecked() },
+        ),
+    });
+    let avx1_arm = pure_float.then(|| quote! {
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+        ::hydroplane::towers::AVX1 => ::hydroplane::dispatch::run_kernel_on(
+            __kernel,
+            unsafe { ::hydroplane::towers::Avx1::new_unchecked() },
+        ),
+    });
+    let sve_arms = no_ints.then(|| quote! {
+        #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+        ::hydroplane::towers::SVE16 => ::hydroplane::dispatch::run_kernel_on(
+            __kernel,
+            unsafe { ::hydroplane::towers::Sve::<16>::new_unchecked() },
+        ),
+        #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+        ::hydroplane::towers::SVE32 => ::hydroplane::dispatch::run_kernel_on(
+            __kernel,
+            unsafe { ::hydroplane::towers::Sve::<32>::new_unchecked() },
+        ),
+        #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+        ::hydroplane::towers::SVE64 => ::hydroplane::dispatch::run_kernel_on(
+            __kernel,
+            unsafe { ::hydroplane::towers::Sve::<64>::new_unchecked() },
+        ),
+    });
+
+    // Combo dispatch needs `Token: Backend<T>` provable in the wrapper body, which only holds
+    // for the concrete elements — generic-scalar kernels keep the element-keyed `dispatch` path
+    // (they monomorphize per element anyway, so there is no combo-pruning to win there).
+    let dispatch_call = if matrix_present || scalar_is_generic {
+        quote!(#dispatch_fn(#name::__Kernel #turbofish { #( #field_idents, )* #phantom_init }))
+    } else {
+        quote! {{
+            let __combo: u8 = #combo_bits | <#scalar as ::hydroplane::Scalar>::TYPE_BITS;
+            let __kernel = #name::__Kernel #turbofish { #( #field_idents, )* #phantom_init };
+            match ::hydroplane::dispatch::combo_tier(__combo) {
+                #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+                ::hydroplane::towers::SSE4 => ::hydroplane::dispatch::run_kernel_on(
+                    __kernel,
+                    unsafe { ::hydroplane::towers::Sse4::new_unchecked() },
+                ),
+                #avx1_arm
+                #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+                ::hydroplane::towers::AVX2 => ::hydroplane::dispatch::run_kernel_on(
+                    __kernel,
+                    unsafe { ::hydroplane::towers::Avx2::new_unchecked() },
+                ),
+                #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+                ::hydroplane::towers::AVX512 => ::hydroplane::dispatch::run_kernel_on(
+                    __kernel,
+                    unsafe { ::hydroplane::towers::Avx512::new_unchecked() },
+                ),
+                #fp16_arm
+                #bf16_arm
+                #[cfg(target_arch = "aarch64")]
+                ::hydroplane::towers::NEON => ::hydroplane::dispatch::run_kernel_on(
+                    __kernel,
+                    ::hydroplane::towers::Neon::new(),
+                ),
+                #sve_arms
+                #[cfg(all(target_arch = "wasm32", target_feature = "simd128", target_feature = "relaxed-simd"))]
+                ::hydroplane::towers::RELAXED => ::hydroplane::dispatch::run_kernel_on(
+                    __kernel,
+                    ::hydroplane::towers::RelaxedSimd::new(),
+                ),
+                #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+                ::hydroplane::towers::SIMD128 => ::hydroplane::dispatch::run_kernel_on(
+                    __kernel,
+                    ::hydroplane::towers::Simd128::new(),
+                ),
+                _ => ::hydroplane::dispatch::run_kernel_on(__kernel, ::hydroplane::ScalarBackend),
+            }
+        }}
+    };
 
     Ok(quote! {
         #[doc(hidden)]
@@ -489,7 +650,7 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
                 type Output = #ret;
                 #k_cap_item
                 #[inline]
-                fn run<__S: #bbound<#scalar>>(self, #primary_ctx: #primary_ty) -> #ret {
+                fn run<__S: #run_bound>(self, #primary_ctx: #primary_ty) -> #ret {
                     #run_body
                 }
             }
@@ -516,6 +677,37 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
             #on_body
         }
     })
+}
+
+/// The element bits (`Scalar::TYPE_BITS` values) whose names appear anywhere in the kernel's
+/// tokens — a safe over-approximation of the elements the body touches, used to prune the
+/// combo-dispatch match to tiers that are distinct on them. Build-time MIR analysis
+/// (`hydroplane-auto`) replaces this with the measured set when available; the generated combo
+/// also ORs the dispatch element's own `TYPE_BITS`, so under-approximation is impossible for the
+/// declared element and a generic scalar folds its bits in at monomorphization.
+fn scan_type_bits(tokens: &TokenStream2) -> u8 {
+    fn walk(ts: TokenStream2, bits: &mut u8) {
+        for tt in ts {
+            match tt {
+                proc_macro2::TokenTree::Ident(id) => {
+                    *bits |= match id.to_string().as_str() {
+                        "f32" => 1,
+                        "f64" => 2,
+                        "f16" => 4,
+                        "bf16" => 8,
+                        "u32" => 16,
+                        "i32" => 32,
+                        _ => 0,
+                    };
+                }
+                proc_macro2::TokenTree::Group(g) => walk(g.stream(), bits),
+                _ => {}
+            }
+        }
+    }
+    let mut bits = 0;
+    walk(tokens.clone(), &mut bits);
+    bits
 }
 
 /// The value of a `#[hint_cnt(N)]` attribute on a kernel parameter, if present. Currently discarded
@@ -545,10 +737,18 @@ fn ctx_type_with_backend(ty: Type) -> syn::Result<Type> {
     let Some(seg) = tp.path.segments.last_mut() else {
         return Err(bad(&tp));
     };
-    let syn::PathArguments::AngleBracketed(args) = &mut seg.arguments else {
-        return Err(bad(&tp));
-    };
-    args.args.push(parse_quote!(__S));
+    // Bare `ctx: Gang` is the canonical form — the gang is element-free, so there is nothing to
+    // write; a legacy bracketed element (`Gang<f32>`) is accepted and names the dispatch element.
+    match &mut seg.arguments {
+        syn::PathArguments::None => {
+            seg.arguments = syn::PathArguments::AngleBracketed(parse_quote!(<__S>));
+        }
+        syn::PathArguments::AngleBracketed(args) => {
+            args.args.clear();
+            args.args.push(parse_quote!(__S));
+        }
+        _ => return Err(bad(&tp)),
+    }
     Ok(Type::Path(tp))
 }
 
@@ -572,9 +772,9 @@ fn ctx_scalar_arg(ty: &Type) -> Option<Type> {
 fn detect_scalar(generics: &Generics) -> syn::Result<Option<Ident>> {
     let has_scalar_bound = |bounds: &Punctuated<TypeParamBound, Token![+]>| -> bool {
         bounds.iter().any(|b| match b {
-            TypeParamBound::Trait(tb) => {
-                tb.path.segments.last().is_some_and(|s| s.ident == "Scalar")
-            }
+            TypeParamBound::Trait(tb) => tb.path.segments.last().is_some_and(|s| {
+                s.ident == "Scalar" || s.ident == "FloatScalar" || s.ident == "IntScalar"
+            }),
             _ => false,
         })
     };

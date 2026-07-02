@@ -9,7 +9,7 @@ use hydroplane::{Gang, Layout, kernel};
 /// load the two operands, multiply-accumulate into a zeroed accumulator, store the result.
 #[kernel(matrix)]
 pub fn gemm<'a, const M: usize, const N: usize, const K: usize>(
-    ctx: Gang<f32>,
+    ctx: Gang,
     a: &'a [f32],
     b: &'a [f32],
     out: &'a mut [f32],
@@ -25,7 +25,7 @@ pub fn gemm<'a, const M: usize, const N: usize, const K: usize>(
 /// free (`load_acc_rm` instead of `zero_acc`).
 #[kernel(matrix)]
 pub fn linear<'a, const M: usize, const N: usize, const K: usize>(
-    ctx: Gang<f32>,
+    ctx: Gang,
     x: &'a [f32],
     w: &'a [f32],
     bias: &'a [f32],
@@ -43,7 +43,7 @@ pub fn linear<'a, const M: usize, const N: usize, const K: usize>(
 /// slice (`row_stride = k_total`); each `B` sub-tile is a contiguous row block.
 #[kernel(matrix)]
 pub fn gemm_ktiled<'a, const M: usize, const N: usize, const KT: usize>(
-    ctx: Gang<f32>,
+    ctx: Gang,
     a: &'a [f32],
     b: &'a [f32],
     k_total: usize,
@@ -66,7 +66,7 @@ pub fn gemm_ktiled<'a, const M: usize, const N: usize, const KT: usize>(
 /// matrix context does vector ops too, which is why a separate `vector` handle is unnecessary.
 #[kernel(matrix)]
 pub fn gemm_sum<'a, const M: usize, const N: usize, const K: usize>(
-    ctx: Gang<f32>,
+    ctx: Gang,
     a: &'a [f32],
     b: &'a [f32],
     out: &'a mut [f32],

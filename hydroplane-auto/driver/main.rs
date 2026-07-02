@@ -146,6 +146,12 @@ fn collect() -> Vec<String> {
         k.m.compute = compute_intensity(&k.on_full, &stmts_of, &calls_of, &kernel_ons);
     }
 
+    let types_of: HashMap<String, u64> =
+        items.iter().map(|it| (it.name(), body_type_bits(it))).collect();
+    for k in &mut kernels {
+        k.m.types = folded_type_bits(&k.on_full, &types_of, &calls_of);
+    }
+
     // Cross-kernel cost composition: when kernel A calls B via `B_on`, B's reduction runs under A's
     // chosen unroll factor, so A's cap must satisfy B too. Fold the transitive callees' register and
     // compute pressure into each kernel by `max` (the tightest sub-kernel wins). Since every kernel
@@ -164,8 +170,8 @@ fn collect() -> Vec<String> {
         .map(|(i, k)| {
             let (vl, compute) = composed_pressure(i, &own, &callee_ids, &mut vec![false; own.len()]);
             format!(
-                "{} stack_bytes={} varying_locals={} mem_ops={} switches={} calls={} stmts={} compute={}",
-                k.name, k.m.stack_bytes, vl, k.m.mem_ops, k.m.switches, k.m.calls, k.m.stmts, compute
+                "{} stack_bytes={} varying_locals={} mem_ops={} switches={} calls={} stmts={} compute={} types={}",
+                k.name, k.m.stack_bytes, vl, k.m.mem_ops, k.m.switches, k.m.calls, k.m.stmts, compute, k.m.types
             )
         })
         .collect()
@@ -271,6 +277,106 @@ struct Metrics {
     calls: u64,
     stmts: u64,
     compute: u64,
+    types: u64,
+}
+
+/// Element-type bits (`Scalar::TYPE_BITS` values) appearing in hydroplane value positions of a
+/// stringified MIR type: `Varying<f32, …>`, `Backend<u32>`, the `VaryingU32<T, S>` companions
+/// (which imply 32-bit integer lanes regardless of the gang element), … This sees through
+/// generics, inference, and helper indirection that the macro's token scan cannot.
+fn type_bits_in(s: &str) -> u64 {
+    // StableMIR debug renders elements structurally: `RigidTy(Float(F32))`, `Uint(U32)`,
+    // `Int(I32)`, and the half types as `AdtDef(… name: "half::f16" …)`. Find each hydroplane
+    // value-type context and take the first concrete element rendered in its generic args
+    // (a `Param` — a still-generic scalar — matches nothing, correctly).
+    const ELEMS: [(&str, u64); 8] = [
+        ("Float(F32)", 1),
+        ("Float(F64)", 2),
+        ("Uint(U32)", 16),
+        ("Int(I32)", 32),
+        ("\"half::bf16\"", 8),
+        ("\"half::f16\"", 4),
+        ("\"bf16\"", 8),
+        ("\"f16\"", 4),
+    ];
+    fn first_elem_bits(tail: &str) -> u64 {
+        let window = &tail[..tail.len().min(240)];
+        let mut best: Option<(usize, u64)> = None;
+        for (pat, bits) in ELEMS {
+            if let Some(i) = window.find(pat) {
+                if best.map(|(bi, _)| i < bi).unwrap_or(true) {
+                    best = Some((i, bits));
+                }
+            }
+        }
+        best.map(|(_, b)| b).unwrap_or(0)
+    }
+    let mut bits = 0;
+    for (ctx, extra) in [
+        ("hydroplane::Varying\"", 0u64),
+        ("hydroplane::varying::Varying\"", 0),
+        ("hydroplane::Mask\"", 0),
+        ("hydroplane::varying::Mask\"", 0),
+        ("hydroplane::VaryingU32\"", 16),
+        ("hydroplane::VaryingI32\"", 32),
+        ("hydroplane::Gang::<S>::", 0),
+        ("hydroplane::varying::Gang::<S>::", 0),
+    ] {
+        let mut rest = s;
+        while let Some(i) = rest.find(ctx) {
+            rest = &rest[i + ctx.len()..];
+            bits |= first_elem_bits(rest) | extra;
+        }
+    }
+    bits
+}
+
+/// Union of the element bits over a body's locals and call targets.
+fn body_type_bits(item: &CrateItem) -> u64 {
+    let Some(body) = item.body() else { return 0 };
+    let mut bits = 0;
+    for local in body.locals().iter() {
+        bits |= type_bits_in(&format!("{:?}", local.ty));
+    }
+    for bb in body.blocks.iter() {
+        if let TerminatorKind::Call { func, .. } = &bb.terminator.kind {
+            if let Ok(ty) = func.ty(body.locals()) {
+                bits |= type_bits_in(&format!("{ty:?}"));
+            }
+        }
+    }
+    bits
+}
+
+/// Element bits reachable from a kernel's `_on` body — the body, its closures, and everything
+/// they transitively call, *including* other kernels' `_on` bodies (an over-approximation only
+/// widens the combo, which costs pruning, never correctness).
+fn folded_type_bits(
+    on_full: &str,
+    types_of: &std::collections::HashMap<String, u64>,
+    calls_of: &std::collections::HashMap<String, Vec<String>>,
+) -> u64 {
+    let mut visited = std::collections::HashSet::new();
+    let mut stack: Vec<String> = vec![on_full.to_string()];
+    let closure_prefix = format!("{on_full}::");
+    for name in types_of.keys() {
+        if name.contains("{closure") && name.starts_with(&closure_prefix) {
+            stack.push(name.clone());
+        }
+    }
+    let mut bits = 0;
+    while let Some(n) = stack.pop() {
+        if !visited.insert(n.clone()) {
+            continue;
+        }
+        bits |= types_of.get(&n).copied().unwrap_or(0);
+        for c in calls_of.get(&n).into_iter().flatten() {
+            if types_of.contains_key(c) {
+                stack.push(c.clone());
+            }
+        }
+    }
+    bits
 }
 
 fn measure(item: &CrateItem) -> Metrics {

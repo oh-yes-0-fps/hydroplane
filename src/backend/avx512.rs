@@ -478,6 +478,7 @@ macro_rules! avx512_int_backend {
                 unsafe { zi_neg(a) }
             }
             #[inline(always)]
+            #[allow(unused_unsafe)] // identity for the u32 arm, intrinsic for i32
             fn abs(self, a: __m512i) -> __m512i {
                 unsafe { ($abs)(a) }
             }

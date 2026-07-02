@@ -20,14 +20,14 @@ use hydroplane::{Gang, kernel};
 /// stages sentinels — `-inf` (lhs) / `+inf` (rhs), so `-inf > +inf` is false and padding never
 /// trips the reduction.
 #[kernel(tiny)]
-fn any_gt<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> bool {
-    let n = ctx.lanes();
-    for off in ctx.chunks_exact(a.len()) {
+fn any_gt<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> bool {
+    let n = ctx.lanes::<f32>();
+    for off in ctx.chunks_exact::<f32>(a.len()) {
         if ctx.load(&a[off..off + n]).gt(ctx.load(&b[off..off + n])).any() {
             return true;
         }
     }
-    if let Some((off, cnt)) = ctx.remainder(a.len()) {
+    if let Some((off, cnt)) = ctx.remainder::<f32>(a.len()) {
         let x = ctx.load_partial(&a[off..off + cnt], f32::NEG_INFINITY);
         let y = ctx.load_partial(&b[off..off + cnt], f32::INFINITY);
         return x.gt(y).any();
@@ -37,14 +37,14 @@ fn any_gt<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> bool {
 
 /// Any `a[i] < b[i]`? Remainder sentinels are swapped: `+inf < -inf` is false.
 #[kernel(tiny)]
-fn any_lt<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> bool {
-    let n = ctx.lanes();
-    for off in ctx.chunks_exact(a.len()) {
+fn any_lt<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> bool {
+    let n = ctx.lanes::<f32>();
+    for off in ctx.chunks_exact::<f32>(a.len()) {
         if ctx.load(&a[off..off + n]).lt(ctx.load(&b[off..off + n])).any() {
             return true;
         }
     }
-    if let Some((off, cnt)) = ctx.remainder(a.len()) {
+    if let Some((off, cnt)) = ctx.remainder::<f32>(a.len()) {
         let x = ctx.load_partial(&a[off..off + cnt], f32::INFINITY);
         let y = ctx.load_partial(&b[off..off + cnt], f32::NEG_INFINITY);
         return x.lt(y).any();
@@ -55,7 +55,7 @@ fn any_lt<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> bool {
 /// Below `lo` anywhere, or above `hi` anywhere? One dispatch (at this kernel's entry); the two
 /// sub-kernels run on the same already-chosen backend via their `_on` companions.
 #[kernel(tiny)]
-fn out_of_limits<'a>(ctx: Gang<f32>, q: &'a [f32], lo: &'a [f32], hi: &'a [f32]) -> bool {
+fn out_of_limits<'a>(ctx: Gang, q: &'a [f32], lo: &'a [f32], hi: &'a [f32]) -> bool {
     any_lt_on(ctx, q, lo) || any_gt_on(ctx, q, hi)
 }
 
@@ -63,7 +63,7 @@ fn out_of_limits<'a>(ctx: Gang<f32>, q: &'a [f32], lo: &'a [f32], hi: &'a [f32])
 /// supplies the `0` identity, the masked tail, the chain combine, and the per-core unroll factor, so
 /// nothing here mentions accumulators-per-pipe yet the loop runs them all.
 #[kernel(tiny)]
-fn dist_sq<'a>(ctx: Gang<f32>, q: &'a [f32], p: &'a [f32]) -> f32 {
+fn dist_sq<'a>(ctx: Gang, q: &'a [f32], p: &'a [f32]) -> f32 {
     ctx.zip_sum(q, p, |acc, a, b| {
         let d = a - b;
         d.fma(d, acc)

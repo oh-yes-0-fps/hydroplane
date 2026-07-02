@@ -237,7 +237,7 @@ pub trait GangGlamExt<S: Backend<f32>> {
     fn load_partial_mat3(self, cols: [&[f32]; 9], fill: f32) -> Mat3Wide<S>;
 }
 
-impl<S: Backend<f32>> GangGlamExt<S> for Gang<f32, S> {
+impl<S: Backend<f32>> GangGlamExt<S> for Gang<S> {
     #[inline(always)]
     fn splat_vec3(self, v: Vec3) -> Vec3Wide<S> {
         Vec3Wide(self.splat_n([v.x, v.y, v.z]))

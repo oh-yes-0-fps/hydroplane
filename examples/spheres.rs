@@ -26,8 +26,8 @@ pub fn spheres_soa<T: Scalar>(rows: &[[T; 4]]) -> Soa<T> {
 /// The kernel — reads like scalar Rust, runs as SIMD. `q = [cx, cy, cz, radius]`. `#[kernel]`
 /// generates the dispatching `any_overlap(soa, q)` callable; no struct, impl, or `dispatch` by hand.
 #[kernel]
-pub fn any_overlap<'a, T: Scalar>(ctx: Gang<T>, soa: &'a Soa<T>, q: [T; 4]) -> bool {
-    let lanes = ctx.lanes();
+pub fn any_overlap<'a, T: Scalar>(ctx: Gang, soa: &'a Soa<T>, q: [T; 4]) -> bool {
+    let lanes = ctx.lanes::<T>();
 
     let cx = ctx.splat(q[X]);
     let cy = ctx.splat(q[Y]);

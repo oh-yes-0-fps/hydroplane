@@ -19,7 +19,7 @@ const LENS: [usize; 7] = [0, 1, 7, 8, 9, 31, 100];
 
 #[kernel]
 fn dist_sq_k<'a>(
-    ctx: Gang<f32>,
+    ctx: Gang,
     xs: &'a [f32],
     ys: &'a [f32],
     zs: &'a [f32],
@@ -27,7 +27,7 @@ fn dist_sq_k<'a>(
     out: &'a mut [f32],
 ) {
     let qv = ctx.splat_vec3(Vec3::from_array(q));
-    ctx.for_each_chunk(out.len(), |off, cnt| {
+    ctx.for_each_chunk::<f32>(out.len(), |off, cnt| {
         let r = off..off + cnt;
         let p = ctx.load_partial_vec3([&xs[r.clone()], &ys[r.clone()], &zs[r.clone()]], 0.0);
         (qv - p).length_squared().store_partial(&mut out[off..off + cnt]);
@@ -50,7 +50,7 @@ fn vec3wide_dist_sq_matches_glam() {
 
 #[kernel]
 fn transform_k<'a>(
-    ctx: Gang<f32>,
+    ctx: Gang,
     xs: &'a [f32],
     ys: &'a [f32],
     zs: &'a [f32],
@@ -62,7 +62,7 @@ fn transform_k<'a>(
 ) {
     let mw = ctx.splat_mat3(Mat3::from_cols_array(&m));
     let tw = ctx.splat_vec3(Vec3::from_array(t));
-    ctx.for_each_chunk(ox.len(), |off, cnt| {
+    ctx.for_each_chunk::<f32>(ox.len(), |off, cnt| {
         let r = off..off + cnt;
         let v = ctx.load_partial_vec3([&xs[r.clone()], &ys[r.clone()], &zs[r.clone()]], 0.0);
         mw.mul_add(v, tw)
@@ -91,11 +91,11 @@ fn mat3wide_transform_matches_glam() {
 }
 
 #[kernel]
-fn max_proj_k<'a>(ctx: Gang<f32>, verts: &'a [Vec3], normal: [f32; 3]) -> f32 {
+fn max_proj_k<'a>(ctx: Gang, verts: &'a [Vec3], normal: [f32; 3]) -> f32 {
     let n = ctx.splat_vec3(Vec3::from_array(normal));
     let neg_inf = ctx.splat(f32::NEG_INFINITY);
     let mut acc = neg_inf;
-    for (off, cnt, active) in ctx.masked_chunks(verts.len()) {
+    for (off, cnt, active) in ctx.masked_chunks::<f32>(verts.len()) {
         let v = ctx.gather_vec3(&verts[off..off + cnt], 0.0);
         acc = acc.max(v.dot(n).select(active, neg_inf));
     }
@@ -119,10 +119,10 @@ fn gather_vec3_max_projection_matches_glam() {
 }
 
 #[kernel]
-fn separated_k<'a>(ctx: Gang<f32>, planes: &'a [(Vec3, f32)], p: [f32; 3]) -> bool {
+fn separated_k<'a>(ctx: Gang, planes: &'a [(Vec3, f32)], p: [f32; 3]) -> bool {
     let pw = ctx.splat_vec3(Vec3::from_array(p));
     let zero = ctx.splat(0.0);
-    for (off, cnt, active) in ctx.masked_chunks(planes.len()) {
+    for (off, cnt, active) in ctx.masked_chunks::<f32>(planes.len()) {
         let (n, d) = ctx.gather_plane(&planes[off..off + cnt], 0.0);
         if ((pw.dot(n) - d).gt(zero) & active).any() {
             return true;
@@ -148,7 +148,7 @@ fn gather_plane_separation_matches_glam() {
 
 #[kernel]
 fn add_scaled_len_k<'a>(
-    ctx: Gang<f32>,
+    ctx: Gang,
     xs: &'a [f32],
     ys: &'a [f32],
     zs: &'a [f32],
@@ -159,7 +159,7 @@ fn add_scaled_len_k<'a>(
     out: &'a mut [f32],
 ) {
     let tv = ctx.splat(t);
-    ctx.for_each_chunk(out.len(), |off, cnt| {
+    ctx.for_each_chunk::<f32>(out.len(), |off, cnt| {
         let r = off..off + cnt;
         let p = ctx.load_partial_vec3([&xs[r.clone()], &ys[r.clone()], &zs[r.clone()]], 0.0);
         let d = ctx.load_partial_vec3([&dxs[r.clone()], &dys[r.clone()], &dzs[r.clone()]], 0.0);
@@ -186,7 +186,7 @@ fn vec3wide_add_scaled_length_matches_glam() {
 
 #[kernel]
 fn select_scale_k<'a>(
-    ctx: Gang<f32>,
+    ctx: Gang,
     xs: &'a [f32],
     ys: &'a [f32],
     zs: &'a [f32],
@@ -194,7 +194,7 @@ fn select_scale_k<'a>(
     out: &'a mut [f32],
 ) {
     let tv = ctx.splat(thresh);
-    ctx.for_each_chunk(out.len(), |off, cnt| {
+    ctx.for_each_chunk::<f32>(out.len(), |off, cnt| {
         let r = off..off + cnt;
         let v = ctx.load_partial_vec3([&xs[r.clone()], &ys[r.clone()], &zs[r.clone()]], 0.0);
         let mask = v.0[0].gt(tv);
@@ -220,10 +220,10 @@ fn vec3wide_select_and_scalar_mul_matches_glam() {
 }
 
 #[kernel]
-fn inverse_k<'a>(ctx: Gang<f32>, m: [&'a [f32]; 9], out: [&'a mut [f32]; 9]) {
+fn inverse_k<'a>(ctx: Gang, m: [&'a [f32]; 9], out: [&'a mut [f32]; 9]) {
     let n = m[0].len();
     let mut out = out;
-    ctx.for_each_chunk(n, |off, cnt| {
+    ctx.for_each_chunk::<f32>(n, |off, cnt| {
         let cols: [&[f32]; 9] = std::array::from_fn(|c| &m[c][off..off + cnt]);
         ctx.load_partial_mat3(cols, 1.0)
             .inverse()

@@ -12,7 +12,7 @@ pub fn inputs(n: usize) -> (Vec<f32>, Vec<f32>) {
 }
 
 #[kernel]
-pub fn dot_hp<'a>(ctx: Gang<f32>, x: &'a [f32], y: &'a [f32]) -> f32 {
+pub fn dot_hp<'a>(ctx: Gang, x: &'a [f32], y: &'a [f32]) -> f32 {
     ctx.dot(x, y)
 }
 

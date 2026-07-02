@@ -842,6 +842,634 @@ impl<T: Scalar, B: Backend<T>, const K: usize> Backend<T> for Unroll<B, K> {
     }
 }
 
+/// Every element the crate supports, on one token — the bound [`Kernel::run`](crate::Kernel)
+/// carries so a kernel body can mix element families freely through one [`Gang`](crate::Gang)
+/// (`f32` compute beside `u32` connectivity, `f64` accumulation over `i32` codes, …). Blanket:
+/// any token implementing all six element backends is `BackendAll` automatically. Elements a
+/// token's ISA has no native lanes for ride the emulated array impls below — correct, reachable
+/// only when a kernel *mixes* that element in, and never chosen by the element's own dispatch
+/// ladder.
+pub trait BackendAll:
+    Backend<f32> + Backend<f64> + Backend<half::f16> + Backend<half::bf16> + Backend<u32> + Backend<i32>
+{
+}
+
+impl<S> BackendAll for S where
+    S: Backend<f32>
+        + Backend<f64>
+        + Backend<half::f16>
+        + Backend<half::bf16>
+        + Backend<u32>
+        + Backend<i32>
+{
+}
+
+/// Method bodies shared by the emulated element impls: fixed max-width array registers,
+/// per-lane scalar ops bounded by `lanes()`.
+#[allow(unused_macros)] // per-target: each ISA file instantiates only what it lacks
+macro_rules! emulated_common_methods {
+    ($t:ty, $lanes:expr) => {
+        type Vector = [$t; crate::MAX_LANES];
+        type Mask = [bool; crate::MAX_LANES];
+
+        #[inline]
+        fn lanes(self) -> usize {
+            $lanes
+        }
+        #[inline]
+        fn splat(self, v: $t) -> [$t; crate::MAX_LANES] {
+            [v; crate::MAX_LANES]
+        }
+        #[inline]
+        fn load(self, s: &[$t]) -> [$t; crate::MAX_LANES] {
+            let mut v = [<$t as crate::scalar::Scalar>::ZERO; crate::MAX_LANES];
+            v[..s.len()].copy_from_slice(s);
+            v
+        }
+        #[inline]
+        fn store(self, v: [$t; crate::MAX_LANES], s: &mut [$t]) {
+            let n = s.len();
+            s.copy_from_slice(&v[..n]);
+        }
+        #[inline]
+        fn add(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+            let mut o = a;
+            for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                o[i] = crate::scalar::Scalar::wadd(a[i], b[i]);
+            }
+            o
+        }
+        #[inline]
+        fn sub(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+            let mut o = a;
+            for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                o[i] = crate::scalar::Scalar::wsub(a[i], b[i]);
+            }
+            o
+        }
+        #[inline]
+        fn mul(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+            let mut o = a;
+            for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                o[i] = crate::scalar::Scalar::wmul(a[i], b[i]);
+            }
+            o
+        }
+        #[inline]
+        fn neg(self, a: Self::Vector) -> Self::Vector {
+            let mut o = a;
+            for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                o[i] = crate::scalar::Scalar::neg(a[i]);
+            }
+            o
+        }
+        #[inline]
+        fn abs(self, a: Self::Vector) -> Self::Vector {
+            let mut o = a;
+            for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                o[i] = crate::scalar::Scalar::abs(a[i]);
+            }
+            o
+        }
+        #[inline]
+        fn min(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+            let mut o = a;
+            for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                o[i] = crate::scalar::Scalar::min(a[i], b[i]);
+            }
+            o
+        }
+        #[inline]
+        fn max(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+            let mut o = a;
+            for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                o[i] = crate::scalar::Scalar::max(a[i], b[i]);
+            }
+            o
+        }
+        #[inline]
+        fn le(self, a: Self::Vector, b: Self::Vector) -> Self::Mask {
+            let mut m = [false; crate::MAX_LANES];
+            for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                m[i] = a[i] <= b[i];
+            }
+            m
+        }
+        #[inline]
+        fn lt(self, a: Self::Vector, b: Self::Vector) -> Self::Mask {
+            let mut m = [false; crate::MAX_LANES];
+            for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                m[i] = a[i] < b[i];
+            }
+            m
+        }
+        #[inline]
+        fn ge(self, a: Self::Vector, b: Self::Vector) -> Self::Mask {
+            let mut m = [false; crate::MAX_LANES];
+            for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                m[i] = a[i] >= b[i];
+            }
+            m
+        }
+        #[inline]
+        fn gt(self, a: Self::Vector, b: Self::Vector) -> Self::Mask {
+            let mut m = [false; crate::MAX_LANES];
+            for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                m[i] = a[i] > b[i];
+            }
+            m
+        }
+        #[inline]
+        fn mask_and(self, a: Self::Mask, b: Self::Mask) -> Self::Mask {
+            let mut m = a;
+            for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                m[i] = a[i] && b[i];
+            }
+            m
+        }
+        #[inline]
+        fn mask_or(self, a: Self::Mask, b: Self::Mask) -> Self::Mask {
+            let mut m = a;
+            for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                m[i] = a[i] || b[i];
+            }
+            m
+        }
+        #[inline]
+        fn mask_not(self, a: Self::Mask) -> Self::Mask {
+            let mut m = a;
+            for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                m[i] = !a[i];
+            }
+            m
+        }
+        #[inline]
+        fn select(self, m: Self::Mask, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+            let mut o = a;
+            for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                o[i] = if m[i] { a[i] } else { b[i] };
+            }
+            o
+        }
+        #[inline]
+        fn any(self, m: Self::Mask) -> bool {
+            m[..<Self as crate::backend::Backend<$t>>::lanes(self)].iter().any(|&x| x)
+        }
+        #[inline]
+        fn all(self, m: Self::Mask) -> bool {
+            m[..<Self as crate::backend::Backend<$t>>::lanes(self)].iter().all(|&x| x)
+        }
+        #[inline]
+        fn mask_bitmask(self, m: Self::Mask) -> u32 {
+            let mut bits = 0u32;
+            for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                if m[i] {
+                    bits |= 1 << i;
+                }
+            }
+            bits
+        }
+        #[inline]
+        fn reduce_sum(self, v: Self::Vector) -> $t {
+            v[..<Self as crate::backend::Backend<$t>>::lanes(self)]
+                .iter()
+                .fold(<$t as crate::scalar::Scalar>::ZERO, |acc, &x| crate::scalar::Scalar::wadd(acc, x))
+        }
+        #[inline]
+        fn reduce_min(self, v: Self::Vector) -> $t {
+            v[..<Self as crate::backend::Backend<$t>>::lanes(self)].iter().copied().fold(v[0], crate::scalar::Scalar::min)
+        }
+        #[inline]
+        fn reduce_max(self, v: Self::Vector) -> $t {
+            v[..<Self as crate::backend::Backend<$t>>::lanes(self)].iter().copied().fold(v[0], crate::scalar::Scalar::max)
+        }
+
+        type IVector = [u32; crate::MAX_LANES];
+        #[inline]
+        fn iload(self, s: &[u32]) -> [u32; crate::MAX_LANES] {
+            let mut v = [0u32; crate::MAX_LANES];
+            v[..s.len()].copy_from_slice(s);
+            v
+        }
+        #[inline]
+        fn istore(self, v: [u32; crate::MAX_LANES], out: &mut [u32]) {
+            let n = out.len();
+            out.copy_from_slice(&v[..n]);
+        }
+    };
+}
+
+/// Correctness-only float element on a token without native lanes for it.
+#[allow(unused_macros)] // per-target: each ISA file instantiates only what it lacks
+macro_rules! emulated_float_element {
+    ([$($gen:tt)*] $token:ty, $t:ty, $lanes:expr) => {
+        impl<$($gen)*> crate::backend::Backend<$t> for $token {
+            emulated_common_methods!($t, $lanes);
+
+            #[inline]
+            fn div(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                let mut o = a;
+                for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                    o[i] = a[i] / b[i];
+                }
+                o
+            }
+            #[inline]
+            fn fma(self, a: Self::Vector, b: Self::Vector, c: Self::Vector) -> Self::Vector {
+                let mut o = a;
+                for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                    o[i] = crate::scalar::FloatScalar::fma(a[i], b[i], c[i]);
+                }
+                o
+            }
+            #[inline]
+            fn sqrt(self, a: Self::Vector) -> Self::Vector {
+                let mut o = a;
+                for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                    o[i] = crate::scalar::FloatScalar::sqrt(a[i]);
+                }
+                o
+            }
+        }
+    };
+    ($token:ty, $t:ty, $lanes:expr) => {
+        emulated_float_element!([] $token, $t, $lanes);
+    };
+}
+
+/// Correctness-only integer element on a token without native lanes for it.
+#[allow(unused_macros)] // per-target: each ISA file instantiates only what it lacks
+macro_rules! emulated_int_element {
+    ([$($gen:tt)*] $token:ty, $t:ty, $lanes:expr) => {
+        impl<$($gen)*> crate::backend::Backend<$t> for $token {
+            emulated_common_methods!($t, $lanes);
+
+            #[inline]
+            fn shl(self, a: Self::Vector, k: u32) -> Self::Vector {
+                let mut o = a;
+                for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                    o[i] = num_traits::PrimInt::unsigned_shl(a[i], k);
+                }
+                o
+            }
+            #[inline]
+            fn shr(self, a: Self::Vector, k: u32) -> Self::Vector {
+                let mut o = a;
+                for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                    o[i] = a[i] >> (k as usize);
+                }
+                o
+            }
+            #[inline]
+            fn bit_and(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                let mut o = a;
+                for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                    o[i] = a[i] & b[i];
+                }
+                o
+            }
+            #[inline]
+            fn bit_or(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                let mut o = a;
+                for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                    o[i] = a[i] | b[i];
+                }
+                o
+            }
+            #[inline]
+            fn bit_xor(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                let mut o = a;
+                for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                    o[i] = a[i] ^ b[i];
+                }
+                o
+            }
+            #[inline]
+            fn bit_not(self, a: Self::Vector) -> Self::Vector {
+                let mut o = a;
+                for i in 0..<Self as crate::backend::Backend<$t>>::lanes(self) {
+                    o[i] = !a[i];
+                }
+                o
+            }
+        }
+    };
+    ($token:ty, $t:ty, $lanes:expr) => {
+        emulated_int_element!([] $token, $t, $lanes);
+    };
+}
+
+#[allow(unused_imports)] // per-target: each ISA file imports only what it lacks
+pub(crate) use {emulated_common_methods, emulated_float_element, emulated_int_element};
+
+/// Delegate an element's whole backend to another token's impl (for capability-superset tokens:
+/// `Avx512Fp16`/`Avx512Bf16` imply `avx512f`, so their non-native elements ride `Avx512`).
+#[allow(unused_macros)] // per-target: each ISA file instantiates only what it lacks
+macro_rules! delegate_float_element {
+    ($token:ty, $t:ty, $inner_ty:ty, $inner:expr) => {
+        impl crate::backend::Backend<$t> for $token {
+            type Vector = <$inner_ty as crate::backend::Backend<$t>>::Vector;
+            type Mask = <$inner_ty as crate::backend::Backend<$t>>::Mask;
+            type IVector = <$inner_ty as crate::backend::Backend<$t>>::IVector;
+            const UNROLL: usize = <$inner_ty as crate::backend::Backend<$t>>::UNROLL;
+
+            #[inline(always)]
+            fn lanes(self) -> usize {
+                <$inner_ty as crate::backend::Backend<$t>>::lanes($inner)
+            }
+            #[inline(always)]
+            fn splat(self, v: $t) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::splat($inner, v)
+            }
+            #[inline(always)]
+            fn load(self, s: &[$t]) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::load($inner, s)
+            }
+            #[inline(always)]
+            fn store(self, v: Self::Vector, s: &mut [$t]) {
+                <$inner_ty as crate::backend::Backend<$t>>::store($inner, v, s)
+            }
+            #[inline(always)]
+            fn add(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::add($inner, a, b)
+            }
+            #[inline(always)]
+            fn sub(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::sub($inner, a, b)
+            }
+            #[inline(always)]
+            fn mul(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::mul($inner, a, b)
+            }
+            #[inline(always)]
+            fn div(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::div($inner, a, b)
+            }
+            #[inline(always)]
+            fn neg(self, a: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::neg($inner, a)
+            }
+            #[inline(always)]
+            fn abs(self, a: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::abs($inner, a)
+            }
+            #[inline(always)]
+            fn fma(self, a: Self::Vector, b: Self::Vector, c: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::fma($inner, a, b, c)
+            }
+            #[inline(always)]
+            fn madd(self, a: Self::Vector, b: Self::Vector, acc: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::madd($inner, a, b, acc)
+            }
+            #[inline(always)]
+            fn sqrt(self, a: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::sqrt($inner, a)
+            }
+            #[inline(always)]
+            fn min(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::min($inner, a, b)
+            }
+            #[inline(always)]
+            fn max(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::max($inner, a, b)
+            }
+            #[inline(always)]
+            fn le(self, a: Self::Vector, b: Self::Vector) -> Self::Mask {
+                <$inner_ty as crate::backend::Backend<$t>>::le($inner, a, b)
+            }
+            #[inline(always)]
+            fn lt(self, a: Self::Vector, b: Self::Vector) -> Self::Mask {
+                <$inner_ty as crate::backend::Backend<$t>>::lt($inner, a, b)
+            }
+            #[inline(always)]
+            fn ge(self, a: Self::Vector, b: Self::Vector) -> Self::Mask {
+                <$inner_ty as crate::backend::Backend<$t>>::ge($inner, a, b)
+            }
+            #[inline(always)]
+            fn gt(self, a: Self::Vector, b: Self::Vector) -> Self::Mask {
+                <$inner_ty as crate::backend::Backend<$t>>::gt($inner, a, b)
+            }
+            #[inline(always)]
+            fn mask_and(self, a: Self::Mask, b: Self::Mask) -> Self::Mask {
+                <$inner_ty as crate::backend::Backend<$t>>::mask_and($inner, a, b)
+            }
+            #[inline(always)]
+            fn mask_or(self, a: Self::Mask, b: Self::Mask) -> Self::Mask {
+                <$inner_ty as crate::backend::Backend<$t>>::mask_or($inner, a, b)
+            }
+            #[inline(always)]
+            fn mask_not(self, a: Self::Mask) -> Self::Mask {
+                <$inner_ty as crate::backend::Backend<$t>>::mask_not($inner, a)
+            }
+            #[inline(always)]
+            fn select(self, m: Self::Mask, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::select($inner, m, a, b)
+            }
+            #[inline(always)]
+            fn any(self, m: Self::Mask) -> bool {
+                <$inner_ty as crate::backend::Backend<$t>>::any($inner, m)
+            }
+            #[inline(always)]
+            fn all(self, m: Self::Mask) -> bool {
+                <$inner_ty as crate::backend::Backend<$t>>::all($inner, m)
+            }
+            #[inline(always)]
+            fn mask_bitmask(self, m: Self::Mask) -> u32 {
+                <$inner_ty as crate::backend::Backend<$t>>::mask_bitmask($inner, m)
+            }
+            #[inline(always)]
+            fn reduce_sum(self, v: Self::Vector) -> $t {
+                <$inner_ty as crate::backend::Backend<$t>>::reduce_sum($inner, v)
+            }
+            #[inline(always)]
+            fn reduce_min(self, v: Self::Vector) -> $t {
+                <$inner_ty as crate::backend::Backend<$t>>::reduce_min($inner, v)
+            }
+            #[inline(always)]
+            fn reduce_max(self, v: Self::Vector) -> $t {
+                <$inner_ty as crate::backend::Backend<$t>>::reduce_max($inner, v)
+            }
+            #[inline(always)]
+            fn iload(self, s: &[u32]) -> Self::IVector {
+                <$inner_ty as crate::backend::Backend<$t>>::iload($inner, s)
+            }
+            #[inline(always)]
+            fn istore(self, v: Self::IVector, out: &mut [u32]) {
+                <$inner_ty as crate::backend::Backend<$t>>::istore($inner, v, out)
+            }
+            #[inline(always)]
+            fn to_bits(self, v: Self::Vector) -> Self::IVector {
+                <$inner_ty as crate::backend::Backend<$t>>::to_bits($inner, v)
+            }
+            #[inline(always)]
+            fn from_bits(self, v: Self::IVector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::from_bits($inner, v)
+            }
+        }
+    };
+}
+
+/// Integer-element sibling of [`delegate_float_element`].
+#[allow(unused_macros)] // per-target: each ISA file instantiates only what it lacks
+macro_rules! delegate_int_element {
+    ($token:ty, $t:ty, $inner_ty:ty, $inner:expr) => {
+        impl crate::backend::Backend<$t> for $token {
+            type Vector = <$inner_ty as crate::backend::Backend<$t>>::Vector;
+            type Mask = <$inner_ty as crate::backend::Backend<$t>>::Mask;
+            type IVector = <$inner_ty as crate::backend::Backend<$t>>::IVector;
+            const UNROLL: usize = <$inner_ty as crate::backend::Backend<$t>>::UNROLL;
+
+            #[inline(always)]
+            fn lanes(self) -> usize {
+                <$inner_ty as crate::backend::Backend<$t>>::lanes($inner)
+            }
+            #[inline(always)]
+            fn splat(self, v: $t) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::splat($inner, v)
+            }
+            #[inline(always)]
+            fn load(self, s: &[$t]) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::load($inner, s)
+            }
+            #[inline(always)]
+            fn store(self, v: Self::Vector, s: &mut [$t]) {
+                <$inner_ty as crate::backend::Backend<$t>>::store($inner, v, s)
+            }
+            #[inline(always)]
+            fn add(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::add($inner, a, b)
+            }
+            #[inline(always)]
+            fn sub(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::sub($inner, a, b)
+            }
+            #[inline(always)]
+            fn mul(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::mul($inner, a, b)
+            }
+            #[inline(always)]
+            fn neg(self, a: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::neg($inner, a)
+            }
+            #[inline(always)]
+            fn abs(self, a: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::abs($inner, a)
+            }
+            #[inline(always)]
+            fn madd(self, a: Self::Vector, b: Self::Vector, acc: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::madd($inner, a, b, acc)
+            }
+            #[inline(always)]
+            fn min(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::min($inner, a, b)
+            }
+            #[inline(always)]
+            fn max(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::max($inner, a, b)
+            }
+            #[inline(always)]
+            fn le(self, a: Self::Vector, b: Self::Vector) -> Self::Mask {
+                <$inner_ty as crate::backend::Backend<$t>>::le($inner, a, b)
+            }
+            #[inline(always)]
+            fn lt(self, a: Self::Vector, b: Self::Vector) -> Self::Mask {
+                <$inner_ty as crate::backend::Backend<$t>>::lt($inner, a, b)
+            }
+            #[inline(always)]
+            fn ge(self, a: Self::Vector, b: Self::Vector) -> Self::Mask {
+                <$inner_ty as crate::backend::Backend<$t>>::ge($inner, a, b)
+            }
+            #[inline(always)]
+            fn gt(self, a: Self::Vector, b: Self::Vector) -> Self::Mask {
+                <$inner_ty as crate::backend::Backend<$t>>::gt($inner, a, b)
+            }
+            #[inline(always)]
+            fn mask_and(self, a: Self::Mask, b: Self::Mask) -> Self::Mask {
+                <$inner_ty as crate::backend::Backend<$t>>::mask_and($inner, a, b)
+            }
+            #[inline(always)]
+            fn mask_or(self, a: Self::Mask, b: Self::Mask) -> Self::Mask {
+                <$inner_ty as crate::backend::Backend<$t>>::mask_or($inner, a, b)
+            }
+            #[inline(always)]
+            fn mask_not(self, a: Self::Mask) -> Self::Mask {
+                <$inner_ty as crate::backend::Backend<$t>>::mask_not($inner, a)
+            }
+            #[inline(always)]
+            fn select(self, m: Self::Mask, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::select($inner, m, a, b)
+            }
+            #[inline(always)]
+            fn any(self, m: Self::Mask) -> bool {
+                <$inner_ty as crate::backend::Backend<$t>>::any($inner, m)
+            }
+            #[inline(always)]
+            fn all(self, m: Self::Mask) -> bool {
+                <$inner_ty as crate::backend::Backend<$t>>::all($inner, m)
+            }
+            #[inline(always)]
+            fn mask_bitmask(self, m: Self::Mask) -> u32 {
+                <$inner_ty as crate::backend::Backend<$t>>::mask_bitmask($inner, m)
+            }
+            #[inline(always)]
+            fn reduce_sum(self, v: Self::Vector) -> $t {
+                <$inner_ty as crate::backend::Backend<$t>>::reduce_sum($inner, v)
+            }
+            #[inline(always)]
+            fn reduce_min(self, v: Self::Vector) -> $t {
+                <$inner_ty as crate::backend::Backend<$t>>::reduce_min($inner, v)
+            }
+            #[inline(always)]
+            fn reduce_max(self, v: Self::Vector) -> $t {
+                <$inner_ty as crate::backend::Backend<$t>>::reduce_max($inner, v)
+            }
+            #[inline(always)]
+            fn shl(self, a: Self::Vector, k: u32) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::shl($inner, a, k)
+            }
+            #[inline(always)]
+            fn shr(self, a: Self::Vector, k: u32) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::shr($inner, a, k)
+            }
+            #[inline(always)]
+            fn bit_and(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::bit_and($inner, a, b)
+            }
+            #[inline(always)]
+            fn bit_or(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::bit_or($inner, a, b)
+            }
+            #[inline(always)]
+            fn bit_xor(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::bit_xor($inner, a, b)
+            }
+            #[inline(always)]
+            fn bit_not(self, a: Self::Vector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::bit_not($inner, a)
+            }
+            #[inline(always)]
+            fn iload(self, s: &[u32]) -> Self::IVector {
+                <$inner_ty as crate::backend::Backend<$t>>::iload($inner, s)
+            }
+            #[inline(always)]
+            fn istore(self, v: Self::IVector, out: &mut [u32]) {
+                <$inner_ty as crate::backend::Backend<$t>>::istore($inner, v, out)
+            }
+            #[inline(always)]
+            fn to_bits(self, v: Self::Vector) -> Self::IVector {
+                <$inner_ty as crate::backend::Backend<$t>>::to_bits($inner, v)
+            }
+            #[inline(always)]
+            fn from_bits(self, v: Self::IVector) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::from_bits($inner, v)
+            }
+        }
+    };
+}
+
+#[allow(unused_imports)] // used by the x86 capability-superset tokens only
+pub(crate) use {delegate_float_element, delegate_int_element};
+
 // The hand-rolled SIMD tokens are crate-internal: application code never names a backend,
 // it goes through `dispatch`, which picks one by runtime CPU detection. They stay reachable
 // for the in-crate differential tests (`diff_tests`) that verify each against the oracle.

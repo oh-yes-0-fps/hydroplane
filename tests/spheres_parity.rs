@@ -3,9 +3,9 @@
 //! `wreck`'s "0 mismatches vs CPU" methodology.
 
 use rand::Rng;
-use hydroplane::{Backend, Kernel, Scalar, Gang, SimdDispatch, Soa, dispatch};
+use hydroplane::{FloatScalar, Backend, Kernel, Gang, SimdDispatch, Soa, dispatch};
 
-fn spheres_soa<T: Scalar>(rows: &[[T; 4]]) -> Soa<T> {
+fn spheres_soa<T: FloatScalar>(rows: &[[T; 4]]) -> Soa<T> {
     let mut soa = Soa::with_pad_fills(&[T::ZERO, T::ZERO, T::ZERO, T::from_f64(f64::NAN)]);
     for row in rows {
         soa.push_row(row);
@@ -13,7 +13,7 @@ fn spheres_soa<T: Scalar>(rows: &[[T; 4]]) -> Soa<T> {
     soa
 }
 
-fn any_overlap<T: Scalar, S: Backend<T>>(ctx: Gang<T, S>, soa: &Soa<T>, q: [T; 4]) -> bool {
+fn any_overlap<T: FloatScalar, S: Backend<T>>(ctx: Gang<T, S>, soa: &Soa<T>, q: [T; 4]) -> bool {
     let lanes = ctx.lanes();
     let (cx, cy, cz, sr) = (
         ctx.splat(q[0]),
@@ -41,11 +41,11 @@ fn any_overlap<T: Scalar, S: Backend<T>>(ctx: Gang<T, S>, soa: &Soa<T>, q: [T; 4
     false
 }
 
-struct AnyOverlap<'a, T: Scalar> {
+struct AnyOverlap<'a, T: FloatScalar> {
     soa: &'a Soa<T>,
     q: [T; 4],
 }
-impl<T: Scalar> Kernel<T> for AnyOverlap<'_, T> {
+impl<T: FloatScalar> Kernel<T> for AnyOverlap<'_, T> {
     type Output = bool;
     fn run<S: Backend<T>>(self, simd: Gang<T, S>) -> bool {
         any_overlap(simd, self.soa, self.q)
@@ -54,7 +54,7 @@ impl<T: Scalar> Kernel<T> for AnyOverlap<'_, T> {
 
 /// Brute-force reference using the scalar ops directly — exact same arithmetic, so the
 /// SIMD path must agree bit-for-bit (the kernel uses no FMA).
-fn naive<T: Scalar>(rows: &[[T; 4]], q: [T; 4]) -> bool {
+fn naive<T: FloatScalar>(rows: &[[T; 4]], q: [T; 4]) -> bool {
     rows.iter().any(|s| {
         let dx = q[0] - s[0];
         let dy = q[1] - s[1];
@@ -65,7 +65,7 @@ fn naive<T: Scalar>(rows: &[[T; 4]], q: [T; 4]) -> bool {
     })
 }
 
-fn run_for<T: Scalar + SimdDispatch>(to: impl Fn(f64) -> T) {
+fn run_for<T: FloatScalar + SimdDispatch>(to: impl Fn(f64) -> T) {
     let mut rng = rand::rng();
     for _ in 0..400 {
         let n = rng.random_range(0..40);

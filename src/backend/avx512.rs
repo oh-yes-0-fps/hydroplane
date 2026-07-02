@@ -176,6 +176,10 @@ impl Backend<f32> for Avx512 {
         unsafe { z_fma(a, b, c) }
     }
     #[inline(always)]
+    fn madd(self, a: __m512, b: __m512, acc: __m512) -> __m512 {
+        <Self as Backend<f32>>::fma(self, a, b, acc)
+    }
+    #[inline(always)]
     fn sqrt(self, a: __m512) -> __m512 {
         unsafe { z_sqrt(a) }
     }
@@ -419,6 +423,210 @@ unsafe fn zi_to_ps(v: __m512i) -> __m512 {
     _mm512_castsi512_ps(v)
 }
 
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_neg(a: __m512i) -> __m512i {
+    _mm512_sub_epi32(_mm512_setzero_si512(), a)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_abs(a: __m512i) -> __m512i {
+    _mm512_abs_epi32(a)
+}
+
+/// The 32-bit integer element backends: 16-lane `__m512i` with the `f32` impl's `__mmask16`
+/// convention. Arithmetic is wrapping; compares are native unsigned/signed k-mask ops.
+macro_rules! avx512_int_backend {
+    ($t:ty, $le:ident, $lt:ident, $min:ident, $max:ident, $abs:expr, $shr:ident,
+     $rmin:ident, $rmax:ident) => {
+        impl Backend<$t> for Avx512 {
+            type Vector = __m512i;
+            type Mask = __mmask16;
+
+            #[inline(always)]
+            fn lanes(self) -> usize {
+                16
+            }
+            #[inline(always)]
+            fn splat(self, v: $t) -> __m512i {
+                unsafe { zi_splat(v as u32) }
+            }
+            #[inline(always)]
+            fn load(self, s: &[$t]) -> __m512i {
+                debug_assert_eq!(s.len(), 16);
+                unsafe { zi_load(s.as_ptr() as *const u32) }
+            }
+            #[inline(always)]
+            fn store(self, v: __m512i, s: &mut [$t]) {
+                debug_assert_eq!(s.len(), 16);
+                unsafe { zi_store(s.as_mut_ptr() as *mut u32, v) }
+            }
+            #[inline(always)]
+            fn add(self, a: __m512i, b: __m512i) -> __m512i {
+                unsafe { zi_add(a, b) }
+            }
+            #[inline(always)]
+            fn sub(self, a: __m512i, b: __m512i) -> __m512i {
+                unsafe { zi_sub(a, b) }
+            }
+            #[inline(always)]
+            fn mul(self, a: __m512i, b: __m512i) -> __m512i {
+                unsafe { zi_mul(a, b) }
+            }
+            #[inline(always)]
+            fn neg(self, a: __m512i) -> __m512i {
+                unsafe { zi_neg(a) }
+            }
+            #[inline(always)]
+            fn abs(self, a: __m512i) -> __m512i {
+                unsafe { ($abs)(a) }
+            }
+            #[inline(always)]
+            fn min(self, a: __m512i, b: __m512i) -> __m512i {
+                unsafe { $min(a, b) }
+            }
+            #[inline(always)]
+            fn max(self, a: __m512i, b: __m512i) -> __m512i {
+                unsafe { $max(a, b) }
+            }
+            #[inline(always)]
+            fn le(self, a: __m512i, b: __m512i) -> __mmask16 {
+                unsafe { $le(a, b) }
+            }
+            #[inline(always)]
+            fn lt(self, a: __m512i, b: __m512i) -> __mmask16 {
+                unsafe { $lt(a, b) }
+            }
+            #[inline(always)]
+            fn ge(self, a: __m512i, b: __m512i) -> __mmask16 {
+                unsafe { $le(b, a) }
+            }
+            #[inline(always)]
+            fn gt(self, a: __m512i, b: __m512i) -> __mmask16 {
+                unsafe { $lt(b, a) }
+            }
+            #[inline(always)]
+            fn mask_and(self, a: __mmask16, b: __mmask16) -> __mmask16 {
+                a & b
+            }
+            #[inline(always)]
+            fn mask_or(self, a: __mmask16, b: __mmask16) -> __mmask16 {
+                a | b
+            }
+            #[inline(always)]
+            fn mask_not(self, a: __mmask16) -> __mmask16 {
+                !a
+            }
+            #[inline(always)]
+            fn select(self, m: __mmask16, a: __m512i, b: __m512i) -> __m512i {
+                unsafe { zi_select(m, a, b) }
+            }
+            #[inline(always)]
+            fn any(self, m: __mmask16) -> bool {
+                m != 0
+            }
+            #[inline(always)]
+            fn all(self, m: __mmask16) -> bool {
+                m == 0xffff
+            }
+            #[inline(always)]
+            fn mask_bitmask(self, m: __mmask16) -> u32 {
+                m as u32
+            }
+            #[inline(always)]
+            fn reduce_sum(self, v: __m512i) -> $t {
+                let mut b = [0u32; 16];
+                unsafe { zi_store(b.as_mut_ptr(), v) };
+                b.iter().fold(0 as $t, |acc, &x| acc.wrapping_add(x as $t))
+            }
+            #[inline(always)]
+            fn reduce_min(self, v: __m512i) -> $t {
+                unsafe { $rmin(v) as $t }
+            }
+            #[inline(always)]
+            fn reduce_max(self, v: __m512i) -> $t {
+                unsafe { $rmax(v) as $t }
+            }
+            #[inline(always)]
+            fn shl(self, a: __m512i, k: u32) -> __m512i {
+                debug_assert!(k < 32);
+                unsafe { zi_shl(a, k) }
+            }
+            #[inline(always)]
+            fn shr(self, a: __m512i, k: u32) -> __m512i {
+                debug_assert!(k < 32);
+                unsafe { $shr(a, k) }
+            }
+            #[inline(always)]
+            fn bit_and(self, a: __m512i, b: __m512i) -> __m512i {
+                unsafe { zi_and(a, b) }
+            }
+            #[inline(always)]
+            fn bit_or(self, a: __m512i, b: __m512i) -> __m512i {
+                unsafe { zi_or(a, b) }
+            }
+            #[inline(always)]
+            fn bit_xor(self, a: __m512i, b: __m512i) -> __m512i {
+                unsafe { zi_xor(a, b) }
+            }
+            #[inline(always)]
+            fn bit_not(self, a: __m512i) -> __m512i {
+                unsafe { zi_xor(a, zi_splat(u32::MAX)) }
+            }
+
+            type IVector = __m512i;
+            #[inline(always)]
+            fn iload(self, s: &[u32]) -> __m512i {
+                debug_assert_eq!(s.len(), 16);
+                unsafe { zi_load(s.as_ptr()) }
+            }
+            #[inline(always)]
+            fn istore(self, v: __m512i, out: &mut [u32]) {
+                debug_assert_eq!(out.len(), 16);
+                unsafe { zi_store(out.as_mut_ptr(), v) }
+            }
+            #[inline(always)]
+            fn to_bits(self, v: __m512i) -> __m512i {
+                v
+            }
+            #[inline(always)]
+            fn from_bits(self, v: __m512i) -> __m512i {
+                v
+            }
+        }
+    };
+}
+
+avx512_int_backend!(
+    u32, _mm512_cmple_epu32_mask, _mm512_cmplt_epu32_mask, zi_min_u, zi_max_u, |a| a,
+    zi_shr, _mm512_reduce_min_epu32, _mm512_reduce_max_epu32
+);
+avx512_int_backend!(
+    i32, _mm512_cmple_epi32_mask, _mm512_cmplt_epi32_mask, zi_min_s, zi_max_s, |a| zi_abs(a),
+    zi_sra, _mm512_reduce_min_epi32, _mm512_reduce_max_epi32
+);
+
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_min_u(a: __m512i, b: __m512i) -> __m512i {
+    _mm512_min_epu32(a, b)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_max_u(a: __m512i, b: __m512i) -> __m512i {
+    _mm512_max_epu32(a, b)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_min_s(a: __m512i, b: __m512i) -> __m512i {
+    _mm512_min_epi32(a, b)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_max_s(a: __m512i, b: __m512i) -> __m512i {
+    _mm512_max_epi32(a, b)
+}
+
 impl Backend<f64> for Avx512 {
     type Vector = __m512d;
     type Mask = __mmask8;
@@ -480,6 +688,10 @@ impl Backend<f64> for Avx512 {
     #[inline(always)]
     fn fma(self, a: __m512d, b: __m512d, c: __m512d) -> __m512d {
         unsafe { zd_fma(a, b, c) }
+    }
+    #[inline(always)]
+    fn madd(self, a: __m512d, b: __m512d, acc: __m512d) -> __m512d {
+        <Self as Backend<f64>>::fma(self, a, b, acc)
     }
     #[inline(always)]
     fn sqrt(self, a: __m512d) -> __m512d {
@@ -729,7 +941,11 @@ mod bf16_impl {
         fn fma(self, a: __m512, b: __m512, c: __m512) -> __m512 {
             unsafe { z_fma(a, b, c) }
         }
-        #[inline(always)]
+            #[inline(always)]
+        fn madd(self, a: __m512, b: __m512, acc: __m512) -> __m512 {
+            <Self as Backend<bf16>>::fma(self, a, b, acc)
+        }
+    #[inline(always)]
         fn sqrt(self, a: __m512) -> __m512 {
             unsafe { z_sqrt(a) }
         }
@@ -883,7 +1099,11 @@ mod f16_impl {
         fn fma(self, a: __m512, b: __m512, c: __m512) -> __m512 {
             unsafe { z_fma(a, b, c) }
         }
-        #[inline(always)]
+            #[inline(always)]
+        fn madd(self, a: __m512, b: __m512, acc: __m512) -> __m512 {
+            <Self as Backend<f16>>::fma(self, a, b, acc)
+        }
+    #[inline(always)]
         fn sqrt(self, a: __m512) -> __m512 {
             unsafe { z_sqrt(a) }
         }

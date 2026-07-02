@@ -10,7 +10,7 @@
 use rand::Rng;
 
 use super::{Backend, ScalarBackend};
-use crate::scalar::Scalar;
+use crate::scalar::{FloatScalar, IntScalar, Scalar};
 
 type BinOp<T> = fn(ScalarBackend, T, T) -> T;
 
@@ -24,7 +24,7 @@ fn rel_eq<T: Scalar>(got: T, want: T, tol: f64) -> bool {
 /// backend-specific), so equality here treats the zeros as equal and NaN as equal to NaN.
 fn check_specials<T, S>(b: S)
 where
-    T: Scalar,
+    T: FloatScalar,
     S: Backend<T>,
 {
     let s = ScalarBackend;
@@ -188,7 +188,7 @@ where
 
 fn check<T, S>(b: S, sample: impl Fn(&mut dyn FnMut() -> f64) -> T)
 where
-    T: Scalar,
+    T: FloatScalar,
     S: Backend<T>,
 {
     check_specials(b);
@@ -227,7 +227,7 @@ where
 
         let got = store(&b, b.neg(va));
         for i in 0..n {
-            assert_eq!(got[i].into_f64(), a[i].neg().into_f64(), "neg lane {i}");
+            assert_eq!(got[i].into_f64(), Scalar::neg(a[i]).into_f64(), "neg lane {i}");
         }
 
         let got = store(&b, b.abs(va));
@@ -288,7 +288,7 @@ where
 /// fused). `N = 10` exercises both the lane-blocked body and the scalar tail at every lane width.
 fn check_mma_one<T, S>(b: S, tol: f64)
 where
-    T: Scalar<Compute = T>,
+    T: FloatScalar<Compute = T>,
     S: crate::matrix::MatrixBackend<T>,
 {
     use crate::matrix::{Accumulator, Layout, MatrixA, MatrixB};
@@ -314,6 +314,158 @@ where
             }
             assert!(rel_eq(got[i * N + j], want, tol), "mma [{i}][{j}]");
         }
+    }
+}
+
+/// The integer *element* backends (`Backend<u32>`/`Backend<i32>`) against the scalar oracle:
+/// wrapping arithmetic, `Ord` min/max, family-correct abs/neg/shifts/bitwise, compares observed
+/// through `mask_bitmask`, select, and reductions.
+fn check_int_element<T, S>(b: S)
+where
+    T: IntScalar + core::fmt::Debug,
+    S: Backend<T>,
+{
+    let n = b.lanes();
+    let mut rng = rand::rng();
+    let store = |v: S::Vector| {
+        let mut o = vec![T::ZERO; n];
+        b.store(v, &mut o);
+        o
+    };
+    let draw = |rng: &mut rand::rngs::ThreadRng| T::from_bits32(rng.random::<u32>());
+
+    for round in 0..300 {
+        let a: Vec<T> = (0..n).map(|_| draw(&mut rng)).collect();
+        let c: Vec<T> = (0..n)
+            .map(|i| if round % 3 == 0 { a[i] } else { draw(&mut rng) })
+            .collect();
+        let va = b.load(&a);
+        let vc = b.load(&c);
+
+        type Op<T> = fn(T, T) -> T;
+        let bin: [(&str, Vec<T>, Op<T>); 5] = [
+            ("add", store(b.add(va, vc)), |x, y| T::from_bits32(x.to_bits32().wrapping_add(y.to_bits32()))),
+            ("sub", store(b.sub(va, vc)), |x, y| T::from_bits32(x.to_bits32().wrapping_sub(y.to_bits32()))),
+            ("mul", store(b.mul(va, vc)), |x, y| T::from_bits32(x.to_bits32().wrapping_mul(y.to_bits32()))),
+            ("min", store(b.min(va, vc)), |x, y| Scalar::min(x, y)),
+            ("max", store(b.max(va, vc)), |x, y| Scalar::max(x, y)),
+        ];
+        for (name, got, op) in bin {
+            for i in 0..n {
+                assert_eq!(got[i], op(a[i], c[i]), "{name} lane {i}");
+            }
+        }
+
+        let got = store(b.neg(va));
+        for i in 0..n {
+            assert_eq!(got[i], Scalar::neg(a[i]), "neg lane {i}");
+        }
+        let got = store(b.abs(va));
+        for i in 0..n {
+            assert_eq!(got[i], Scalar::abs(a[i]), "abs lane {i}");
+        }
+
+        let k = rng.random_range(0..32u32);
+        let got = store(b.shl(va, k));
+        for i in 0..n {
+            assert_eq!(got[i].to_bits32(), a[i].to_bits32() << k, "shl({k}) lane {i}");
+        }
+        let got = store(b.shr(va, k));
+        for i in 0..n {
+            assert_eq!(got[i], a[i] >> (k as usize), "shr({k}) lane {i}");
+        }
+
+        let bits3: [(&str, Vec<T>, Op<T>); 3] = [
+            ("bit_and", store(b.bit_and(va, vc)), |x, y| x & y),
+            ("bit_or", store(b.bit_or(va, vc)), |x, y| x | y),
+            ("bit_xor", store(b.bit_xor(va, vc)), |x, y| x ^ y),
+        ];
+        for (name, got, op) in bits3 {
+            for i in 0..n {
+                assert_eq!(got[i], op(a[i], c[i]), "{name} lane {i}");
+            }
+        }
+        let got = store(b.bit_not(va));
+        for i in 0..n {
+            assert_eq!(got[i], !a[i], "bit_not lane {i}");
+        }
+
+        type Pred<T> = fn(T, T) -> bool;
+        let cmps: [(&str, u32, Pred<T>); 4] = [
+            ("le", b.mask_bitmask(b.le(va, vc)), |x, y| x <= y),
+            ("lt", b.mask_bitmask(b.lt(va, vc)), |x, y| x < y),
+            ("ge", b.mask_bitmask(b.ge(va, vc)), |x, y| x >= y),
+            ("gt", b.mask_bitmask(b.gt(va, vc)), |x, y| x > y),
+        ];
+        for (name, bits, pred) in cmps {
+            let mut want = 0u32;
+            for i in 0..n {
+                if pred(a[i], c[i]) {
+                    want |= 1 << i;
+                }
+            }
+            assert_eq!(bits, want, "{name} bitmask");
+        }
+
+        let m = b.lt(va, vc);
+        let got = store(b.select(m, va, vc));
+        for i in 0..n {
+            assert_eq!(got[i], if a[i] < c[i] { a[i] } else { c[i] }, "select lane {i}");
+        }
+
+        let sum = b.reduce_sum(va);
+        let want = a.iter().fold(T::ZERO, |acc, &x| {
+            T::from_bits32(acc.to_bits32().wrapping_add(x.to_bits32()))
+        });
+        assert_eq!(sum, want, "reduce_sum");
+        assert_eq!(b.reduce_min(va), a.iter().copied().fold(a[0], Scalar::min), "reduce_min");
+        assert_eq!(b.reduce_max(va), a.iter().copied().fold(a[0], Scalar::max), "reduce_max");
+    }
+}
+
+fn check_int_elements<S>(b: S)
+where
+    S: Backend<u32> + Backend<i32> + Copy,
+{
+    check_int_element::<u32, S>(b);
+    check_int_element::<i32, S>(b);
+}
+
+#[test]
+fn scalar_int_elements_match_oracle() {
+    check_int_elements(ScalarBackend);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn neon_int_elements_match_scalar() {
+    check_int_elements(super::neon::Neon::new());
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[test]
+fn sse4_int_elements_match_scalar() {
+    match super::sse4::Sse4::detect() {
+        Some(b) => check_int_elements(b),
+        None => eprintln!("SSE4.1 unavailable; skipping"),
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[test]
+fn avx2_int_elements_match_scalar() {
+    match super::avx2::Avx2::detect() {
+        Some(b) => check_int_elements(b),
+        None => eprintln!("AVX2 unavailable; skipping"),
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[test]
+fn avx512_int_elements_match_scalar() {
+    match super::avx512::Avx512::detect() {
+        Some(b) => check_int_elements(b),
+        None => eprintln!("AVX-512 unavailable; skipping"),
     }
 }
 

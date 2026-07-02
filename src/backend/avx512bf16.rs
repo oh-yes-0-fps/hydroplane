@@ -113,6 +113,10 @@ impl Backend<bf16> for Avx512Bf16 {
         self.f32().fma(a, b, c)
     }
     #[inline(always)]
+    fn madd(self, a: __m512, b: __m512, acc: __m512) -> __m512 {
+        <Self as Backend<bf16>>::fma(self, a, b, acc)
+    }
+    #[inline(always)]
     fn sqrt(self, a: __m512) -> __m512 {
         self.f32().sqrt(a)
     }

@@ -14,17 +14,17 @@
 
 use criterion::measurement::WallTime;
 use criterion::{BenchmarkGroup, BenchmarkId, Criterion, Throughput};
-use hydroplane::{Layout, MatrixBackend, MatrixKernel, Scalar, Gang, dispatch_matrix};
+use hydroplane::{FloatScalar, Layout, MatrixBackend, MatrixKernel, Gang, dispatch_matrix};
 use std::hint::black_box;
 
 /// `out = A·B` for a single `S×S×S` tile — large enough (≥ both engines' min dims) that the one
 /// `mma` lands on Accelerate (default) or the SME grid kernel (`no_apple_accelerate`).
-struct Gemm<'a, T: Scalar, const M: usize, const N: usize, const K: usize> {
+struct Gemm<'a, T: FloatScalar, const M: usize, const N: usize, const K: usize> {
     a: &'a [T],
     b: &'a [T],
     out: &'a mut [T::Compute],
 }
-impl<T: Scalar, const M: usize, const N: usize, const K: usize> MatrixKernel<T>
+impl<T: FloatScalar, const M: usize, const N: usize, const K: usize> MatrixKernel<T>
     for Gemm<'_, T, M, N, K>
 {
     type Output = ();

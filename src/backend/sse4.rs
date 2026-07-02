@@ -175,6 +175,10 @@ impl Backend<f32> for Sse4 {
         unsafe { s_add(s_mul(a, b), c) }
     }
     #[inline(always)]
+    fn madd(self, a: __m128, b: __m128, acc: __m128) -> __m128 {
+        <Self as Backend<f32>>::fma(self, a, b, acc)
+    }
+    #[inline(always)]
     fn sqrt(self, a: __m128) -> __m128 {
         unsafe { s_sqrt(a) }
     }
@@ -438,6 +442,222 @@ unsafe fn si_to_ps(v: __m128i) -> __m128 {
     _mm_castsi128_ps(v)
 }
 
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_neg(a: __m128i) -> __m128i {
+    _mm_sub_epi32(_mm_setzero_si128(), a)
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_abs(a: __m128i) -> __m128i {
+    _mm_abs_epi32(a)
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_min_u(a: __m128i, b: __m128i) -> __m128i {
+    _mm_min_epu32(a, b)
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_max_u(a: __m128i, b: __m128i) -> __m128i {
+    _mm_max_epu32(a, b)
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_min_s(a: __m128i, b: __m128i) -> __m128i {
+    _mm_min_epi32(a, b)
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_max_s(a: __m128i, b: __m128i) -> __m128i {
+    _mm_max_epi32(a, b)
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_or_ps(a: __m128, b: __m128) -> __m128 {
+    _mm_or_ps(a, b)
+}
+
+/// The 32-bit integer element backends: 4-lane `__m128i` with the `f32` impl's `__m128` mask
+/// convention, so integer and float compares compose. Arithmetic is wrapping.
+macro_rules! sse4_int_backend {
+    ($t:ty, $lt:ident, $min:ident, $max:ident, $abs:expr, $shr:ident) => {
+        impl Backend<$t> for Sse4 {
+            type Vector = __m128i;
+            type Mask = __m128;
+
+            #[inline(always)]
+            fn lanes(self) -> usize {
+                4
+            }
+            #[inline(always)]
+            fn splat(self, v: $t) -> __m128i {
+                unsafe { si_splat(v as u32) }
+            }
+            #[inline(always)]
+            fn load(self, s: &[$t]) -> __m128i {
+                debug_assert_eq!(s.len(), 4);
+                unsafe { si_load(s.as_ptr() as *const u32) }
+            }
+            #[inline(always)]
+            fn store(self, v: __m128i, s: &mut [$t]) {
+                debug_assert_eq!(s.len(), 4);
+                unsafe { si_store(s.as_mut_ptr() as *mut u32, v) }
+            }
+            #[inline(always)]
+            fn add(self, a: __m128i, b: __m128i) -> __m128i {
+                unsafe { si_add(a, b) }
+            }
+            #[inline(always)]
+            fn sub(self, a: __m128i, b: __m128i) -> __m128i {
+                unsafe { si_sub(a, b) }
+            }
+            #[inline(always)]
+            fn mul(self, a: __m128i, b: __m128i) -> __m128i {
+                unsafe { si_mul(a, b) }
+            }
+            #[inline(always)]
+            fn neg(self, a: __m128i) -> __m128i {
+                unsafe { si_neg(a) }
+            }
+            #[inline(always)]
+            fn abs(self, a: __m128i) -> __m128i {
+                unsafe { ($abs)(a) }
+            }
+            #[inline(always)]
+            fn min(self, a: __m128i, b: __m128i) -> __m128i {
+                unsafe { $min(a, b) }
+            }
+            #[inline(always)]
+            fn max(self, a: __m128i, b: __m128i) -> __m128i {
+                unsafe { $max(a, b) }
+            }
+            #[inline(always)]
+            fn le(self, a: __m128i, b: __m128i) -> __m128 {
+                unsafe { si_or_ps($lt(a, b), si_eq(a, b)) }
+            }
+            #[inline(always)]
+            fn lt(self, a: __m128i, b: __m128i) -> __m128 {
+                unsafe { $lt(a, b) }
+            }
+            #[inline(always)]
+            fn ge(self, a: __m128i, b: __m128i) -> __m128 {
+                unsafe { si_or_ps($lt(b, a), si_eq(a, b)) }
+            }
+            #[inline(always)]
+            fn gt(self, a: __m128i, b: __m128i) -> __m128 {
+                unsafe { $lt(b, a) }
+            }
+            #[inline(always)]
+            fn mask_and(self, a: __m128, b: __m128) -> __m128 {
+                unsafe { s_and(a, b) }
+            }
+            #[inline(always)]
+            fn mask_or(self, a: __m128, b: __m128) -> __m128 {
+                unsafe { s_or(a, b) }
+            }
+            #[inline(always)]
+            fn mask_not(self, a: __m128) -> __m128 {
+                unsafe { s_xor(a, _mm_castsi128_ps(_mm_set1_epi32(-1))) }
+            }
+            #[inline(always)]
+            fn select(self, m: __m128, a: __m128i, b: __m128i) -> __m128i {
+                unsafe { si_select(m, a, b) }
+            }
+            #[inline(always)]
+            fn any(self, m: __m128) -> bool {
+                unsafe { _mm_movemask_ps(m) != 0 }
+            }
+            #[inline(always)]
+            fn all(self, m: __m128) -> bool {
+                unsafe { _mm_movemask_ps(m) == 0xF }
+            }
+            #[inline(always)]
+            fn mask_bitmask(self, m: __m128) -> u32 {
+                unsafe { _mm_movemask_ps(m) as u32 }
+            }
+            #[inline(always)]
+            fn reduce_sum(self, v: __m128i) -> $t {
+                let mut b = [0u32; 4];
+                unsafe { si_store(b.as_mut_ptr(), v) };
+                b.iter().fold(0 as $t, |acc, &x| acc.wrapping_add(x as $t))
+            }
+            #[inline(always)]
+            fn reduce_min(self, v: __m128i) -> $t {
+                let mut b = [0u32; 4];
+                unsafe { si_store(b.as_mut_ptr(), v) };
+                b.iter().map(|&x| x as $t).min().unwrap()
+            }
+            #[inline(always)]
+            fn reduce_max(self, v: __m128i) -> $t {
+                let mut b = [0u32; 4];
+                unsafe { si_store(b.as_mut_ptr(), v) };
+                b.iter().map(|&x| x as $t).max().unwrap()
+            }
+            #[inline(always)]
+            fn shl(self, a: __m128i, k: u32) -> __m128i {
+                debug_assert!(k < 32);
+                unsafe { si_shl(a, k) }
+            }
+            #[inline(always)]
+            fn shr(self, a: __m128i, k: u32) -> __m128i {
+                debug_assert!(k < 32);
+                unsafe { $shr(a, k) }
+            }
+            #[inline(always)]
+            fn bit_and(self, a: __m128i, b: __m128i) -> __m128i {
+                unsafe { si_and(a, b) }
+            }
+            #[inline(always)]
+            fn bit_or(self, a: __m128i, b: __m128i) -> __m128i {
+                unsafe { si_or(a, b) }
+            }
+            #[inline(always)]
+            fn bit_xor(self, a: __m128i, b: __m128i) -> __m128i {
+                unsafe { si_xor(a, b) }
+            }
+            #[inline(always)]
+            fn bit_not(self, a: __m128i) -> __m128i {
+                unsafe { si_xor(a, si_splat(u32::MAX)) }
+            }
+
+            type IVector = __m128i;
+            #[inline(always)]
+            fn iload(self, s: &[u32]) -> __m128i {
+                debug_assert_eq!(s.len(), 4);
+                unsafe { si_load(s.as_ptr()) }
+            }
+            #[inline(always)]
+            fn istore(self, v: __m128i, out: &mut [u32]) {
+                debug_assert_eq!(out.len(), 4);
+                unsafe { si_store(out.as_mut_ptr(), v) }
+            }
+            #[inline(always)]
+            fn to_bits(self, v: __m128i) -> __m128i {
+                v
+            }
+            #[inline(always)]
+            fn from_bits(self, v: __m128i) -> __m128i {
+                v
+            }
+        }
+    };
+}
+
+sse4_int_backend!(u32, si_lt_u_i, si_min_u, si_max_u, |a| a, si_shr);
+sse4_int_backend!(i32, si_lt_s_i, si_min_s, si_max_s, |a| si_abs(a), si_sra);
+
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_lt_u_i(a: __m128i, b: __m128i) -> __m128 {
+    si_lt_u(a, b)
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_lt_s_i(a: __m128i, b: __m128i) -> __m128 {
+    si_lt_s(a, b)
+}
+
 impl Backend<f64> for Sse4 {
     type Vector = __m128d;
     type Mask = __m128d;
@@ -499,6 +719,10 @@ impl Backend<f64> for Sse4 {
     #[inline(always)]
     fn fma(self, a: __m128d, b: __m128d, c: __m128d) -> __m128d {
         unsafe { _mm_add_pd_(d_mul(a, b), c) }
+    }
+    #[inline(always)]
+    fn madd(self, a: __m128d, b: __m128d, acc: __m128d) -> __m128d {
+        <Self as Backend<f64>>::fma(self, a, b, acc)
     }
     #[inline(always)]
     fn sqrt(self, a: __m128d) -> __m128d {
@@ -761,7 +985,11 @@ macro_rules! sse4_widen_half {
                 fn fma(self, a: __m128, b: __m128, c: __m128) -> __m128 {
                     unsafe { s_add(s_mul(a, b), c) }
                 }
-                #[inline(always)]
+                            #[inline(always)]
+                fn madd(self, a: __m128, b: __m128, acc: __m128) -> __m128 {
+                    <Self as Backend<$t>>::fma(self, a, b, acc)
+                }
+    #[inline(always)]
                 fn sqrt(self, a: __m128) -> __m128 {
                     unsafe { s_sqrt(a) }
                 }

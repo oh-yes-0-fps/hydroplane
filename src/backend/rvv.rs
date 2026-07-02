@@ -110,7 +110,11 @@ macro_rules! impl_rvv_backend {
             fn fma(self, a: RvvVec<C>, b: RvvVec<C>, c: RvvVec<C>) -> RvvVec<C> {
                 unsafe { rvv::$fma::<C>(&a, &b, &c) }
             }
-            #[inline(always)]
+                    #[inline(always)]
+            fn madd(self, a: RvvVec<C>, b: RvvVec<C>, acc: RvvVec<C>) -> RvvVec<C> {
+                <Self as Backend<$t>>::fma(self, a, b, acc)
+            }
+    #[inline(always)]
             fn sqrt(self, a: RvvVec<C>) -> RvvVec<C> {
                 unsafe { rvv::$sqrt::<C>(&a) }
             }

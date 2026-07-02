@@ -3,11 +3,11 @@
 //! generics, ordinary `<…>` generics, multiple bounds, where-clauses, a renamed/overridden
 //! scalar, and several type parameters.
 
-use hydroplane::{Scalar, Gang, kernel};
+use hydroplane::{FloatScalar, Gang, kernel};
 
 #[kernel]
 /// Sum of `xs` scaled by `k`, reduced across lanes — exercises load/operators/reduce.
-pub fn scaled_sum<'a, T: Scalar>(ctx: Gang<T>, xs: &'a [T], k: T) -> f64 {
+pub fn scaled_sum<'a, T: FloatScalar>(ctx: Gang<T>, xs: &'a [T], k: T) -> f64 {
     let mut acc = ctx.splat(T::ZERO);
     ctx.for_each_chunk(xs.len(), |off, cnt| {
         let v = ctx.load_partial(&xs[off..off + cnt], T::ZERO);
@@ -19,7 +19,7 @@ pub fn scaled_sum<'a, T: Scalar>(ctx: Gang<T>, xs: &'a [T], k: T) -> f64 {
 // Multiple bounds on the scalar + an extra non-scalar type parameter used only in the return type:
 // `T` is still picked as the scalar (it carries the `Scalar` bound), `R` rides along via PhantomData.
 #[kernel]
-pub fn scaled_sum_into<'a, T: Scalar + Copy, R: From<f64>>(ctx: Gang<T>, xs: &'a [T], k: T) -> R {
+pub fn scaled_sum_into<'a, T: FloatScalar + Copy, R: From<f64>>(ctx: Gang<T>, xs: &'a [T], k: T) -> R {
     let mut acc = ctx.splat(T::ZERO);
     ctx.for_each_chunk(xs.len(), |off, cnt| {
         acc = acc + ctx.load_partial(&xs[off..off + cnt], T::ZERO) * k;
@@ -31,7 +31,7 @@ pub fn scaled_sum_into<'a, T: Scalar + Copy, R: From<f64>>(ctx: Gang<T>, xs: &'a
 #[kernel]
 pub fn dot<'a, T>(ctx: Gang<T>, xs: &'a [T], ys: &'a [T]) -> f64
 where
-    T: Scalar,
+    T: FloatScalar,
 {
     let mut acc = ctx.splat(T::ZERO);
     ctx.for_each_chunk(xs.len(), |off, cnt| {
@@ -45,7 +45,7 @@ where
 // The scalar parameter need not be named `T` — it's found by its `Scalar` bound (the `macro_rules!`
 // fallback hard-requires the name `T`).
 #[kernel]
-pub fn renamed_scalar<'a, Elem: Scalar>(ctx: Gang<Elem>, xs: &'a [Elem]) -> f64 {
+pub fn renamed_scalar<'a, Elem: FloatScalar>(ctx: Gang<Elem>, xs: &'a [Elem]) -> f64 {
     let mut acc = ctx.splat(Elem::ZERO);
     ctx.for_each_chunk(xs.len(), |off, cnt| {
         acc = acc + ctx.load_partial(&xs[off..off + cnt], Elem::ZERO);
@@ -55,7 +55,7 @@ pub fn renamed_scalar<'a, Elem: Scalar>(ctx: Gang<Elem>, xs: &'a [Elem]) -> f64 
 
 // A plain vector reduction over a generic scalar (bare `#[kernel]`).
 #[kernel]
-pub fn vector_sum<'a, T: Scalar>(ctx: Gang<T>, xs: &'a [T]) -> f64 {
+pub fn vector_sum<'a, T: FloatScalar>(ctx: Gang<T>, xs: &'a [T]) -> f64 {
     let mut acc = ctx.splat(T::ZERO);
     ctx.for_each_chunk(xs.len(), |off, cnt| {
         acc = acc + ctx.load_partial(&xs[off..off + cnt], T::ZERO);
@@ -83,7 +83,7 @@ pub fn any_gt<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> bool {
 }
 
 #[kernel(matrix)]
-pub fn gemm<'a, T: Scalar, const M: usize, const N: usize, const K: usize>(
+pub fn gemm<'a, T: FloatScalar, const M: usize, const N: usize, const K: usize>(
     ctx: Gang<T>,
     a: &'a [T],
     b: &'a [T],
@@ -98,7 +98,7 @@ pub fn gemm<'a, T: Scalar, const M: usize, const N: usize, const K: usize>(
 // A matrix context is also a `Backend`, so one `ctx` drives both the tile matmul (`out = A·B`) and a
 // vector reduction (the lane-sum of `a`) in the same kernel.
 #[kernel(matrix)]
-pub fn gemm_and_sum_a<'a, T: Scalar, const M: usize, const N: usize, const K: usize>(
+pub fn gemm_and_sum_a<'a, T: FloatScalar, const M: usize, const N: usize, const K: usize>(
     ctx: Gang<T>,
     a: &'a [T],
     b: &'a [T],
@@ -153,7 +153,7 @@ fn scalar_param_need_not_be_named_t() {
 // companion with its *own* dispatched context, so dispatch runs once (at `scaled_then_sum`'s entry)
 // rather than again per inner call.
 #[kernel]
-pub fn scaled<'a, T: Scalar>(ctx: Gang<T>, xs: &'a [T], k: T) -> f64 {
+pub fn scaled<'a, T: FloatScalar>(ctx: Gang<T>, xs: &'a [T], k: T) -> f64 {
     let mut acc = ctx.splat(T::ZERO);
     ctx.for_each_chunk(xs.len(), |off, cnt| {
         acc = acc + ctx.load_partial(&xs[off..off + cnt], T::ZERO) * k;
@@ -162,7 +162,7 @@ pub fn scaled<'a, T: Scalar>(ctx: Gang<T>, xs: &'a [T], k: T) -> f64 {
 }
 
 #[kernel]
-pub fn scaled_then_sum<'a, T: Scalar>(ctx: Gang<T>, xs: &'a [T], ys: &'a [T], k: T) -> f64 {
+pub fn scaled_then_sum<'a, T: FloatScalar>(ctx: Gang<T>, xs: &'a [T], ys: &'a [T], k: T) -> f64 {
     scaled_on(ctx, xs, k) + scaled_on(ctx, ys, k)
 }
 

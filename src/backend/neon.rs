@@ -73,6 +73,10 @@ impl Backend<f32> for Neon {
         unsafe { vfmaq_f32(c, a, b) }
     }
     #[inline(always)]
+    fn madd(self, a: float32x4_t, b: float32x4_t, acc: float32x4_t) -> float32x4_t {
+        <Self as Backend<f32>>::fma(self, a, b, acc)
+    }
+    #[inline(always)]
     fn sqrt(self, a: float32x4_t) -> float32x4_t {
         unsafe { vsqrtq_f32(a) }
     }
@@ -280,6 +284,10 @@ impl Backend<f64> for Neon {
         unsafe { vfmaq_f64(c, a, b) }
     }
     #[inline(always)]
+    fn madd(self, a: float64x2_t, b: float64x2_t, acc: float64x2_t) -> float64x2_t {
+        <Self as Backend<f64>>::fma(self, a, b, acc)
+    }
+    #[inline(always)]
     fn sqrt(self, a: float64x2_t) -> float64x2_t {
         unsafe { vsqrtq_f64(a) }
     }
@@ -434,7 +442,11 @@ mod bf16_impl {
         fn fma(self, a: float32x4_t, b: float32x4_t, c: float32x4_t) -> float32x4_t {
             unsafe { vfmaq_f32(c, a, b) }
         }
-        #[inline(always)]
+            #[inline(always)]
+        fn madd(self, a: float32x4_t, b: float32x4_t, acc: float32x4_t) -> float32x4_t {
+            <Self as Backend<bf16>>::fma(self, a, b, acc)
+        }
+    #[inline(always)]
         fn sqrt(self, a: float32x4_t) -> float32x4_t {
             unsafe { vsqrtq_f32(a) }
         }
@@ -661,7 +673,11 @@ mod f16_impl {
         fn fma(self, a: float16x8_t, b: float16x8_t, c: float16x8_t) -> float16x8_t {
             unsafe { fma(a, b, c) }
         }
-        #[inline(always)]
+            #[inline(always)]
+        fn madd(self, a: float16x8_t, b: float16x8_t, acc: float16x8_t) -> float16x8_t {
+            <Self as Backend<f16>>::fma(self, a, b, acc)
+        }
+    #[inline(always)]
         fn sqrt(self, a: float16x8_t) -> float16x8_t {
             unsafe { sqrt(a) }
         }
@@ -753,3 +769,203 @@ mod f16_impl {
         }
     }
 }
+
+/// The 32-bit integer element backends: same 4-lane geometry and `uint32x4_t` mask convention as
+/// the `f32` impl, so float- and integer-element kernels share dispatch and mask machinery.
+/// Arithmetic is wrapping (NEON integer semantics).
+macro_rules! neon_int_backend {
+    ($t:ty, $vec:ty, $ld:ident, $st:ident, $dup:ident, $add:ident, $sub:ident, $mul:ident,
+     $neg:expr, $abs:expr, $min:ident, $max:ident,
+     $le:ident, $lt:ident, $ge:ident, $gt:ident, $sel:ident,
+     $rsum:ident, $rmin:ident, $rmax:ident,
+     $shl:expr, $shr:expr, $and:ident, $orr:ident, $eor:ident, $not:expr,
+     $tobits:expr, $frombits:expr) => {
+        impl Backend<$t> for Neon {
+            type Vector = $vec;
+            type Mask = uint32x4_t;
+
+            #[inline(always)]
+            fn lanes(self) -> usize {
+                4
+            }
+            #[inline(always)]
+            fn splat(self, v: $t) -> $vec {
+                unsafe { $dup(v) }
+            }
+            #[inline(always)]
+            fn load(self, s: &[$t]) -> $vec {
+                debug_assert_eq!(s.len(), 4);
+                unsafe { $ld(s.as_ptr()) }
+            }
+            #[inline(always)]
+            fn store(self, v: $vec, s: &mut [$t]) {
+                debug_assert_eq!(s.len(), 4);
+                unsafe { $st(s.as_mut_ptr(), v) }
+            }
+            #[inline(always)]
+            fn add(self, a: $vec, b: $vec) -> $vec {
+                unsafe { $add(a, b) }
+            }
+            #[inline(always)]
+            fn sub(self, a: $vec, b: $vec) -> $vec {
+                unsafe { $sub(a, b) }
+            }
+            #[inline(always)]
+            fn mul(self, a: $vec, b: $vec) -> $vec {
+                unsafe { $mul(a, b) }
+            }
+            #[inline(always)]
+            fn neg(self, a: $vec) -> $vec {
+                unsafe { ($neg)(a) }
+            }
+            #[inline(always)]
+            #[allow(unused_unsafe)]
+            fn abs(self, a: $vec) -> $vec {
+                unsafe { ($abs)(a) }
+            }
+            #[inline(always)]
+            fn min(self, a: $vec, b: $vec) -> $vec {
+                unsafe { $min(a, b) }
+            }
+            #[inline(always)]
+            fn max(self, a: $vec, b: $vec) -> $vec {
+                unsafe { $max(a, b) }
+            }
+            #[inline(always)]
+            fn le(self, a: $vec, b: $vec) -> uint32x4_t {
+                unsafe { $le(a, b) }
+            }
+            #[inline(always)]
+            fn lt(self, a: $vec, b: $vec) -> uint32x4_t {
+                unsafe { $lt(a, b) }
+            }
+            #[inline(always)]
+            fn ge(self, a: $vec, b: $vec) -> uint32x4_t {
+                unsafe { $ge(a, b) }
+            }
+            #[inline(always)]
+            fn gt(self, a: $vec, b: $vec) -> uint32x4_t {
+                unsafe { $gt(a, b) }
+            }
+            #[inline(always)]
+            fn mask_and(self, a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+                unsafe { vandq_u32(a, b) }
+            }
+            #[inline(always)]
+            fn mask_or(self, a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+                unsafe { vorrq_u32(a, b) }
+            }
+            #[inline(always)]
+            fn mask_not(self, a: uint32x4_t) -> uint32x4_t {
+                unsafe { vmvnq_u32(a) }
+            }
+            #[inline(always)]
+            fn select(self, m: uint32x4_t, a: $vec, b: $vec) -> $vec {
+                unsafe { $sel(m, a, b) }
+            }
+            #[inline(always)]
+            fn any(self, m: uint32x4_t) -> bool {
+                unsafe { vmaxvq_u32(m) != 0 }
+            }
+            #[inline(always)]
+            fn all(self, m: uint32x4_t) -> bool {
+                unsafe { vminvq_u32(m) == u32::MAX }
+            }
+            #[inline(always)]
+            fn mask_bitmask(self, m: uint32x4_t) -> u32 {
+                const WEIGHTS: [u32; 4] = [1, 2, 4, 8];
+                unsafe { vaddvq_u32(vandq_u32(m, vld1q_u32(WEIGHTS.as_ptr()))) }
+            }
+            #[inline(always)]
+            fn reduce_sum(self, v: $vec) -> $t {
+                unsafe { $rsum(v) }
+            }
+            #[inline(always)]
+            fn reduce_min(self, v: $vec) -> $t {
+                unsafe { $rmin(v) }
+            }
+            #[inline(always)]
+            fn reduce_max(self, v: $vec) -> $t {
+                unsafe { $rmax(v) }
+            }
+            #[inline(always)]
+            fn shl(self, a: $vec, k: u32) -> $vec {
+                debug_assert!(k < 32);
+                unsafe { ($shl)(a, k) }
+            }
+            #[inline(always)]
+            fn shr(self, a: $vec, k: u32) -> $vec {
+                debug_assert!(k < 32);
+                unsafe { ($shr)(a, k) }
+            }
+            #[inline(always)]
+            fn bit_and(self, a: $vec, b: $vec) -> $vec {
+                unsafe { $and(a, b) }
+            }
+            #[inline(always)]
+            fn bit_or(self, a: $vec, b: $vec) -> $vec {
+                unsafe { $orr(a, b) }
+            }
+            #[inline(always)]
+            fn bit_xor(self, a: $vec, b: $vec) -> $vec {
+                unsafe { $eor(a, b) }
+            }
+            #[inline(always)]
+            fn bit_not(self, a: $vec) -> $vec {
+                unsafe { ($not)(a) }
+            }
+
+            type IVector = uint32x4_t;
+            #[inline(always)]
+            fn iload(self, s: &[u32]) -> uint32x4_t {
+                debug_assert_eq!(s.len(), 4);
+                unsafe { vld1q_u32(s.as_ptr()) }
+            }
+            #[inline(always)]
+            fn istore(self, v: uint32x4_t, out: &mut [u32]) {
+                debug_assert_eq!(out.len(), 4);
+                unsafe { vst1q_u32(out.as_mut_ptr(), v) }
+            }
+            #[inline(always)]
+            #[allow(unused_unsafe)]
+            fn to_bits(self, v: $vec) -> uint32x4_t {
+                unsafe { ($tobits)(v) }
+            }
+            #[inline(always)]
+            #[allow(unused_unsafe)]
+            fn from_bits(self, v: uint32x4_t) -> $vec {
+                unsafe { ($frombits)(v) }
+            }
+        }
+    };
+}
+
+neon_int_backend!(
+    u32, uint32x4_t, vld1q_u32, vst1q_u32, vdupq_n_u32, vaddq_u32, vsubq_u32, vmulq_u32,
+    |a| vreinterpretq_u32_s32(vnegq_s32(vreinterpretq_s32_u32(a))),
+    |a| a,
+    vminq_u32, vmaxq_u32,
+    vcleq_u32, vcltq_u32, vcgeq_u32, vcgtq_u32, vbslq_u32,
+    vaddvq_u32, vminvq_u32, vmaxvq_u32,
+    |a, k: u32| vshlq_u32(a, vdupq_n_s32(k as i32)),
+    |a, k: u32| vshlq_u32(a, vdupq_n_s32(-(k as i32))),
+    vandq_u32, vorrq_u32, veorq_u32,
+    |a| vmvnq_u32(a),
+    |v| v,
+    |v| v
+);
+
+neon_int_backend!(
+    i32, int32x4_t, vld1q_s32, vst1q_s32, vdupq_n_s32, vaddq_s32, vsubq_s32, vmulq_s32,
+    |a| vnegq_s32(a),
+    |a| vabsq_s32(a),
+    vminq_s32, vmaxq_s32,
+    vcleq_s32, vcltq_s32, vcgeq_s32, vcgtq_s32, vbslq_s32,
+    vaddvq_s32, vminvq_s32, vmaxvq_s32,
+    |a, k: u32| vshlq_s32(a, vdupq_n_s32(k as i32)),
+    |a, k: u32| vshlq_s32(a, vdupq_n_s32(-(k as i32))),
+    vandq_s32, vorrq_s32, veorq_s32,
+    |a| vmvnq_s32(a),
+    |v| vreinterpretq_u32_s32(v),
+    |v| vreinterpretq_s32_u32(v)
+);

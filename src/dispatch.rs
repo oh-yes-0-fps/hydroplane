@@ -437,6 +437,98 @@ macro_rules! impl_simd_dispatch_x86 {
 impl_simd_dispatch_x86!(f32, arm_dispatch_tail);
 impl_simd_dispatch_x86!(f64);
 
+/// Integer-element dispatch: the same runtime x86 tier cache and compile-time selection as the
+/// float ladder, minus the tiers with no 32-bit integer backend (AVX1 — 256-bit integer ops are
+/// AVX2 — and the scalable SVE/RVV tokens). aarch64 goes straight to NEON.
+macro_rules! impl_simd_dispatch_int {
+    ($ty:ty) => {
+        impl SimdDispatch for $ty {
+            #[inline]
+            #[allow(unreachable_code)]
+            fn dispatch<K: Kernel<Self>>(kernel: K) -> K::Output {
+                #[cfg(all(
+                    any(target_arch = "x86_64", target_arch = "x86"),
+                    target_feature = "avx512f",
+                    not(any(no_avx, no_avx512))
+                ))]
+                {
+                    // SAFETY: target compiled with avx512f.
+                    let b = unsafe { crate::backend::avx512::Avx512::new_unchecked() };
+                    return kernel.run(Gang::new(b));
+                }
+                #[cfg(all(
+                    any(target_arch = "x86_64", target_arch = "x86"),
+                    feature = "std",
+                    not(static_dispatch),
+                    not(all(target_feature = "avx512f", not(any(no_avx, no_avx512))))
+                ))]
+                {
+                    use crate::backend::sse4::Sse4;
+                    #[cfg(not(any(no_avx, no_avx512)))]
+                    use crate::backend::avx512::Avx512;
+                    #[cfg(not(no_avx))]
+                    use crate::backend::avx2::Avx2;
+                    static TIER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+                    let t = cached_tier(&TIER, || {
+                        #[cfg(not(any(no_avx, no_avx512)))]
+                        if Avx512::detect().is_some() {
+                            return 1;
+                        }
+                        #[cfg(not(no_avx))]
+                        if Avx2::detect().is_some() {
+                            return 2;
+                        }
+                        if Sse4::detect().is_some() { 4 } else { u8::MAX }
+                    });
+                    // SAFETY: each token is built only for the tier the matching `detect()`
+                    // confirmed this run.
+                    return match t {
+                        #[cfg(not(any(no_avx, no_avx512)))]
+                        1 => kernel.run(Gang::new(unsafe { Avx512::new_unchecked() })),
+                        #[cfg(not(no_avx))]
+                        2 => kernel.run(Gang::new(unsafe { Avx2::new_unchecked() })),
+                        4 => kernel.run(Gang::new(unsafe { Sse4::new_unchecked() })),
+                        _ => kernel.run(Gang::new(ScalarBackend)),
+                    };
+                }
+                #[cfg(all(
+                    any(target_arch = "x86_64", target_arch = "x86"),
+                    any(not(feature = "std"), static_dispatch),
+                    not(all(target_feature = "avx512f", not(any(no_avx, no_avx512)))),
+                    target_feature = "avx2",
+                    not(no_avx)
+                ))]
+                {
+                    // SAFETY: target compiled with avx2.
+                    let b = unsafe { crate::backend::avx2::Avx2::new_unchecked() };
+                    return kernel.run(Gang::new(b));
+                }
+                #[cfg(all(
+                    any(target_arch = "x86_64", target_arch = "x86"),
+                    any(not(feature = "std"), static_dispatch),
+                    not(all(target_feature = "avx512f", not(any(no_avx, no_avx512)))),
+                    not(all(target_feature = "avx2", not(no_avx))),
+                    target_feature = "sse4.1"
+                ))]
+                {
+                    // SAFETY: target compiled with sse4.1.
+                    let b = unsafe { crate::backend::sse4::Sse4::new_unchecked() };
+                    return kernel.run(Gang::new(b));
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    return kernel.run(Gang::new(crate::backend::neon::Neon::new()));
+                }
+                wasm_dispatch_tail!(kernel);
+                kernel.run(Gang::new(ScalarBackend))
+            }
+        }
+    };
+}
+
+impl_simd_dispatch_int!(u32);
+impl_simd_dispatch_int!(i32);
+
 // Scalars without a hand-rolled SIMD backend yet (f16/bf16) always take the scalar path.
 mod half_dispatch {
     use super::{Kernel, ScalarBackend, Gang, SimdDispatch};

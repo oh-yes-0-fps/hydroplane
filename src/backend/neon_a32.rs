@@ -411,6 +411,10 @@ impl Backend<f32> for Neon {
         unsafe { fma(&a, &b, &c) }
     }
     #[inline(always)]
+    fn madd(self, a: F32x4, b: F32x4, acc: F32x4) -> F32x4 {
+        <Self as Backend<f32>>::fma(self, a, b, acc)
+    }
+    #[inline(always)]
     fn sqrt(self, a: F32x4) -> F32x4 {
         unsafe { sqrt(&a) }
     }

@@ -11,7 +11,7 @@
 //! matmul accumulates in `f32` with no extra plumbing.
 
 use crate::backend::Backend;
-use crate::scalar::Scalar;
+use crate::scalar::{FloatScalar, Scalar};
 
 mod sealed {
     pub trait Sealed {}
@@ -205,7 +205,7 @@ impl<'a, E: Scalar, const R: usize, const C: usize> CpuTile<'a, E, R, C> for [[E
 /// A backend that can hold matrix tiles and fuse-multiply-add them. Supertrait of [`Backend`]:
 /// every backend that runs a kernel also implements this, so a matmul kernel just tightens its
 /// bound from `Backend<T>` to `MatrixBackend<T>` and the existing dispatch delivers it.
-pub trait MatrixBackend<T: Scalar>: Backend<T> {
+pub trait MatrixBackend<T: FloatScalar>: Backend<T> {
     /// An `R×C` tile of element `E` in role `Ro`. Concrete `[[E; C]; R]` on the CPU/scalar/GPU
     /// floor; an opaque distributed handle once a cooperative-matrix lowering is available.
     type Tile<'a, E: Scalar, const R: usize, const C: usize, Ro: Role>: Copy;
@@ -265,7 +265,7 @@ fn tile_index(r: usize, c: usize, row_stride: usize, layout: Layout) -> usize {
 /// dimension into `lanes()`-wide accumulators kept in a register across the `K` reduction, folding
 /// with the backend's `fma`; a scalar tail handles `N % lanes`.
 #[inline]
-fn simd_gemm<C: Scalar, B: Backend<C>, const M: usize, const N: usize, const K: usize>(
+fn simd_gemm<C: FloatScalar, B: Backend<C>, const M: usize, const N: usize, const K: usize>(
     backend: B,
     a: [[C; K]; M],
     b: [[C; N]; K],
@@ -323,7 +323,7 @@ fn simd_gemm<C: Scalar, B: Backend<C>, const M: usize, const N: usize, const K: 
 #[inline]
 #[allow(clippy::needless_range_loop)]
 fn packed_gemm<
-    C: Scalar,
+    C: FloatScalar,
     B: Backend<C>,
     const M: usize,
     const N: usize,
@@ -473,7 +473,7 @@ const SME_MIN_DIM: usize = 16;
 ))]
 mod sme_pack {
     #![allow(clippy::needless_range_loop)]
-    use crate::scalar::Scalar;
+    use crate::scalar::{FloatScalar, Scalar};
     use core::cell::RefCell;
     use half::{bf16, f16};
     thread_local! {
@@ -639,7 +639,7 @@ mod sme_pack {
     /// # Safety
     /// `ac` is a valid `M×K` (`M = pm·blk`); `ap.len() >= pm·⌈k/2⌉·blk·2`.
     #[inline]
-    pub unsafe fn pack_a_pairs<T: Scalar>(ac: *const T, ap: &mut [T], pm: usize, k: usize, blk: usize) {
+    pub unsafe fn pack_a_pairs<T: FloatScalar>(ac: *const T, ap: &mut [T], pm: usize, k: usize, blk: usize) {
         debug_assert_eq!(core::mem::size_of::<T>(), 2);
         if k.is_multiple_of(2) {
             let apf = unsafe { core::slice::from_raw_parts_mut(ap.as_mut_ptr() as *mut f32, ap.len() / 2) };
@@ -669,7 +669,7 @@ mod sme_pack {
     /// # Safety
     /// `bc` is a valid `K×N` (`N = pn·blk`); `bp.len() >= pn·⌈k/2⌉·blk·2`.
     #[inline]
-    pub unsafe fn pack_b_pairs<T: Scalar>(bc: *const T, bp: &mut [T], pn: usize, k: usize, n: usize, blk: usize) {
+    pub unsafe fn pack_b_pairs<T: FloatScalar>(bc: *const T, bp: &mut [T], pn: usize, k: usize, n: usize, blk: usize) {
         use core::arch::aarch64::*;
         debug_assert_eq!(core::mem::size_of::<T>(), 2);
         let pairs = k.div_ceil(2);
@@ -884,7 +884,7 @@ fn array_mma_simd<'i, T, S, const M: usize, const N: usize, const K: usize>(
     c: [[T::Compute; N]; M],
 ) -> [[T::Compute; N]; M]
 where
-    T: Scalar,
+    T: FloatScalar,
     S: Backend<T::Compute>,
 {
     // Inputs arrive as zero-copy [`View`]s. The hardware paths pack straight from the view's slice
@@ -1231,7 +1231,7 @@ fn array_mma_scalar<'i, T, const M: usize, const N: usize, const K: usize>(
     mut c: [[T::Compute; N]; M],
 ) -> [[T::Compute; N]; M]
 where
-    T: Scalar,
+    T: FloatScalar,
 {
     let mut i = 0;
     while i < M {
@@ -1301,9 +1301,9 @@ macro_rules! array_tile_methods {
 /// (CPU tokens + scalar oracle); `scalar` uses the per-invocation triple loop (GPU `Subgroup`).
 macro_rules! impl_array_matrix_backend {
     ($backend:ty, simd) => {
-        impl<T: Scalar> $crate::matrix::MatrixBackend<T> for $backend
+        impl<T: FloatScalar> $crate::matrix::MatrixBackend<T> for $backend
         where
-            $backend: $crate::backend::Backend<T> + $crate::backend::Backend<<T as Scalar>::Compute>,
+            $backend: $crate::backend::Backend<T> + $crate::backend::Backend<<T as FloatScalar>::Compute>,
         {
             array_tile_methods!();
 
@@ -1312,14 +1312,14 @@ macro_rules! impl_array_matrix_backend {
                 self,
                 a: Self::Tile<'i, T, M, K, $crate::matrix::MatrixA>,
                 b: Self::Tile<'i, T, K, N, $crate::matrix::MatrixB>,
-                c: Self::Tile<'i, <T as Scalar>::Compute, M, N, $crate::matrix::Accumulator>,
-            ) -> Self::Tile<'i, <T as Scalar>::Compute, M, N, $crate::matrix::Accumulator> {
+                c: Self::Tile<'i, <T as FloatScalar>::Compute, M, N, $crate::matrix::Accumulator>,
+            ) -> Self::Tile<'i, <T as FloatScalar>::Compute, M, N, $crate::matrix::Accumulator> {
                 array_mma_simd::<T, $backend, M, N, K>(self, a, b, c)
             }
         }
     };
     ($backend:ty, scalar) => {
-        impl<T: Scalar> $crate::matrix::MatrixBackend<T> for $backend
+        impl<T: FloatScalar> $crate::matrix::MatrixBackend<T> for $backend
         where
             $backend: $crate::backend::Backend<T>,
         {
@@ -1330,8 +1330,8 @@ macro_rules! impl_array_matrix_backend {
                 self,
                 a: Self::Tile<'i, T, M, K, $crate::matrix::MatrixA>,
                 b: Self::Tile<'i, T, K, N, $crate::matrix::MatrixB>,
-                c: Self::Tile<'i, <T as Scalar>::Compute, M, N, $crate::matrix::Accumulator>,
-            ) -> Self::Tile<'i, <T as Scalar>::Compute, M, N, $crate::matrix::Accumulator> {
+                c: Self::Tile<'i, <T as FloatScalar>::Compute, M, N, $crate::matrix::Accumulator>,
+            ) -> Self::Tile<'i, <T as FloatScalar>::Compute, M, N, $crate::matrix::Accumulator> {
                 array_mma_scalar::<T, M, N, K>(a, b, c)
             }
         }
@@ -1366,10 +1366,10 @@ impl_array_matrix_backend!(crate::backend::wasm::RelaxedSimd, simd);
 // SME hosts a SVE-dispatched matmul lands on the ZA engine (the SME branch inside `array_mma_simd`),
 // and on plain SVE it's the register-blocked GEMM using the SVE element-wise ops.
 #[cfg(target_arch = "aarch64")]
-impl<const W: usize, T: Scalar> MatrixBackend<T> for crate::backend::sve::Sve<W>
+impl<const W: usize, T: FloatScalar> MatrixBackend<T> for crate::backend::sve::Sve<W>
 where
     crate::backend::sve::Sve<W>:
-        crate::backend::Backend<T> + crate::backend::Backend<<T as Scalar>::Compute>,
+        crate::backend::Backend<T> + crate::backend::Backend<<T as FloatScalar>::Compute>,
 {
     array_tile_methods!();
 
@@ -1378,8 +1378,8 @@ where
         self,
         a: Self::Tile<'i, T, M, K, MatrixA>,
         b: Self::Tile<'i, T, K, N, MatrixB>,
-        c: Self::Tile<'i, <T as Scalar>::Compute, M, N, Accumulator>,
-    ) -> Self::Tile<'i, <T as Scalar>::Compute, M, N, Accumulator> {
+        c: Self::Tile<'i, <T as FloatScalar>::Compute, M, N, Accumulator>,
+    ) -> Self::Tile<'i, <T as FloatScalar>::Compute, M, N, Accumulator> {
         array_mma_simd::<T, crate::backend::sve::Sve<W>, M, N, K>(self, a, b, c)
     }
 }
@@ -1388,10 +1388,10 @@ where
 // has no matrix engine — the RISC-V matrix extension isn't ratified — so `mma` is the
 // register-blocked GEMM over the RVV element-wise ops, via `array_mma_simd` like every CPU token.
 #[cfg(target_arch = "riscv64")]
-impl<const W: usize, T: Scalar> MatrixBackend<T> for crate::backend::rvv::Rvv<W>
+impl<const W: usize, T: FloatScalar> MatrixBackend<T> for crate::backend::rvv::Rvv<W>
 where
     crate::backend::rvv::Rvv<W>:
-        crate::backend::Backend<T> + crate::backend::Backend<<T as Scalar>::Compute>,
+        crate::backend::Backend<T> + crate::backend::Backend<<T as FloatScalar>::Compute>,
 {
     array_tile_methods!();
 
@@ -1400,8 +1400,8 @@ where
         self,
         a: Self::Tile<'i, T, M, K, MatrixA>,
         b: Self::Tile<'i, T, K, N, MatrixB>,
-        c: Self::Tile<'i, <T as Scalar>::Compute, M, N, Accumulator>,
-    ) -> Self::Tile<'i, <T as Scalar>::Compute, M, N, Accumulator> {
+        c: Self::Tile<'i, <T as FloatScalar>::Compute, M, N, Accumulator>,
+    ) -> Self::Tile<'i, <T as FloatScalar>::Compute, M, N, Accumulator> {
         array_mma_simd::<T, crate::backend::rvv::Rvv<W>, M, N, K>(self, a, b, c)
     }
 }
@@ -1419,7 +1419,7 @@ use crate::varying::Gang;
 /// The tile/MMA surface reached from a [`Gang`] context via [`Gang::tiles`]. The matrix analogue
 /// of building [`Lane`](crate::Lane)s through `Gang`.
 #[derive(Clone, Copy)]
-pub struct Tiles<T: Scalar, S: MatrixBackend<T>> {
+pub struct Tiles<T: FloatScalar, S: MatrixBackend<T>> {
     backend: S,
     _t: PhantomData<T>,
 }
@@ -1429,7 +1429,7 @@ pub struct Tiles<T: Scalar, S: MatrixBackend<T>> {
 #[derive(Clone, Copy)]
 pub struct Tile<
     'a,
-    T: Scalar,
+    T: FloatScalar,
     S: MatrixBackend<T>,
     E: Scalar,
     const R: usize,
@@ -1441,7 +1441,7 @@ pub struct Tile<
     _p: PhantomData<(T, Ro)>,
 }
 
-impl<T: Scalar, S: MatrixBackend<T>> Gang<T, S> {
+impl<T: FloatScalar, S: MatrixBackend<T>> Gang<T, S> {
     /// Gateway to the tile / matrix-multiply surface.
     #[inline(always)]
     pub fn tiles(self) -> Tiles<T, S> {
@@ -1452,7 +1452,7 @@ impl<T: Scalar, S: MatrixBackend<T>> Gang<T, S> {
     }
 }
 
-impl<T: Scalar, S: MatrixBackend<T>> Tiles<T, S> {
+impl<T: FloatScalar, S: MatrixBackend<T>> Tiles<T, S> {
     /// Load the `M×K` left operand `A` from memory. The returned tile borrows `mem` for `'a` —
     /// on a dense CPU tile this is a zero-copy view; the copy (or widen) is deferred to `mma`.
     #[inline]
@@ -1565,7 +1565,7 @@ impl<T: Scalar, S: MatrixBackend<T>> Tiles<T, S> {
     }
 }
 
-impl<'a, T: Scalar, S: MatrixBackend<T>, E: Scalar, const R: usize, const C: usize, Ro: Role>
+impl<'a, T: FloatScalar, S: MatrixBackend<T>, E: Scalar, const R: usize, const C: usize, Ro: Role>
     Tile<'a, T, S, E, R, C, Ro>
 {
     /// The raw backend tile.
@@ -1601,20 +1601,20 @@ impl<'a, T: Scalar, S: MatrixBackend<T>, E: Scalar, const R: usize, const C: usi
 
 /// A matmul kernel — like [`Kernel`](crate::Kernel) but its `run` receives a context whose backend
 /// also supports tiles. Run with [`run_matrix_scalar`] (oracle) or `dispatch`-style selection.
-pub trait MatrixKernel<T: Scalar> {
+pub trait MatrixKernel<T: FloatScalar> {
     type Output;
     fn run<S: MatrixBackend<T>>(self, ctx: Gang<T, S>) -> Self::Output;
 }
 
 /// Run a matmul kernel on the always-available scalar backend (correctness oracle / baseline).
 #[inline]
-pub fn run_matrix_scalar<T: Scalar, K: MatrixKernel<T>>(kernel: K) -> K::Output {
+pub fn run_matrix_scalar<T: FloatScalar, K: MatrixKernel<T>>(kernel: K) -> K::Output {
     kernel.run(Gang::new(crate::backend::ScalarBackend))
 }
 
 /// Per-scalar dispatch policy for matmul kernels — the [`SimdDispatch`](crate::SimdDispatch)
 /// analogue for [`MatrixKernel`].
-pub trait MatrixDispatch: Scalar {
+pub trait MatrixDispatch: FloatScalar {
     fn dispatch_matrix<K: MatrixKernel<Self>>(kernel: K) -> K::Output;
 }
 

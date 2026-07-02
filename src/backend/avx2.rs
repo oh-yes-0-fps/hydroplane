@@ -190,6 +190,10 @@ impl Backend<f32> for Avx2 {
         unsafe { f32_fma(a, b, c) }
     }
     #[inline(always)]
+    fn madd(self, a: __m256, b: __m256, acc: __m256) -> __m256 {
+        <Self as Backend<f32>>::fma(self, a, b, acc)
+    }
+    #[inline(always)]
     fn sqrt(self, a: __m256) -> __m256 {
         unsafe { f32_sqrt(a) }
     }
@@ -471,6 +475,221 @@ unsafe fn yi_to_ps(v: __m256i) -> __m256 {
     _mm256_castsi256_ps(v)
 }
 
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_neg(a: __m256i) -> __m256i {
+    _mm256_sub_epi32(_mm256_setzero_si256(), a)
+}
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_abs(a: __m256i) -> __m256i {
+    _mm256_abs_epi32(a)
+}
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_min_u(a: __m256i, b: __m256i) -> __m256i {
+    _mm256_min_epu32(a, b)
+}
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_max_u(a: __m256i, b: __m256i) -> __m256i {
+    _mm256_max_epu32(a, b)
+}
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_min_s(a: __m256i, b: __m256i) -> __m256i {
+    _mm256_min_epi32(a, b)
+}
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_max_s(a: __m256i, b: __m256i) -> __m256i {
+    _mm256_max_epi32(a, b)
+}
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_or_ps(a: __m256, b: __m256) -> __m256 {
+    _mm256_or_ps(a, b)
+}
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_lt_u_i(a: __m256i, b: __m256i) -> __m256 {
+    yi_lt_u(a, b)
+}
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_lt_s_i(a: __m256i, b: __m256i) -> __m256 {
+    yi_lt_s(a, b)
+}
+
+/// The 32-bit integer element backends: 8-lane `__m256i` with the `f32` impl's `__m256` mask
+/// convention, so integer and float compares compose. Arithmetic is wrapping.
+macro_rules! avx2_int_backend {
+    ($t:ty, $lt:ident, $min:ident, $max:ident, $abs:expr, $shr:ident) => {
+        impl Backend<$t> for Avx2 {
+            type Vector = __m256i;
+            type Mask = __m256;
+
+            #[inline(always)]
+            fn lanes(self) -> usize {
+                8
+            }
+            #[inline(always)]
+            fn splat(self, v: $t) -> __m256i {
+                unsafe { yi_splat(v as u32) }
+            }
+            #[inline(always)]
+            fn load(self, s: &[$t]) -> __m256i {
+                debug_assert_eq!(s.len(), 8);
+                unsafe { yi_load(s.as_ptr() as *const u32) }
+            }
+            #[inline(always)]
+            fn store(self, v: __m256i, s: &mut [$t]) {
+                debug_assert_eq!(s.len(), 8);
+                unsafe { yi_store(s.as_mut_ptr() as *mut u32, v) }
+            }
+            #[inline(always)]
+            fn add(self, a: __m256i, b: __m256i) -> __m256i {
+                unsafe { yi_add(a, b) }
+            }
+            #[inline(always)]
+            fn sub(self, a: __m256i, b: __m256i) -> __m256i {
+                unsafe { yi_sub(a, b) }
+            }
+            #[inline(always)]
+            fn mul(self, a: __m256i, b: __m256i) -> __m256i {
+                unsafe { yi_mul(a, b) }
+            }
+            #[inline(always)]
+            fn neg(self, a: __m256i) -> __m256i {
+                unsafe { yi_neg(a) }
+            }
+            #[inline(always)]
+            fn abs(self, a: __m256i) -> __m256i {
+                unsafe { ($abs)(a) }
+            }
+            #[inline(always)]
+            fn min(self, a: __m256i, b: __m256i) -> __m256i {
+                unsafe { $min(a, b) }
+            }
+            #[inline(always)]
+            fn max(self, a: __m256i, b: __m256i) -> __m256i {
+                unsafe { $max(a, b) }
+            }
+            #[inline(always)]
+            fn le(self, a: __m256i, b: __m256i) -> __m256 {
+                unsafe { yi_or_ps($lt(a, b), yi_eq(a, b)) }
+            }
+            #[inline(always)]
+            fn lt(self, a: __m256i, b: __m256i) -> __m256 {
+                unsafe { $lt(a, b) }
+            }
+            #[inline(always)]
+            fn ge(self, a: __m256i, b: __m256i) -> __m256 {
+                unsafe { yi_or_ps($lt(b, a), yi_eq(a, b)) }
+            }
+            #[inline(always)]
+            fn gt(self, a: __m256i, b: __m256i) -> __m256 {
+                unsafe { $lt(b, a) }
+            }
+            #[inline(always)]
+            fn mask_and(self, a: __m256, b: __m256) -> __m256 {
+                unsafe { f32_and(a, b) }
+            }
+            #[inline(always)]
+            fn mask_or(self, a: __m256, b: __m256) -> __m256 {
+                unsafe { f32_or(a, b) }
+            }
+            #[inline(always)]
+            fn mask_not(self, a: __m256) -> __m256 {
+                unsafe { f32_not(a) }
+            }
+            #[inline(always)]
+            fn select(self, m: __m256, a: __m256i, b: __m256i) -> __m256i {
+                unsafe { yi_select(m, a, b) }
+            }
+            #[inline(always)]
+            fn any(self, m: __m256) -> bool {
+                unsafe { f32_movemask(m) != 0 }
+            }
+            #[inline(always)]
+            fn all(self, m: __m256) -> bool {
+                unsafe { f32_movemask(m) == 0xFF }
+            }
+            #[inline(always)]
+            fn mask_bitmask(self, m: __m256) -> u32 {
+                unsafe { f32_movemask(m) as u32 }
+            }
+            #[inline(always)]
+            fn reduce_sum(self, v: __m256i) -> $t {
+                let mut b = [0u32; 8];
+                unsafe { yi_store(b.as_mut_ptr(), v) };
+                b.iter().fold(0 as $t, |acc, &x| acc.wrapping_add(x as $t))
+            }
+            #[inline(always)]
+            fn reduce_min(self, v: __m256i) -> $t {
+                let mut b = [0u32; 8];
+                unsafe { yi_store(b.as_mut_ptr(), v) };
+                b.iter().map(|&x| x as $t).min().unwrap()
+            }
+            #[inline(always)]
+            fn reduce_max(self, v: __m256i) -> $t {
+                let mut b = [0u32; 8];
+                unsafe { yi_store(b.as_mut_ptr(), v) };
+                b.iter().map(|&x| x as $t).max().unwrap()
+            }
+            #[inline(always)]
+            fn shl(self, a: __m256i, k: u32) -> __m256i {
+                debug_assert!(k < 32);
+                unsafe { yi_shl(a, k) }
+            }
+            #[inline(always)]
+            fn shr(self, a: __m256i, k: u32) -> __m256i {
+                debug_assert!(k < 32);
+                unsafe { $shr(a, k) }
+            }
+            #[inline(always)]
+            fn bit_and(self, a: __m256i, b: __m256i) -> __m256i {
+                unsafe { yi_and(a, b) }
+            }
+            #[inline(always)]
+            fn bit_or(self, a: __m256i, b: __m256i) -> __m256i {
+                unsafe { yi_or(a, b) }
+            }
+            #[inline(always)]
+            fn bit_xor(self, a: __m256i, b: __m256i) -> __m256i {
+                unsafe { yi_xor(a, b) }
+            }
+            #[inline(always)]
+            fn bit_not(self, a: __m256i) -> __m256i {
+                unsafe { yi_xor(a, yi_splat(u32::MAX)) }
+            }
+
+            type IVector = __m256i;
+            #[inline(always)]
+            fn iload(self, s: &[u32]) -> __m256i {
+                debug_assert_eq!(s.len(), 8);
+                unsafe { yi_load(s.as_ptr()) }
+            }
+            #[inline(always)]
+            fn istore(self, v: __m256i, out: &mut [u32]) {
+                debug_assert_eq!(out.len(), 8);
+                unsafe { yi_store(out.as_mut_ptr(), v) }
+            }
+            #[inline(always)]
+            fn to_bits(self, v: __m256i) -> __m256i {
+                v
+            }
+            #[inline(always)]
+            fn from_bits(self, v: __m256i) -> __m256i {
+                v
+            }
+        }
+    };
+}
+
+avx2_int_backend!(u32, yi_lt_u_i, yi_min_u, yi_max_u, |a| a, yi_shr);
+avx2_int_backend!(i32, yi_lt_s_i, yi_min_s, yi_max_s, |a| yi_abs(a), yi_sra);
+
 impl Backend<f64> for Avx2 {
     type Vector = __m256d;
     type Mask = __m256d;
@@ -532,6 +751,10 @@ impl Backend<f64> for Avx2 {
     #[inline(always)]
     fn fma(self, a: __m256d, b: __m256d, c: __m256d) -> __m256d {
         unsafe { f64_fma(a, b, c) }
+    }
+    #[inline(always)]
+    fn madd(self, a: __m256d, b: __m256d, acc: __m256d) -> __m256d {
+        <Self as Backend<f64>>::fma(self, a, b, acc)
     }
     #[inline(always)]
     fn sqrt(self, a: __m256d) -> __m256d {
@@ -802,7 +1025,11 @@ mod f16_impl {
         fn fma(self, a: __m256, b: __m256, c: __m256) -> __m256 {
             unsafe { f32_fma(a, b, c) }
         }
-        #[inline(always)]
+            #[inline(always)]
+        fn madd(self, a: __m256, b: __m256, acc: __m256) -> __m256 {
+            <Self as Backend<f16>>::fma(self, a, b, acc)
+        }
+    #[inline(always)]
         fn sqrt(self, a: __m256) -> __m256 {
             unsafe { f32_sqrt(a) }
         }
@@ -974,7 +1201,11 @@ mod bf16_impl {
         fn fma(self, a: __m256, b: __m256, c: __m256) -> __m256 {
             unsafe { f32_fma(a, b, c) }
         }
-        #[inline(always)]
+            #[inline(always)]
+        fn madd(self, a: __m256, b: __m256, acc: __m256) -> __m256 {
+            <Self as Backend<bf16>>::fma(self, a, b, acc)
+        }
+    #[inline(always)]
         fn sqrt(self, a: __m256) -> __m256 {
             unsafe { f32_sqrt(a) }
         }

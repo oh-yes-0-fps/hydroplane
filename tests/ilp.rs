@@ -1,13 +1,13 @@
-use hydroplane::{Backend, Gang, Kernel, Scalar, SimdDispatch, dispatch, run_scalar};
+use hydroplane::{FloatScalar, Backend, Gang, Kernel, SimdDispatch, dispatch, run_scalar};
 
-fn oracle_dot<T: Scalar>(a: &[T], b: &[T]) -> f64 {
+fn oracle_dot<T: FloatScalar>(a: &[T], b: &[T]) -> f64 {
     a.iter()
         .zip(b)
         .map(|(&x, &y)| x.into_f64() * y.into_f64())
         .sum()
 }
 
-fn dot_zip_reduce<T: Scalar, S: Backend<T>>(g: Gang<T, S>, a: &[T], b: &[T]) -> f64 {
+fn dot_zip_reduce<T: FloatScalar, S: Backend<T>>(g: Gang<T, S>, a: &[T], b: &[T]) -> f64 {
     g.zip_reduce(
         a,
         b,
@@ -21,7 +21,7 @@ fn dot_zip_reduce<T: Scalar, S: Backend<T>>(g: Gang<T, S>, a: &[T], b: &[T]) -> 
     .into_f64()
 }
 
-fn sum_reduce<T: Scalar, S: Backend<T>>(g: Gang<T, S>, a: &[T]) -> f64 {
+fn sum_reduce<T: FloatScalar, S: Backend<T>>(g: Gang<T, S>, a: &[T]) -> f64 {
     g.reduce(a, T::ZERO, g.splat(T::ZERO), |acc, x| acc + x, |p, q| p + q)
         .reduce_sum()
         .into_f64()
@@ -30,11 +30,11 @@ fn sum_reduce<T: Scalar, S: Backend<T>>(g: Gang<T, S>, a: &[T]) -> f64 {
 // The unroll factor K is now chosen automatically (dispatch wraps the backend in `Unroll<S, K>`),
 // so a kernel can't pin K from the outside; both `zip_reduce` and `reduce` exercise whichever K this
 // core resolved. The size sweep below crosses the K*lanes() window and tail boundaries either way.
-struct Variants<'a, T: Scalar> {
+struct Variants<'a, T: FloatScalar> {
     a: &'a [T],
     b: &'a [T],
 }
-impl<T: Scalar> Kernel<T> for Variants<'_, T> {
+impl<T: FloatScalar> Kernel<T> for Variants<'_, T> {
     type Output = [f64; 2];
     fn run<S: Backend<T>>(self, g: Gang<T, S>) -> [f64; 2] {
         [dot_zip_reduce(g, self.a, self.b), sum_reduce(g, self.a)]
@@ -43,7 +43,7 @@ impl<T: Scalar> Kernel<T> for Variants<'_, T> {
 
 const SIZES: &[usize] = &[0, 1, 3, 5, 8, 15, 16, 31, 64, 257];
 
-fn check_all<T: Scalar + SimdDispatch>() {
+fn check_all<T: FloatScalar + SimdDispatch>() {
     for &n in SIZES {
         let a: Vec<T> = (0..n)
             .map(|i| T::from_f64((i % 13) as f64 * 0.25 - 1.5))

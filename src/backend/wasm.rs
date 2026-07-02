@@ -195,7 +195,11 @@ macro_rules! wasm_backend {
             fn fma(self, a: v128, b: v128, c: v128) -> v128 {
                 $fma32(a, b, c)
             }
-            #[inline(always)]
+                    #[inline(always)]
+            fn madd(self, a: v128, b: v128, acc: v128) -> v128 {
+                <Self as Backend<f32>>::fma(self, a, b, acc)
+            }
+    #[inline(always)]
             fn sqrt(self, a: v128) -> v128 {
                 f32x4_sqrt(a)
             }
@@ -340,7 +344,11 @@ macro_rules! wasm_backend {
             fn fma(self, a: v128, b: v128, c: v128) -> v128 {
                 $fma64(a, b, c)
             }
-            #[inline(always)]
+                    #[inline(always)]
+            fn madd(self, a: v128, b: v128, acc: v128) -> v128 {
+                <Self as Backend<f64>>::fma(self, a, b, acc)
+            }
+    #[inline(always)]
             fn sqrt(self, a: v128) -> v128 {
                 f64x2_sqrt(a)
             }
@@ -475,7 +483,11 @@ macro_rules! wasm_backend {
             fn fma(self, a: v128, b: v128, c: v128) -> v128 {
                 $fma32(a, b, c)
             }
-            #[inline(always)]
+                    #[inline(always)]
+            fn madd(self, a: v128, b: v128, acc: v128) -> v128 {
+                <Self as Backend<bf16>>::fma(self, a, b, acc)
+            }
+    #[inline(always)]
             fn sqrt(self, a: v128) -> v128 {
                 f32x4_sqrt(a)
             }
@@ -628,7 +640,11 @@ macro_rules! wasm_backend {
             fn fma(self, a: v128, b: v128, c: v128) -> v128 {
                 $fma32(a, b, c)
             }
-            #[inline(always)]
+                    #[inline(always)]
+            fn madd(self, a: v128, b: v128, acc: v128) -> v128 {
+                <Self as Backend<f16>>::fma(self, a, b, acc)
+            }
+    #[inline(always)]
             fn sqrt(self, a: v128) -> v128 {
                 f32x4_sqrt(a)
             }
@@ -715,6 +731,177 @@ macro_rules! wasm_backend {
                 )
             }
         }
+
+        /// The 32-bit integer element backends: 4-lane `v128` with the same all-ones-lane mask
+        /// convention as the float impls. Arithmetic is wrapping.
+        macro_rules! wasm_int_backend {
+            ($t:ty, $le:ident, $lt:ident, $ge:ident, $gt:ident, $min:ident, $max:ident,
+             $abs:expr, $shr:ident) => {
+                impl Backend<$t> for $token {
+                    type Vector = v128;
+                    type Mask = v128;
+
+                    #[inline(always)]
+                    fn lanes(self) -> usize {
+                        4
+                    }
+                    #[inline(always)]
+                    fn splat(self, v: $t) -> v128 {
+                        u32x4_splat(v as u32)
+                    }
+                    #[inline(always)]
+                    fn load(self, s: &[$t]) -> v128 {
+                        debug_assert_eq!(s.len(), 4);
+                        unsafe { v128_load(s.as_ptr() as *const v128) }
+                    }
+                    #[inline(always)]
+                    fn store(self, v: v128, s: &mut [$t]) {
+                        debug_assert_eq!(s.len(), 4);
+                        unsafe { v128_store(s.as_mut_ptr() as *mut v128, v) }
+                    }
+                    #[inline(always)]
+                    fn add(self, a: v128, b: v128) -> v128 {
+                        i32x4_add(a, b)
+                    }
+                    #[inline(always)]
+                    fn sub(self, a: v128, b: v128) -> v128 {
+                        i32x4_sub(a, b)
+                    }
+                    #[inline(always)]
+                    fn mul(self, a: v128, b: v128) -> v128 {
+                        i32x4_mul(a, b)
+                    }
+                    #[inline(always)]
+                    fn neg(self, a: v128) -> v128 {
+                        i32x4_sub(u32x4_splat(0), a)
+                    }
+                    #[inline(always)]
+                    fn abs(self, a: v128) -> v128 {
+                        ($abs)(a)
+                    }
+                    #[inline(always)]
+                    fn min(self, a: v128, b: v128) -> v128 {
+                        $min(a, b)
+                    }
+                    #[inline(always)]
+                    fn max(self, a: v128, b: v128) -> v128 {
+                        $max(a, b)
+                    }
+                    #[inline(always)]
+                    fn le(self, a: v128, b: v128) -> v128 {
+                        $le(a, b)
+                    }
+                    #[inline(always)]
+                    fn lt(self, a: v128, b: v128) -> v128 {
+                        $lt(a, b)
+                    }
+                    #[inline(always)]
+                    fn ge(self, a: v128, b: v128) -> v128 {
+                        $ge(a, b)
+                    }
+                    #[inline(always)]
+                    fn gt(self, a: v128, b: v128) -> v128 {
+                        $gt(a, b)
+                    }
+                    #[inline(always)]
+                    fn mask_and(self, a: v128, b: v128) -> v128 {
+                        v128_and(a, b)
+                    }
+                    #[inline(always)]
+                    fn mask_or(self, a: v128, b: v128) -> v128 {
+                        v128_or(a, b)
+                    }
+                    #[inline(always)]
+                    fn mask_not(self, a: v128) -> v128 {
+                        v128_not(a)
+                    }
+                    #[inline(always)]
+                    fn select(self, m: v128, a: v128, b: v128) -> v128 {
+                        v128_bitselect(a, b, m)
+                    }
+                    #[inline(always)]
+                    fn any(self, m: v128) -> bool {
+                        v128_any_true(m)
+                    }
+                    #[inline(always)]
+                    fn all(self, m: v128) -> bool {
+                        i32x4_all_true(m)
+                    }
+                    #[inline(always)]
+                    fn mask_bitmask(self, m: v128) -> u32 {
+                        i32x4_bitmask(m) as u32
+                    }
+                    #[inline(always)]
+                    fn reduce_sum(self, v: v128) -> $t {
+                        let mut b = [0u32; 4];
+                        unsafe { v128_store(b.as_mut_ptr() as *mut v128, v) };
+                        b.iter().fold(0 as $t, |acc, &x| acc.wrapping_add(x as $t))
+                    }
+                    #[inline(always)]
+                    fn reduce_min(self, v: v128) -> $t {
+                        let mut b = [0u32; 4];
+                        unsafe { v128_store(b.as_mut_ptr() as *mut v128, v) };
+                        b.iter().map(|&x| x as $t).min().unwrap()
+                    }
+                    #[inline(always)]
+                    fn reduce_max(self, v: v128) -> $t {
+                        let mut b = [0u32; 4];
+                        unsafe { v128_store(b.as_mut_ptr() as *mut v128, v) };
+                        b.iter().map(|&x| x as $t).max().unwrap()
+                    }
+                    #[inline(always)]
+                    fn shl(self, a: v128, k: u32) -> v128 {
+                        debug_assert!(k < 32);
+                        i32x4_shl(a, k)
+                    }
+                    #[inline(always)]
+                    fn shr(self, a: v128, k: u32) -> v128 {
+                        debug_assert!(k < 32);
+                        $shr(a, k)
+                    }
+                    #[inline(always)]
+                    fn bit_and(self, a: v128, b: v128) -> v128 {
+                        v128_and(a, b)
+                    }
+                    #[inline(always)]
+                    fn bit_or(self, a: v128, b: v128) -> v128 {
+                        v128_or(a, b)
+                    }
+                    #[inline(always)]
+                    fn bit_xor(self, a: v128, b: v128) -> v128 {
+                        v128_xor(a, b)
+                    }
+                    #[inline(always)]
+                    fn bit_not(self, a: v128) -> v128 {
+                        v128_not(a)
+                    }
+
+                    type IVector = v128;
+                    #[inline(always)]
+                    fn iload(self, s: &[u32]) -> v128 {
+                        debug_assert_eq!(s.len(), 4);
+                        unsafe { v128_load(s.as_ptr() as *const v128) }
+                    }
+                    #[inline(always)]
+                    fn istore(self, v: v128, out: &mut [u32]) {
+                        debug_assert_eq!(out.len(), 4);
+                        unsafe { v128_store(out.as_mut_ptr() as *mut v128, v) }
+                    }
+                    #[inline(always)]
+                    fn to_bits(self, v: v128) -> v128 {
+                        v
+                    }
+                    #[inline(always)]
+                    fn from_bits(self, v: v128) -> v128 {
+                        v
+                    }
+                }
+            };
+        }
+
+        wasm_int_backend!(u32, u32x4_le, u32x4_lt, u32x4_ge, u32x4_gt, u32x4_min, u32x4_max, |a| a, u32x4_shr);
+        wasm_int_backend!(i32, i32x4_le, i32x4_lt, i32x4_ge, i32x4_gt, i32x4_min, i32x4_max, |a| i32x4_abs(a), i32x4_shr);
+
     };
 }
 

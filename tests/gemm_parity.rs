@@ -1,12 +1,12 @@
-use hydroplane::{Layout, MatrixBackend, MatrixKernel, Scalar, Gang, dispatch_matrix, run_matrix_scalar};
+use hydroplane::{FloatScalar, Layout, MatrixBackend, MatrixKernel, Scalar, Gang, dispatch_matrix, run_matrix_scalar};
 
-struct Gemm<'a, T: Scalar, const M: usize, const N: usize, const K: usize> {
+struct Gemm<'a, T: FloatScalar, const M: usize, const N: usize, const K: usize> {
     a: &'a [T],
     b: &'a [T],
     out: &'a mut [T::Compute],
 }
 
-impl<T: Scalar, const M: usize, const N: usize, const K: usize> MatrixKernel<T>
+impl<T: FloatScalar, const M: usize, const N: usize, const K: usize> MatrixKernel<T>
     for Gemm<'_, T, M, N, K>
 {
     type Output = ();
@@ -20,7 +20,7 @@ impl<T: Scalar, const M: usize, const N: usize, const K: usize> MatrixKernel<T>
 }
 
 /// Naive reference `D = A·B`, accumulating in the compute precision exactly as the backend does.
-fn reference<T: Scalar>(a: &[T], b: &[T], m: usize, n: usize, k: usize) -> Vec<T::Compute> {
+fn reference<T: FloatScalar>(a: &[T], b: &[T], m: usize, n: usize, k: usize) -> Vec<T::Compute> {
     let mut out = vec![<T::Compute as Scalar>::ZERO; m * n];
     for i in 0..m {
         for j in 0..n {

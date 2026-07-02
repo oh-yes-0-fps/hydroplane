@@ -1,4 +1,4 @@
-use hydroplane::{Backend, Gang, Kernel, Scalar, SimdDispatch, dispatch, run_scalar};
+use hydroplane::{FloatScalar, Backend, Gang, Kernel, SimdDispatch, dispatch, run_scalar};
 
 struct Out<T> {
     map: Vec<T>,
@@ -16,13 +16,13 @@ struct Out<T> {
     norm: f64,
 }
 
-struct Helpers<'a, T: Scalar> {
+struct Helpers<'a, T: FloatScalar> {
     a: &'a [T],
     b: &'a [T],
     c: &'a [T],
 }
 
-impl<T: Scalar> Kernel<T> for Helpers<'_, T> {
+impl<T: FloatScalar> Kernel<T> for Helpers<'_, T> {
     type Output = Out<T>;
     fn run<S: Backend<T>>(self, g: Gang<T, S>) -> Out<T> {
         let (a, b, c) = (self.a, self.b, self.c);
@@ -89,7 +89,7 @@ fn close(got: f64, want: f64) -> bool {
     (got - want).abs() <= 1e-3 * (1.0 + want.abs())
 }
 
-fn check_all<T: Scalar + SimdDispatch>() {
+fn check_all<T: FloatScalar + SimdDispatch>() {
     for &n in SIZES {
         let a: Vec<T> = (0..n)
             .map(|i| T::from_f64((i % 13) as f64 * 0.5 - 2.0))
@@ -191,12 +191,12 @@ fn helpers_match_oracle_f64() {
     check_all::<f64>();
 }
 
-struct MaskAbs<'a, T: Scalar> {
+struct MaskAbs<'a, T: FloatScalar> {
     a: &'a [T],
     cnt: usize,
 }
 
-impl<T: Scalar> Kernel<T> for MaskAbs<'_, T> {
+impl<T: FloatScalar> Kernel<T> for MaskAbs<'_, T> {
     type Output = (Vec<T>, usize, Vec<T>);
     fn run<S: Backend<T>>(self, g: Gang<T, S>) -> (Vec<T>, usize, Vec<T>) {
         let lanes = g.lanes();
@@ -211,7 +211,7 @@ impl<T: Scalar> Kernel<T> for MaskAbs<'_, T> {
     }
 }
 
-fn check_mask_abs<T: Scalar + SimdDispatch>() {
+fn check_mask_abs<T: FloatScalar + SimdDispatch>() {
     for &cnt in &[0usize, 1, 2, 5, 8, 100] {
         for &n in SIZES {
             let a: Vec<T> = (0..n)

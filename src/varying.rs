@@ -19,7 +19,7 @@ use core::mem::MaybeUninit;
 use core::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
 use crate::backend::Backend;
-use crate::scalar::Scalar;
+use crate::scalar::{FloatScalar, IntScalar, Scalar};
 
 /// The unroll factor `build.rs` resolved for a `static_dispatch` + pinned-cpu build (the
 /// `hp_resolved_unroll` cfg). `HP_STATIC_UNROLL` is the decimal `K`; if it is somehow unset under the
@@ -1299,7 +1299,10 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
     /// per-core ILP unroll, the `0` identity, both masked-tail fills and the chain combine all come for
     /// free; the walk is bounded by the shorter column.
     #[inline]
-    pub fn dot(self, a: &[T], b: &[T]) -> T {
+    pub fn dot(self, a: &[T], b: &[T]) -> T
+    where
+        T: FloatScalar,
+    {
         self.zip_sum(a, b, |acc, x, y| x.fma(y, acc))
     }
 
@@ -1307,13 +1310,19 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
     /// it to [`norm`](Self::norm) when the squared magnitude is enough (a distance comparison), to skip
     /// the `sqrt`.
     #[inline]
-    pub fn norm_sq(self, a: &[T]) -> T {
+    pub fn norm_sq(self, a: &[T]) -> T
+    where
+        T: FloatScalar,
+    {
         self.sum(a, |acc, x| x.fma(x, acc))
     }
 
     /// L2 norm `√(Σ a[i]²)` — [`norm_sq`](Self::norm_sq) and a single scalar `sqrt`.
     #[inline]
-    pub fn norm(self, a: &[T]) -> T {
+    pub fn norm(self, a: &[T]) -> T
+    where
+        T: FloatScalar,
+    {
         self.norm_sq(a).sqrt()
     }
 
@@ -1393,7 +1402,7 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
                             zero,
                             zero,
                             init,
-                            |acc, x, y| x.fma(y, acc),
+                            |acc, x, y| x.madd(y, acc),
                             |p, q| p + q,
                         );
                         sink += r.reduce_sum().into_f64();
@@ -1555,12 +1564,18 @@ impl<T: Scalar, S: Backend<T>> Varying<T, S> {
     }
 
     #[inline(always)]
-    pub fn sqrt(self) -> Self {
+    pub fn sqrt(self) -> Self
+    where
+        T: FloatScalar,
+    {
         Self::wrap(self.backend, self.backend.sqrt(self.v))
     }
     /// Lane-wise reciprocal `1/self`, full-precision (an IEEE divide, not a fast `rcp` estimate).
     #[inline(always)]
-    pub fn recip(self) -> Self {
+    pub fn recip(self) -> Self
+    where
+        T: FloatScalar,
+    {
         let one = self.backend.splat(T::ONE);
         Self::wrap(self.backend, self.backend.div(one, self.v))
     }
@@ -1593,8 +1608,18 @@ impl<T: Scalar, S: Backend<T>> Varying<T, S> {
     }
     /// `self * b + c`, fused where the backend supports it.
     #[inline(always)]
-    pub fn fma(self, b: Self, c: Self) -> Self {
+    pub fn fma(self, b: Self, c: Self) -> Self
+    where
+        T: FloatScalar,
+    {
         Self::wrap(self.backend, self.backend.fma(self.v, b.v, c.v))
+    }
+
+    /// `self * b + acc` for any element family — fused on the float backends (identical to
+    /// [`fma`](Self::fma) there), wrapping two-op multiply-add on the integer elements.
+    #[inline(always)]
+    pub fn madd(self, b: Self, acc: Self) -> Self {
+        Self::wrap(self.backend, self.backend.madd(self.v, b.v, acc.v))
     }
 
     /// Each lane's bit pattern as an integer-companion lane — free on backends whose integer
@@ -1660,7 +1685,13 @@ macro_rules! lane_binop {
 lane_binop!(Add, add, add);
 lane_binop!(Sub, sub, sub);
 lane_binop!(Mul, mul, mul);
-lane_binop!(Div, div, div);
+impl<T: FloatScalar, S: Backend<T>> Div for Varying<T, S> {
+    type Output = Varying<T, S>;
+    #[inline(always)]
+    fn div(self, rhs: Self) -> Self {
+        Varying::wrap(self.backend, self.backend.div(self.v, rhs.v))
+    }
+}
 
 impl<T: Scalar, S: Backend<T>> Neg for Varying<T, S> {
     type Output = Varying<T, S>;
@@ -1688,7 +1719,59 @@ macro_rules! varying_scalar_binop {
 varying_scalar_binop!(Add, add, add);
 varying_scalar_binop!(Sub, sub, sub);
 varying_scalar_binop!(Mul, mul, mul);
-varying_scalar_binop!(Div, div, div);
+impl<T: FloatScalar, S: Backend<T>> Div<T> for Varying<T, S> {
+    type Output = Varying<T, S>;
+    #[inline(always)]
+    fn div(self, rhs: T) -> Self {
+        let r = self.backend.splat(rhs);
+        Varying::wrap(self.backend, self.backend.div(self.v, r))
+    }
+}
+
+/// Integer-element lane-wise shift by a uniform count (`k < 32`); `>>` is element-appropriate —
+/// logical for `u32`, arithmetic for `i32`.
+impl<T: IntScalar, S: Backend<T>> core::ops::Shl<u32> for Varying<T, S> {
+    type Output = Varying<T, S>;
+    #[inline(always)]
+    fn shl(self, k: u32) -> Self {
+        Varying::wrap(self.backend, self.backend.shl(self.v, k))
+    }
+}
+impl<T: IntScalar, S: Backend<T>> core::ops::Shr<u32> for Varying<T, S> {
+    type Output = Varying<T, S>;
+    #[inline(always)]
+    fn shr(self, k: u32) -> Self {
+        Varying::wrap(self.backend, self.backend.shr(self.v, k))
+    }
+}
+impl<T: IntScalar, S: Backend<T>> BitAnd for Varying<T, S> {
+    type Output = Varying<T, S>;
+    #[inline(always)]
+    fn bitand(self, rhs: Self) -> Self {
+        Varying::wrap(self.backend, self.backend.bit_and(self.v, rhs.v))
+    }
+}
+impl<T: IntScalar, S: Backend<T>> BitOr for Varying<T, S> {
+    type Output = Varying<T, S>;
+    #[inline(always)]
+    fn bitor(self, rhs: Self) -> Self {
+        Varying::wrap(self.backend, self.backend.bit_or(self.v, rhs.v))
+    }
+}
+impl<T: IntScalar, S: Backend<T>> BitXor for Varying<T, S> {
+    type Output = Varying<T, S>;
+    #[inline(always)]
+    fn bitxor(self, rhs: Self) -> Self {
+        Varying::wrap(self.backend, self.backend.bit_xor(self.v, rhs.v))
+    }
+}
+impl<T: IntScalar, S: Backend<T>> Not for Varying<T, S> {
+    type Output = Varying<T, S>;
+    #[inline(always)]
+    fn not(self) -> Self {
+        Varying::wrap(self.backend, self.backend.bit_not(self.v))
+    }
+}
 
 /// A varying boolean mask companion to [`Varying`].
 #[derive(Clone, Copy)]

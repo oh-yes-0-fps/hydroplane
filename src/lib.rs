@@ -59,7 +59,7 @@ pub use matrix::{
     Accumulator, Layout, MatrixA, MatrixB, MatrixBackend, MatrixDispatch, MatrixKernel, Role, Tile,
     Tiles, dispatch_matrix, run_matrix_scalar,
 };
-pub use scalar::Scalar;
+pub use scalar::{FloatScalar, IntScalar, Scalar};
 pub use varying::{ChunksExact, Varying, VaryingI32, VaryingU32, Mask, Gang};
 
 /// The `#[kernel]` attribute: write a [`Kernel`]/[`MatrixKernel`] as a plain generic function.
@@ -120,7 +120,7 @@ mod tests {
         }
         // scalar tail
         while i < xs.len() {
-            if xs[i] <= r && -xs[i] <= r {
+            if xs[i] <= r && xs[i].neg() <= r {
                 return true;
             }
             i += 1;

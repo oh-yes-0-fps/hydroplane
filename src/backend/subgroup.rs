@@ -250,7 +250,11 @@ mod device {
                 fn fma(self, a: $ty, b: $ty, c: $ty) -> $ty {
                     gpu_fma(a, b, c)
                 }
-                #[inline]
+                            #[inline(always)]
+                fn madd(self, a: $ty, b: $ty, acc: $ty) -> $ty {
+                    <Self as Backend<$ty>>::fma(self, a, b, acc)
+                }
+    #[inline]
                 fn sqrt(self, a: $ty) -> $ty {
                     gpu_sqrt(a)
                 }
@@ -411,7 +415,11 @@ mod device {
                 fn fma(self, a: f32, b: f32, c: f32) -> f32 {
                     gpu_fma(a, b, c)
                 }
-                #[inline]
+                            #[inline(always)]
+                fn madd(self, a: f32, b: f32, acc: f32) -> f32 {
+                    <Self as Backend<$ty>>::fma(self, a, b, acc)
+                }
+    #[inline]
                 fn sqrt(self, a: f32) -> f32 {
                     gpu_sqrt(a)
                 }

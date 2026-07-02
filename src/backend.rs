@@ -9,7 +9,7 @@
 //! float-agnosticism and the portability come from the same place. The lane count is a
 //! `fn` (not a `const`) because the GPU subgroup backend only learns it at runtime.
 
-use crate::scalar::Scalar;
+use crate::scalar::{FloatScalar, IntScalar, Scalar};
 
 /// An instruction-set execution context for scalar `T`. Implemented by [`ScalarBackend`]
 /// (every `T`) and, per `(ISA, scalar)`, by the hand-rolled `core::arch` backends.
@@ -39,10 +39,90 @@ pub trait Backend<T: Scalar>: Copy {
     fn add(self, a: Self::Vector, b: Self::Vector) -> Self::Vector;
     fn sub(self, a: Self::Vector, b: Self::Vector) -> Self::Vector;
     fn mul(self, a: Self::Vector, b: Self::Vector) -> Self::Vector;
-    fn div(self, a: Self::Vector, b: Self::Vector) -> Self::Vector;
+    /// Negation: IEEE sign flip for the float elements, wrapping for the integer elements.
     fn neg(self, a: Self::Vector) -> Self::Vector;
-    fn fma(self, a: Self::Vector, b: Self::Vector, c: Self::Vector) -> Self::Vector;
-    fn sqrt(self, a: Self::Vector) -> Self::Vector;
+
+    /// Float-family only (`where T: FloatScalar` makes calls with an integer element a compile
+    /// error, so the defaults below are statically unreachable — float backends override them,
+    /// integer impls never mention them).
+    #[inline]
+    fn div(self, _a: Self::Vector, _b: Self::Vector) -> Self::Vector
+    where
+        T: FloatScalar,
+    {
+        unreachable!("`div` is implemented by every float backend")
+    }
+    #[inline]
+    fn fma(self, _a: Self::Vector, _b: Self::Vector, _c: Self::Vector) -> Self::Vector
+    where
+        T: FloatScalar,
+    {
+        unreachable!("`fma` is implemented by every float backend")
+    }
+    #[inline]
+    fn sqrt(self, _a: Self::Vector) -> Self::Vector
+    where
+        T: FloatScalar,
+    {
+        unreachable!("`sqrt` is implemented by every float backend")
+    }
+
+    /// `a*b + acc` with the element family's natural fusion: the float backends override this
+    /// with their fused `fma`, integer elements and the portable default use the two-op
+    /// multiply-add (wrapping for ints). Family-neutral — it exists so shared machinery (the
+    /// runtime unroll sweep, generic reduction steps) can probe/feed the multiply-add pipes
+    /// without a `FloatScalar` bound.
+    #[inline]
+    fn madd(self, a: Self::Vector, b: Self::Vector, acc: Self::Vector) -> Self::Vector {
+        self.add(self.mul(a, b), acc)
+    }
+
+    /// Integer-family only: lane-wise shift by a uniform count (`k < 32`). `shr` is
+    /// element-appropriate — logical (zero-filling) for `u32`, arithmetic (sign-filling) for
+    /// `i32`. Statically unreachable defaults, same scheme as `div`.
+    #[inline]
+    fn shl(self, _a: Self::Vector, _k: u32) -> Self::Vector
+    where
+        T: IntScalar,
+    {
+        unreachable!("`shl` is implemented by every integer backend")
+    }
+    #[inline]
+    fn shr(self, _a: Self::Vector, _k: u32) -> Self::Vector
+    where
+        T: IntScalar,
+    {
+        unreachable!("`shr` is implemented by every integer backend")
+    }
+    /// Integer-family lane-wise bitwise ops.
+    #[inline]
+    fn bit_and(self, _a: Self::Vector, _b: Self::Vector) -> Self::Vector
+    where
+        T: IntScalar,
+    {
+        unreachable!("`bit_and` is implemented by every integer backend")
+    }
+    #[inline]
+    fn bit_or(self, _a: Self::Vector, _b: Self::Vector) -> Self::Vector
+    where
+        T: IntScalar,
+    {
+        unreachable!("`bit_or` is implemented by every integer backend")
+    }
+    #[inline]
+    fn bit_xor(self, _a: Self::Vector, _b: Self::Vector) -> Self::Vector
+    where
+        T: IntScalar,
+    {
+        unreachable!("`bit_xor` is implemented by every integer backend")
+    }
+    #[inline]
+    fn bit_not(self, _a: Self::Vector) -> Self::Vector
+    where
+        T: IntScalar,
+    {
+        unreachable!("`bit_not` is implemented by every integer backend")
+    }
     /// Absolute value. The default is `max(a, -a)` (two ops); a backend overrides it with a single
     /// dedicated instruction (NEON `fabs`, wasm `f*.abs`, AVX-512 `vabs`) or a sign-bit clear
     /// (x86 `andps` with the `0x7FFF…` mask).
@@ -337,57 +417,95 @@ impl<T: Scalar> Backend<T> for ScalarBackend {
     }
     #[inline(always)]
     fn add(self, a: T, b: T) -> T {
-        a + b
+        a.wadd(b)
     }
     #[inline(always)]
     fn sub(self, a: T, b: T) -> T {
-        a - b
+        a.wsub(b)
     }
     #[inline(always)]
     fn mul(self, a: T, b: T) -> T {
-        a * b
+        a.wmul(b)
     }
     #[inline(always)]
-    fn div(self, a: T, b: T) -> T {
+    fn div(self, a: T, b: T) -> T
+    where
+        T: FloatScalar,
+    {
         a / b
     }
     #[inline(always)]
     fn neg(self, a: T) -> T {
-        -a
+        a.neg()
     }
     #[inline(always)]
-    fn fma(self, a: T, b: T, c: T) -> T {
+    fn abs(self, a: T) -> T {
+        a.abs()
+    }
+    #[inline(always)]
+    fn fma(self, a: T, b: T, c: T) -> T
+    where
+        T: FloatScalar,
+    {
         a.fma(b, c)
     }
     #[inline(always)]
-    fn sqrt(self, a: T) -> T {
+    fn sqrt(self, a: T) -> T
+    where
+        T: FloatScalar,
+    {
         a.sqrt()
     }
     #[inline(always)]
+    fn shl(self, a: T, k: u32) -> T
+    where
+        T: IntScalar,
+    {
+        a.unsigned_shl(k)
+    }
+    #[inline(always)]
+    fn shr(self, a: T, k: u32) -> T
+    where
+        T: IntScalar,
+    {
+        a >> (k as usize)
+    }
+    #[inline(always)]
+    fn bit_and(self, a: T, b: T) -> T
+    where
+        T: IntScalar,
+    {
+        a & b
+    }
+    #[inline(always)]
+    fn bit_or(self, a: T, b: T) -> T
+    where
+        T: IntScalar,
+    {
+        a | b
+    }
+    #[inline(always)]
+    fn bit_xor(self, a: T, b: T) -> T
+    where
+        T: IntScalar,
+    {
+        a ^ b
+    }
+    #[inline(always)]
+    fn bit_not(self, a: T) -> T
+    where
+        T: IntScalar,
+    {
+        !a
+    }
+    #[inline(always)]
     fn min(self, a: T, b: T) -> T {
-        // Explicit minimumNumber, so the oracle's NaN contract can't drift with a scalar type's
-        // own `FloatCore::min` (half's, in particular).
-        if a.is_nan() {
-            b
-        } else if b.is_nan() {
-            a
-        } else if b < a {
-            b
-        } else {
-            a
-        }
+        // `Scalar::min` is the family-correct oracle: minimumNumber for floats, `Ord` for ints.
+        a.min(b)
     }
     #[inline(always)]
     fn max(self, a: T, b: T) -> T {
-        if a.is_nan() {
-            b
-        } else if b.is_nan() {
-            a
-        } else if b > a {
-            b
-        } else {
-            a
-        }
+        a.max(b)
     }
     #[inline(always)]
     fn le(self, a: T, b: T) -> bool {
@@ -502,7 +620,10 @@ impl<T: Scalar, B: Backend<T>, const K: usize> Backend<T> for Unroll<B, K> {
         self.0.mul(a, b)
     }
     #[inline(always)]
-    fn div(self, a: Self::Vector, b: Self::Vector) -> Self::Vector {
+    fn div(self, a: Self::Vector, b: Self::Vector) -> Self::Vector
+    where
+        T: FloatScalar,
+    {
         self.0.div(a, b)
     }
     #[inline(always)]
@@ -510,12 +631,64 @@ impl<T: Scalar, B: Backend<T>, const K: usize> Backend<T> for Unroll<B, K> {
         self.0.neg(a)
     }
     #[inline(always)]
-    fn fma(self, a: Self::Vector, b: Self::Vector, c: Self::Vector) -> Self::Vector {
+    fn fma(self, a: Self::Vector, b: Self::Vector, c: Self::Vector) -> Self::Vector
+    where
+        T: FloatScalar,
+    {
         self.0.fma(a, b, c)
     }
     #[inline(always)]
-    fn sqrt(self, a: Self::Vector) -> Self::Vector {
+    fn sqrt(self, a: Self::Vector) -> Self::Vector
+    where
+        T: FloatScalar,
+    {
         self.0.sqrt(a)
+    }
+    #[inline(always)]
+    fn madd(self, a: Self::Vector, b: Self::Vector, acc: Self::Vector) -> Self::Vector {
+        self.0.madd(a, b, acc)
+    }
+    #[inline(always)]
+    fn shl(self, a: Self::Vector, k: u32) -> Self::Vector
+    where
+        T: IntScalar,
+    {
+        self.0.shl(a, k)
+    }
+    #[inline(always)]
+    fn shr(self, a: Self::Vector, k: u32) -> Self::Vector
+    where
+        T: IntScalar,
+    {
+        self.0.shr(a, k)
+    }
+    #[inline(always)]
+    fn bit_and(self, a: Self::Vector, b: Self::Vector) -> Self::Vector
+    where
+        T: IntScalar,
+    {
+        self.0.bit_and(a, b)
+    }
+    #[inline(always)]
+    fn bit_or(self, a: Self::Vector, b: Self::Vector) -> Self::Vector
+    where
+        T: IntScalar,
+    {
+        self.0.bit_or(a, b)
+    }
+    #[inline(always)]
+    fn bit_xor(self, a: Self::Vector, b: Self::Vector) -> Self::Vector
+    where
+        T: IntScalar,
+    {
+        self.0.bit_xor(a, b)
+    }
+    #[inline(always)]
+    fn bit_not(self, a: Self::Vector) -> Self::Vector
+    where
+        T: IntScalar,
+    {
+        self.0.bit_not(a)
     }
     #[inline(always)]
     fn abs(self, a: Self::Vector) -> Self::Vector {

@@ -120,6 +120,10 @@ impl Backend<f32> for Avx1 {
         unsafe { f32_fma(a, b, c) }
     }
     #[inline(always)]
+    fn madd(self, a: __m256, b: __m256, acc: __m256) -> __m256 {
+        <Self as Backend<f32>>::fma(self, a, b, acc)
+    }
+    #[inline(always)]
     fn sqrt(self, a: __m256) -> __m256 {
         unsafe { f32_sqrt(a) }
     }
@@ -382,6 +386,10 @@ impl Backend<f64> for Avx1 {
     #[inline(always)]
     fn fma(self, a: __m256d, b: __m256d, c: __m256d) -> __m256d {
         unsafe { f64_fma(a, b, c) }
+    }
+    #[inline(always)]
+    fn madd(self, a: __m256d, b: __m256d, acc: __m256d) -> __m256d {
+        <Self as Backend<f64>>::fma(self, a, b, acc)
     }
     #[inline(always)]
     fn sqrt(self, a: __m256d) -> __m256d {

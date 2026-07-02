@@ -96,7 +96,11 @@ macro_rules! impl_sve_backend {
             fn fma(self, a: SveVec<C>, b: SveVec<C>, c: SveVec<C>) -> SveVec<C> {
                 unsafe { sve1::$fma::<C>(&a, &b, &c) }
             }
-            #[inline(always)]
+                    #[inline(always)]
+            fn madd(self, a: SveVec<C>, b: SveVec<C>, acc: SveVec<C>) -> SveVec<C> {
+                <Self as Backend<$t>>::fma(self, a, b, acc)
+            }
+    #[inline(always)]
             fn sqrt(self, a: SveVec<C>) -> SveVec<C> {
                 unsafe { sve1::$sqrt::<C>(&a) }
             }

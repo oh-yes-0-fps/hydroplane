@@ -107,6 +107,10 @@ impl Backend<Half> for Avx512Fp16 {
         unsafe { p::fma(a, b, c) }
     }
     #[inline(always)]
+    fn madd(self, a: __m512i, b: __m512i, acc: __m512i) -> __m512i {
+        <Self as Backend<Half>>::fma(self, a, b, acc)
+    }
+    #[inline(always)]
     fn sqrt(self, a: __m512i) -> __m512i {
         unsafe { p::sqrt(a) }
     }

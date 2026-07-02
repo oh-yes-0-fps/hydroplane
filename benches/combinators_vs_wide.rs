@@ -150,12 +150,12 @@ fn gather_count_sentinel_hp<'a>(ctx: Gang<f32>, pts: &'a [[f32; 4]], q: [f32; 4]
     let [cx, cy, cz, sr] = ctx.splat_n(q);
     let (one, zero) = (ctx.splat(1.0), ctx.splat(0.0));
     let mut acc = zero;
-    for (off, cnt) in ctx.chunks(pts.len()) {
+    ctx.for_each_chunk(pts.len(), |off, cnt| {
         let [x, y, z, r] = ctx.gather_n(&pts[off..off + cnt], [0.0, 0.0, 0.0, f32::NAN], |p| *p);
         let (dx, dy, dz) = (cx - x, cy - y, cz - z);
         let rsum = sr + r;
         acc = acc + one.select((dx * dx + dy * dy + dz * dz).le(rsum * rsum), zero);
-    }
+    });
     acc.reduce_sum() as usize
 }
 

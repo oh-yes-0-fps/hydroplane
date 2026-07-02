@@ -63,7 +63,7 @@ impl<T: Scalar> Kernel<T> for Helpers<'_, T> {
                 |acc, x, y, z| acc + x * y + z,
             )
             .reduce_sum()
-            .to_f64();
+            .into_f64();
 
         Out {
             map,
@@ -75,10 +75,10 @@ impl<T: Scalar> Kernel<T> for Helpers<'_, T> {
             any_n,
             all_n,
             zip3,
-            total: g.total(a).to_f64(),
-            dot: g.dot(a, b).to_f64(),
-            norm_sq: g.norm_sq(a).to_f64(),
-            norm: g.norm(a).to_f64(),
+            total: g.total(a).into_f64(),
+            dot: g.dot(a, b).into_f64(),
+            norm_sq: g.norm_sq(a).into_f64(),
+            norm: g.norm(a).into_f64(),
         }
     }
 }
@@ -101,27 +101,27 @@ fn check_all<T: Scalar + SimdDispatch>() {
             .map(|i| T::from_f64((i % 5) as f64 * 0.25 - 0.5))
             .collect();
 
-        let map_want: Vec<f64> = a.iter().map(|&x| 2.0 * x.to_f64() + 1.0).collect();
+        let map_want: Vec<f64> = a.iter().map(|&x| 2.0 * x.into_f64() + 1.0).collect();
         let zip_map_want: Vec<f64> = a
             .iter()
             .zip(&b)
-            .map(|(&x, &y)| x.to_f64() * y.to_f64())
+            .map(|(&x, &y)| x.into_f64() * y.into_f64())
             .collect();
-        let any_want = a.iter().any(|&x| x.to_f64() > 3.0);
-        let all_want = a.iter().all(|&x| x.to_f64() < 3.0);
-        let zip_any_want = a.iter().zip(&b).any(|(&x, &y)| x.to_f64() > y.to_f64());
-        let zip_all_want = a.iter().zip(&b).all(|(&x, &y)| x.to_f64() <= y.to_f64());
-        let any_n_want = (0..n).any(|i| a[i].to_f64() + b[i].to_f64() + c[i].to_f64() > 3.0);
-        let all_n_want = (0..n).all(|i| a[i].to_f64() + b[i].to_f64() + c[i].to_f64() < 10.0);
+        let any_want = a.iter().any(|&x| x.into_f64() > 3.0);
+        let all_want = a.iter().all(|&x| x.into_f64() < 3.0);
+        let zip_any_want = a.iter().zip(&b).any(|(&x, &y)| x.into_f64() > y.into_f64());
+        let zip_all_want = a.iter().zip(&b).all(|(&x, &y)| x.into_f64() <= y.into_f64());
+        let any_n_want = (0..n).any(|i| a[i].into_f64() + b[i].into_f64() + c[i].into_f64() > 3.0);
+        let all_n_want = (0..n).all(|i| a[i].into_f64() + b[i].into_f64() + c[i].into_f64() < 10.0);
         let zip3_want: f64 = a
             .iter()
             .zip(&b)
             .zip(&c)
-            .map(|((&x, &y), &z)| x.to_f64() * y.to_f64() + z.to_f64())
+            .map(|((&x, &y), &z)| x.into_f64() * y.into_f64() + z.into_f64())
             .sum();
-        let total_want: f64 = a.iter().map(|&x| x.to_f64()).sum();
-        let dot_want: f64 = a.iter().zip(&b).map(|(&x, &y)| x.to_f64() * y.to_f64()).sum();
-        let norm_sq_want: f64 = a.iter().map(|&x| x.to_f64() * x.to_f64()).sum();
+        let total_want: f64 = a.iter().map(|&x| x.into_f64()).sum();
+        let dot_want: f64 = a.iter().zip(&b).map(|(&x, &y)| x.into_f64() * y.into_f64()).sum();
+        let norm_sq_want: f64 = a.iter().map(|&x| x.into_f64() * x.into_f64()).sum();
         let norm_want = norm_sq_want.sqrt();
 
         for (label, out) in [
@@ -131,18 +131,18 @@ fn check_all<T: Scalar + SimdDispatch>() {
             assert_eq!(out.map.len(), map_want.len(), "{label} map len n={n}");
             for (i, &got) in out.map.iter().enumerate() {
                 assert!(
-                    close(got.to_f64(), map_want[i]),
+                    close(got.into_f64(), map_want[i]),
                     "{label} map mismatch n={n} i={i}: got {}, want {}",
-                    got.to_f64(),
+                    got.into_f64(),
                     map_want[i]
                 );
             }
             assert_eq!(out.zip_map.len(), zip_map_want.len(), "{label} zip_map len n={n}");
             for (i, &got) in out.zip_map.iter().enumerate() {
                 assert!(
-                    close(got.to_f64(), zip_map_want[i]),
+                    close(got.into_f64(), zip_map_want[i]),
                     "{label} zip_map mismatch n={n} i={i}: got {}, want {}",
-                    got.to_f64(),
+                    got.into_f64(),
                     zip_map_want[i]
                 );
             }
@@ -223,11 +223,11 @@ fn check_mask_abs<T: Scalar + SimdDispatch>() {
             ] {
                 for (i, f) in flags.iter().enumerate() {
                     let want = if i < active { 1.0 } else { 0.0 };
-                    assert_eq!(f.to_f64(), want, "{label} active_mask cnt={cnt} lane={i}");
+                    assert_eq!(f.into_f64(), want, "{label} active_mask cnt={cnt} lane={i}");
                 }
                 assert_eq!(absv.len(), a.len());
                 for (i, got) in absv.iter().enumerate() {
-                    assert_eq!(got.to_f64(), a[i].to_f64().abs(), "{label} abs n={n} i={i}");
+                    assert_eq!(got.into_f64(), a[i].into_f64().abs(), "{label} abs n={n} i={i}");
                 }
             }
         }
@@ -242,4 +242,65 @@ fn mask_abs_match_oracle_f32() {
 #[test]
 fn mask_abs_match_oracle_f64() {
     check_mask_abs::<f64>();
+}
+
+/// `chunks_exact` must tile exactly the full-register prefix in order, and `remainder`
+/// (both the `Gang` method and the iterator's) must describe precisely the leftover tail.
+struct ExactCovers {
+    len: usize,
+}
+
+impl Kernel<f32> for ExactCovers {
+    type Output = bool;
+    fn run<S: Backend<f32>>(self, g: Gang<f32, S>) -> bool {
+        let n = g.lanes();
+        let len = self.len;
+        let it = g.chunks_exact(len);
+        if it.remainder() != g.remainder(len) {
+            return false;
+        }
+        let mut expect = 0usize;
+        for off in it {
+            if off != expect {
+                return false;
+            }
+            expect += n;
+        }
+        match g.remainder(len) {
+            Some((off, cnt)) => off == expect && cnt > 0 && cnt < n && off + cnt == len,
+            None => expect == len,
+        }
+    }
+}
+
+struct SumExact<'a> {
+    xs: &'a [f32],
+}
+
+impl Kernel<f32> for SumExact<'_> {
+    type Output = f32;
+    fn run<S: Backend<f32>>(self, g: Gang<f32, S>) -> f32 {
+        let n = g.lanes();
+        let mut acc = g.splat(0.0);
+        for off in g.chunks_exact(self.xs.len()) {
+            acc = acc + g.load(&self.xs[off..off + n]);
+        }
+        if let Some((off, cnt)) = g.remainder(self.xs.len()) {
+            acc = acc + g.load_partial(&self.xs[off..off + cnt], 0.0);
+        }
+        acc.reduce_sum()
+    }
+}
+
+#[test]
+fn chunks_exact_and_remainder() {
+    for len in [0usize, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 1000, 1003] {
+        assert!(dispatch(ExactCovers { len }), "decomposition wrong at len={len}");
+        assert!(run_scalar(ExactCovers { len }), "scalar decomposition wrong at len={len}");
+
+        let xs: Vec<f32> = (0..len).map(|i| (i as f32 % 9.0) - 4.0).collect();
+        let want: f32 = xs.iter().sum();
+        let got = dispatch(SumExact { xs: &xs });
+        assert!((got - want).abs() <= 1e-3 * (1.0 + want.abs()), "sum wrong at len={len}: {got} vs {want}");
+    }
 }

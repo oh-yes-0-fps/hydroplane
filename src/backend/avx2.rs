@@ -60,6 +60,89 @@ impl Backend<f32> for Avx2 {
     type Vector = __m256;
     type Mask = __m256;
 
+    type IVector = __m256i;
+    #[inline(always)]
+    fn iload(self, s: &[u32]) -> __m256i {
+        debug_assert_eq!(s.len(), 8);
+        unsafe { yi_load(s.as_ptr()) }
+    }
+    #[inline(always)]
+    fn istore(self, v: __m256i, out: &mut [u32]) {
+        debug_assert_eq!(out.len(), 8);
+        unsafe { yi_store(out.as_mut_ptr(), v) }
+    }
+    #[inline(always)]
+    fn isplat(self, v: u32) -> __m256i {
+        unsafe { yi_splat(v) }
+    }
+    #[inline(always)]
+    fn iadd(self, a: __m256i, b: __m256i) -> __m256i {
+        unsafe { yi_add(a, b) }
+    }
+    #[inline(always)]
+    fn isub(self, a: __m256i, b: __m256i) -> __m256i {
+        unsafe { yi_sub(a, b) }
+    }
+    #[inline(always)]
+    fn imul(self, a: __m256i, b: __m256i) -> __m256i {
+        unsafe { yi_mul(a, b) }
+    }
+    #[inline(always)]
+    fn iand(self, a: __m256i, b: __m256i) -> __m256i {
+        unsafe { yi_and(a, b) }
+    }
+    #[inline(always)]
+    fn ior(self, a: __m256i, b: __m256i) -> __m256i {
+        unsafe { yi_or(a, b) }
+    }
+    #[inline(always)]
+    fn ixor(self, a: __m256i, b: __m256i) -> __m256i {
+        unsafe { yi_xor(a, b) }
+    }
+    #[inline(always)]
+    fn inot(self, a: __m256i) -> __m256i {
+        unsafe { yi_xor(a, yi_splat(u32::MAX)) }
+    }
+    #[inline(always)]
+    fn ishl(self, a: __m256i, k: u32) -> __m256i {
+        debug_assert!(k < 32);
+        unsafe { yi_shl(a, k) }
+    }
+    #[inline(always)]
+    fn ishr(self, a: __m256i, k: u32) -> __m256i {
+        debug_assert!(k < 32);
+        unsafe { yi_shr(a, k) }
+    }
+    #[inline(always)]
+    fn ishr_arith(self, a: __m256i, k: u32) -> __m256i {
+        debug_assert!(k < 32);
+        unsafe { yi_sra(a, k) }
+    }
+    #[inline(always)]
+    fn ieq(self, a: __m256i, b: __m256i) -> __m256 {
+        unsafe { yi_eq(a, b) }
+    }
+    #[inline(always)]
+    fn ilt_u(self, a: __m256i, b: __m256i) -> __m256 {
+        unsafe { yi_lt_u(a, b) }
+    }
+    #[inline(always)]
+    fn ilt_s(self, a: __m256i, b: __m256i) -> __m256 {
+        unsafe { yi_lt_s(a, b) }
+    }
+    #[inline(always)]
+    fn iselect(self, m: __m256, a: __m256i, b: __m256i) -> __m256i {
+        unsafe { yi_select(m, a, b) }
+    }
+    #[inline(always)]
+    fn to_bits(self, v: __m256) -> __m256i {
+        unsafe { yi_from_ps(v) }
+    }
+    #[inline(always)]
+    fn from_bits(self, v: __m256i) -> __m256 {
+        unsafe { yi_to_ps(v) }
+    }
+
     #[inline(always)]
     fn lanes(self) -> usize {
         8
@@ -236,12 +319,16 @@ unsafe fn f32_sqrt(a: __m256) -> __m256 {
 #[target_feature(enable = "avx2,fma")]
 #[inline]
 unsafe fn f32_min(a: __m256, b: __m256) -> __m256 {
-    _mm256_min_ps(a, b)
+    // IEEE minimumNumber: `vminps` already yields `b` when `a` is NaN; blend patches the
+    // b-is-NaN case (bare `vminps` would return the NaN).
+    let m = _mm256_min_ps(a, b);
+    _mm256_blendv_ps(m, a, _mm256_cmp_ps::<_CMP_UNORD_Q>(b, b))
 }
 #[target_feature(enable = "avx2,fma")]
 #[inline]
 unsafe fn f32_max(a: __m256, b: __m256) -> __m256 {
-    _mm256_max_ps(a, b)
+    let m = _mm256_max_ps(a, b);
+    _mm256_blendv_ps(m, a, _mm256_cmp_ps::<_CMP_UNORD_Q>(b, b))
 }
 #[target_feature(enable = "avx2,fma")]
 #[inline]
@@ -281,8 +368,14 @@ unsafe fn f32_reduce<const OP: i32>(v: __m256) -> f32 {
     #[inline(always)]
     unsafe fn combine<const OP: i32>(a: __m128, b: __m128) -> __m128 {
         match OP {
-            1 => _mm_min_ps(a, b),
-            2 => _mm_max_ps(a, b),
+            1 => {
+                let m = _mm_min_ps(a, b);
+                _mm_blendv_ps(m, a, _mm_cmpunord_ps(b, b))
+            }
+            2 => {
+                let m = _mm_max_ps(a, b);
+                _mm_blendv_ps(m, a, _mm_cmpunord_ps(b, b))
+            }
             _ => _mm_add_ps(a, b),
         }
     }
@@ -298,9 +391,101 @@ unsafe fn f32_reduce<const OP: i32>(v: __m256) -> f32 {
 
 // ───────────────────────────── f64 × __m256d (4 lanes) ────────────────────────────
 
+macro_rules! yi_binop {
+    ($name:ident, $intr:ident) => {
+        #[target_feature(enable = "avx2,fma")]
+        #[inline]
+        unsafe fn $name(a: __m256i, b: __m256i) -> __m256i {
+            $intr(a, b)
+        }
+    };
+}
+
+yi_binop!(yi_add, _mm256_add_epi32);
+yi_binop!(yi_sub, _mm256_sub_epi32);
+yi_binop!(yi_mul, _mm256_mullo_epi32);
+yi_binop!(yi_and, _mm256_and_si256);
+yi_binop!(yi_or, _mm256_or_si256);
+yi_binop!(yi_xor, _mm256_xor_si256);
+
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_load(p: *const u32) -> __m256i {
+    _mm256_loadu_si256(p as *const __m256i)
+}
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_store(p: *mut u32, v: __m256i) {
+    _mm256_storeu_si256(p as *mut __m256i, v)
+}
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_splat(v: u32) -> __m256i {
+    _mm256_set1_epi32(v as i32)
+}
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_shl(a: __m256i, k: u32) -> __m256i {
+    _mm256_sll_epi32(a, _mm_cvtsi32_si128(k as i32))
+}
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_shr(a: __m256i, k: u32) -> __m256i {
+    _mm256_srl_epi32(a, _mm_cvtsi32_si128(k as i32))
+}
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_sra(a: __m256i, k: u32) -> __m256i {
+    _mm256_sra_epi32(a, _mm_cvtsi32_si128(k as i32))
+}
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_eq(a: __m256i, b: __m256i) -> __m256 {
+    _mm256_castsi256_ps(_mm256_cmpeq_epi32(a, b))
+}
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_lt_s(a: __m256i, b: __m256i) -> __m256 {
+    _mm256_castsi256_ps(_mm256_cmpgt_epi32(b, a))
+}
+/// Unsigned `<` via the sign-flip trick (see the SSE4 backend).
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_lt_u(a: __m256i, b: __m256i) -> __m256 {
+    let bias = _mm256_set1_epi32(i32::MIN);
+    _mm256_castsi256_ps(_mm256_cmpgt_epi32(_mm256_xor_si256(b, bias), _mm256_xor_si256(a, bias)))
+}
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_select(m: __m256, a: __m256i, b: __m256i) -> __m256i {
+    _mm256_blendv_epi8(b, a, _mm256_castps_si256(m))
+}
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_from_ps(v: __m256) -> __m256i {
+    _mm256_castps_si256(v)
+}
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn yi_to_ps(v: __m256i) -> __m256 {
+    _mm256_castsi256_ps(v)
+}
+
 impl Backend<f64> for Avx2 {
     type Vector = __m256d;
     type Mask = __m256d;
+
+    type IVector = [u32; 4];
+    #[inline(always)]
+    fn iload(self, s: &[u32]) -> [u32; 4] {
+        let mut v = [0u32; 4];
+        v.copy_from_slice(s);
+        v
+    }
+    #[inline(always)]
+    fn istore(self, v: [u32; 4], out: &mut [u32]) {
+        out.copy_from_slice(&v);
+    }
 
     #[inline(always)]
     fn lanes(self) -> usize {
@@ -477,12 +662,14 @@ unsafe fn f64_sqrt(a: __m256d) -> __m256d {
 #[target_feature(enable = "avx2,fma")]
 #[inline]
 unsafe fn f64_min(a: __m256d, b: __m256d) -> __m256d {
-    _mm256_min_pd(a, b)
+    let m = _mm256_min_pd(a, b);
+    _mm256_blendv_pd(m, a, _mm256_cmp_pd::<_CMP_UNORD_Q>(b, b))
 }
 #[target_feature(enable = "avx2,fma")]
 #[inline]
 unsafe fn f64_max(a: __m256d, b: __m256d) -> __m256d {
-    _mm256_max_pd(a, b)
+    let m = _mm256_max_pd(a, b);
+    _mm256_blendv_pd(m, a, _mm256_cmp_pd::<_CMP_UNORD_Q>(b, b))
 }
 #[target_feature(enable = "avx2,fma")]
 #[inline]
@@ -522,8 +709,14 @@ unsafe fn f64_reduce<const OP: i32>(v: __m256d) -> f64 {
     #[inline(always)]
     unsafe fn combine<const OP: i32>(a: __m128d, b: __m128d) -> __m128d {
         match OP {
-            1 => _mm_min_pd(a, b),
-            2 => _mm_max_pd(a, b),
+            1 => {
+                let m = _mm_min_pd(a, b);
+                _mm_blendv_pd(m, a, _mm_cmpunord_pd(b, b))
+            }
+            2 => {
+                let m = _mm_max_pd(a, b);
+                _mm_blendv_pd(m, a, _mm_cmpunord_pd(b, b))
+            }
             _ => _mm_add_pd(a, b),
         }
     }
@@ -550,6 +743,18 @@ mod f16_impl {
     impl Backend<f16> for Avx2 {
         type Vector = __m256; // 8 × f32 (widened)
         type Mask = __m256;
+
+        type IVector = [u32; 8];
+        #[inline(always)]
+        fn iload(self, s: &[u32]) -> [u32; 8] {
+            let mut v = [0u32; 8];
+            v.copy_from_slice(s);
+            v
+        }
+        #[inline(always)]
+        fn istore(self, v: [u32; 8], out: &mut [u32]) {
+            out.copy_from_slice(&v);
+        }
 
         #[inline(always)]
         fn lanes(self) -> usize {
@@ -710,6 +915,18 @@ mod bf16_impl {
     impl Backend<bf16> for Avx2 {
         type Vector = __m256;
         type Mask = __m256;
+
+        type IVector = [u32; 8];
+        #[inline(always)]
+        fn iload(self, s: &[u32]) -> [u32; 8] {
+            let mut v = [0u32; 8];
+            v.copy_from_slice(s);
+            v
+        }
+        #[inline(always)]
+        fn istore(self, v: [u32; 8], out: &mut [u32]) {
+            out.copy_from_slice(&v);
+        }
 
         #[inline(always)]
         fn lanes(self) -> usize {

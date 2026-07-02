@@ -52,6 +52,18 @@ impl Backend<Half> for Avx512Fp16 {
     type Vector = __m512i; // 32 × f16 (raw bits)
     type Mask = u32;
 
+    type IVector = [u32; 32];
+    #[inline(always)]
+    fn iload(self, s: &[u32]) -> [u32; 32] {
+        let mut v = [0u32; 32];
+        v.copy_from_slice(s);
+        v
+    }
+    #[inline(always)]
+    fn istore(self, v: [u32; 32], out: &mut [u32]) {
+        out.copy_from_slice(&v);
+    }
+
     #[inline(always)]
     fn lanes(self) -> usize {
         32

@@ -14,12 +14,30 @@ use hydroplane::{Gang, kernel};
 use std::hint::black_box;
 use wide::{f32x4, f32x8};
 
-// Idiomatic `chunks` + `load_partial`: ergonomic, but the variable chunk count forces a
-// partial-vs-full branch and per-iteration bounds checks in the hot loop.
+// The drop-in body-runner: `for_each_chunk` inlines the closure once into a branch-free
+// full-register loop (`cnt` constant there, so `load_partial` folds to `load`) and once for the
+// tail — should match `dot_exact`/`dot_opt` despite the uniform `(off, cnt)` body.
 #[kernel]
 fn dot<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
     let mut acc = ctx.splat(0.0);
-    for (off, cnt) in ctx.chunks(a.len()) {
+    ctx.for_each_chunk(a.len(), |off, cnt| {
+        let x = ctx.load_partial(&a[off..off + cnt], 0.0);
+        let y = ctx.load_partial(&b[off..off + cnt], 0.0);
+        acc = acc + x * y;
+    });
+    acc.reduce_sum()
+}
+
+// `chunks_exact` + `remainder`: the branch-free iterator form of `dot_opt`'s hand-written loop —
+// should close the gap to it (and leave `chunks` behind).
+#[kernel]
+fn dot_exact<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
+    let n = ctx.lanes();
+    let mut acc = ctx.splat(0.0);
+    for off in ctx.chunks_exact(a.len()) {
+        acc = acc + ctx.load(&a[off..off + n]) * ctx.load(&b[off..off + n]);
+    }
+    if let Some((off, cnt)) = ctx.remainder(a.len()) {
         let x = ctx.load_partial(&a[off..off + cnt], 0.0);
         let y = ctx.load_partial(&b[off..off + cnt], 0.0);
         acc = acc + x * y;
@@ -39,6 +57,26 @@ fn dot_fold<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
 // provably in bounds — no per-iteration checks) plus a single masked tail.
 #[kernel]
 fn dot_opt<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
+    let n = ctx.lanes();
+    let len = a.len().min(b.len());
+    let mut acc = ctx.splat(0.0);
+    let mut i = 0;
+    while i + n <= len {
+        acc = acc + ctx.load(&a[i..i + n]) * ctx.load(&b[i..i + n]);
+        i += n;
+    }
+    if i < len {
+        let x = ctx.load_partial(&a[i..len], 0.0);
+        let y = ctx.load_partial(&b[i..len], 0.0);
+        acc = acc + x * y;
+    }
+    acc.reduce_sum()
+}
+
+// Identical body to `dot_opt`, but `tiny` opts out of the default `noalias` (`#[inline(never)]` `_on`)
+// boundary — measures whether that per-invocation call taxes a tiny scalar-returning kernel.
+#[kernel(tiny)]
+fn dot_opt_tiny<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
     let n = ctx.lanes();
     let len = a.len().min(b.len());
     let mut acc = ctx.splat(0.0);
@@ -174,6 +212,7 @@ fn bench(c: &mut Criterion) {
         let want = dot_scalar(&a, &b);
         let tol = 1e-3 * (1.0 + want.abs());
         assert!((dot(&a, &b) - want).abs() <= tol, "hydroplane disagrees at n={n}");
+        assert!((dot_exact(&a, &b) - want).abs() <= tol, "hydroplane_exact disagrees at n={n}");
         assert!((dot_fold(&a, &b) - want).abs() <= tol, "hydroplane_fold disagrees at n={n}");
         assert!((dot_opt(&a, &b) - want).abs() <= tol, "hydroplane_opt disagrees at n={n}");
         assert!((dot_wide(&a, &b) - want).abs() <= tol, "wide8 disagrees at n={n}");
@@ -182,11 +221,17 @@ fn bench(c: &mut Criterion) {
         assert!((dot_zip_reduce(&a, &b) - want).abs() <= tol, "zip_reduce disagrees at n={n}");
         assert!((dot_sum(&a, &b) - want).abs() <= tol, "zip_sum disagrees at n={n}");
 
-        g.bench_with_input(BenchmarkId::new("hydroplane", n), &n, |bch, _| {
+        g.bench_with_input(BenchmarkId::new("hydroplane_each", n), &n, |bch, _| {
             bch.iter(|| dot(black_box(&a), black_box(&b)))
+        });
+        g.bench_with_input(BenchmarkId::new("hydroplane_exact", n), &n, |bch, _| {
+            bch.iter(|| dot_exact(black_box(&a), black_box(&b)))
         });
         g.bench_with_input(BenchmarkId::new("hydroplane_fold", n), &n, |bch, _| {
             bch.iter(|| dot_fold(black_box(&a), black_box(&b)))
+        });
+        g.bench_with_input(BenchmarkId::new("hydroplane_opt_tiny", n), &n, |bch, _| {
+            bch.iter(|| dot_opt_tiny(black_box(&a), black_box(&b)))
         });
         g.bench_with_input(BenchmarkId::new("hydroplane_opt", n), &n, |bch, _| {
             bch.iter(|| dot_opt(black_box(&a), black_box(&b)))

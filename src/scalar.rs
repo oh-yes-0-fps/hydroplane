@@ -158,10 +158,16 @@ fn software_sqrt_f64(x: f64) -> f64 {
 
 /// A scalar float element a kernel can be generic over.
 ///
-/// All arithmetic is expressed as inherent methods (rather than `core::ops`) so that
-/// `f16`/`bf16` can transparently route through [`Scalar::Compute`] without the operator
-/// traits implying native half-precision math.
-pub trait Scalar: Copy + PartialEq + PartialOrd + Send + Sync + 'static {
+/// Arithmetic, comparison, `min`/`max`, `abs`, and the classification/constant helpers all come
+/// from the [`num_traits::float::FloatCore`] supertrait (`core`-only, so every no-`std`
+/// configuration keeps them; `f16`/`bf16` get theirs from `half`'s `num-traits` support, which
+/// routes through f32 exactly like [`Scalar::Compute`]). This trait only adds what `FloatCore`
+/// cannot express: the compute-precision widening policy, `sqrt` (reached without `std` via the
+/// hardware instruction), `fma`, and infallible `f64` literal conversion for in-kernel constants.
+///
+/// Note the `FloatCore` `min`/`max` are the IEEE non-NaN-propagating kind (a single NaN operand
+/// yields the other operand), which is also how the SIMD backends document theirs.
+pub trait Scalar: num_traits::float::FloatCore + Send + Sync + 'static {
     /// The precision this element's math is carried out in.
     /// `f32 -> f32`, `f64 -> f64`, `f16/bf16 -> f32`.
     type Compute: Scalar<Compute = Self::Compute>;
@@ -170,45 +176,34 @@ pub trait Scalar: Copy + PartialEq + PartialOrd + Send + Sync + 'static {
     const ONE: Self;
 
     /// Build from an `f64` literal (for in-kernel constants like `4.0`).
-    fn from_f64(v: f64) -> Self;
-    fn to_f64(self) -> f64;
+    #[inline(always)]
+    fn from_f64(v: f64) -> Self {
+        // Never `None` for the float-to-float casts this trait is implemented for.
+        <Self as num_traits::NumCast>::from(v).unwrap_or_else(|| Self::nan())
+    }
+    #[inline(always)]
+    fn into_f64(self) -> f64 {
+        <f64 as num_traits::NumCast>::from(self).unwrap_or(f64::NAN)
+    }
 
     /// Widen to the compute precision and back. No-ops for `f32`/`f64`.
     fn widen(self) -> Self::Compute;
     fn narrow(c: Self::Compute) -> Self;
 
-    fn add(self, o: Self) -> Self;
-    fn sub(self, o: Self) -> Self;
-    fn mul(self, o: Self) -> Self;
-    fn div(self, o: Self) -> Self;
-    fn neg(self) -> Self;
+    /// The lane's bit pattern in the low bits of a `u32` — the scalar half of the 32-bit
+    /// integer-companion bridge ([`Backend::to_bits`](crate::Backend::to_bits)). Exact for
+    /// `f32`; `f16`/`bf16` zero-extend their 16 bits; `f64` truncates to the low half of its
+    /// pattern (lossy — bit tricks are 32-bit-element territory).
+    fn to_bits32(self) -> u32;
+    /// Inverse of [`to_bits32`](Scalar::to_bits32); for `f64` the high pattern half is zeroed.
+    fn from_bits32(v: u32) -> Self;
+
     fn sqrt(self) -> Self;
-    fn min(self, o: Self) -> Self;
-    fn max(self, o: Self) -> Self;
 
     #[inline(always)]
     fn fma(self, b: Self, c: Self) -> Self {
         // Default: not a true fused op; backends with hardware FMA override.
-        self.mul(b).add(c)
-    }
-
-    #[inline(always)]
-    fn le(self, o: Self) -> bool {
-        self.partial_cmp(&o)
-            .is_some_and(|c| c != core::cmp::Ordering::Greater)
-    }
-    #[inline(always)]
-    fn lt(self, o: Self) -> bool {
-        self.partial_cmp(&o) == Some(core::cmp::Ordering::Less)
-    }
-    #[inline(always)]
-    fn ge(self, o: Self) -> bool {
-        self.partial_cmp(&o)
-            .is_some_and(|c| c != core::cmp::Ordering::Less)
-    }
-    #[inline(always)]
-    fn gt(self, o: Self) -> bool {
-        self.partial_cmp(&o) == Some(core::cmp::Ordering::Greater)
+        self * b + c
     }
 }
 
@@ -221,7 +216,7 @@ impl Scalar for f32 {
         v as f32
     }
     #[inline(always)]
-    fn to_f64(self) -> f64 {
+    fn into_f64(self) -> f64 {
         self as f64
     }
     #[inline(always)]
@@ -233,38 +228,16 @@ impl Scalar for f32 {
         c
     }
     #[inline(always)]
-    fn add(self, o: Self) -> Self {
-        self + o
+    fn to_bits32(self) -> u32 {
+        self.to_bits()
     }
     #[inline(always)]
-    fn sub(self, o: Self) -> Self {
-        self - o
-    }
-    #[inline(always)]
-    fn mul(self, o: Self) -> Self {
-        self * o
-    }
-    #[inline(always)]
-    fn div(self, o: Self) -> Self {
-        self / o
-    }
-    #[inline(always)]
-    fn neg(self) -> Self {
-        -self
+    fn from_bits32(v: u32) -> Self {
+        f32::from_bits(v)
     }
     #[inline(always)]
     fn sqrt(self) -> Self {
         sqrt_f32(self)
-    }
-    #[inline(always)]
-    fn min(self, o: Self) -> Self {
-        // match SIMD min semantics (non-propagating, second-on-NaN is backend-specific;
-        // we use a plain comparison so the scalar oracle is deterministic).
-        if o < self { o } else { self }
-    }
-    #[inline(always)]
-    fn max(self, o: Self) -> Self {
-        if o > self { o } else { self }
     }
 }
 
@@ -277,7 +250,7 @@ impl Scalar for f64 {
         v
     }
     #[inline(always)]
-    fn to_f64(self) -> f64 {
+    fn into_f64(self) -> f64 {
         self
     }
     #[inline(always)]
@@ -289,36 +262,16 @@ impl Scalar for f64 {
         c
     }
     #[inline(always)]
-    fn add(self, o: Self) -> Self {
-        self + o
+    fn to_bits32(self) -> u32 {
+        self.to_bits() as u32
     }
     #[inline(always)]
-    fn sub(self, o: Self) -> Self {
-        self - o
-    }
-    #[inline(always)]
-    fn mul(self, o: Self) -> Self {
-        self * o
-    }
-    #[inline(always)]
-    fn div(self, o: Self) -> Self {
-        self / o
-    }
-    #[inline(always)]
-    fn neg(self) -> Self {
-        -self
+    fn from_bits32(v: u32) -> Self {
+        f64::from_bits(v as u64)
     }
     #[inline(always)]
     fn sqrt(self) -> Self {
         sqrt_f64(self)
-    }
-    #[inline(always)]
-    fn min(self, o: Self) -> Self {
-        if o < self { o } else { self }
-    }
-    #[inline(always)]
-    fn max(self, o: Self) -> Self {
-        if o > self { o } else { self }
     }
 }
 
@@ -330,7 +283,8 @@ mod half_impls {
         ($ty:ident) => {
             impl Scalar for $ty {
                 // Math happens in f32 — `half` provides no SIMD arithmetic, and most
-                // targets have no native f16/bf16 ALU. Storage stays 16-bit.
+                // targets have no native f16/bf16 ALU. Storage stays 16-bit; the operator
+                // and `FloatCore` impls from `half` widen-compute-narrow the same way.
                 type Compute = f32;
                 const ZERO: Self = $ty::from_f32_const(0.0);
                 const ONE: Self = $ty::from_f32_const(1.0);
@@ -339,8 +293,8 @@ mod half_impls {
                     $ty::from_f64(v)
                 }
                 #[inline(always)]
-                fn to_f64(self) -> f64 {
-                    self.to_f64()
+                fn into_f64(self) -> f64 {
+                    $ty::to_f64(self)
                 }
                 #[inline(always)]
                 fn widen(self) -> f32 {
@@ -351,36 +305,16 @@ mod half_impls {
                     $ty::from_f32(c)
                 }
                 #[inline(always)]
-                fn add(self, o: Self) -> Self {
-                    $ty::from_f32(self.to_f32() + o.to_f32())
+                fn to_bits32(self) -> u32 {
+                    self.to_bits() as u32
                 }
                 #[inline(always)]
-                fn sub(self, o: Self) -> Self {
-                    $ty::from_f32(self.to_f32() - o.to_f32())
-                }
-                #[inline(always)]
-                fn mul(self, o: Self) -> Self {
-                    $ty::from_f32(self.to_f32() * o.to_f32())
-                }
-                #[inline(always)]
-                fn div(self, o: Self) -> Self {
-                    $ty::from_f32(self.to_f32() / o.to_f32())
-                }
-                #[inline(always)]
-                fn neg(self) -> Self {
-                    $ty::from_f32(-self.to_f32())
+                fn from_bits32(v: u32) -> Self {
+                    $ty::from_bits(v as u16)
                 }
                 #[inline(always)]
                 fn sqrt(self) -> Self {
                     $ty::from_f32(Scalar::sqrt(self.to_f32()))
-                }
-                #[inline(always)]
-                fn min(self, o: Self) -> Self {
-                    if o.to_f32() < self.to_f32() { o } else { self }
-                }
-                #[inline(always)]
-                fn max(self, o: Self) -> Self {
-                    if o.to_f32() > self.to_f32() { o } else { self }
                 }
             }
         };

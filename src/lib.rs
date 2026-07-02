@@ -34,13 +34,19 @@ pub mod dispatch;
 // The runtime unroll cache; gone when `build.rs` resolved the factor at compile time.
 #[cfg(not(hp_resolved_unroll))]
 pub(crate) mod ilp;
-pub mod kernel_macro;
 pub mod matrix;
 pub mod scalar;
 pub mod varying;
 
 #[cfg(feature = "alloc")]
+pub mod cols;
+#[cfg(feature = "alloc")]
 pub mod soa;
+
+/// Opt-in `glam`-aware wide-vector helpers ([`Vec3Wide`](glam_ext::Vec3Wide) etc.). Behind the
+/// `glam` feature so the core stays geometry-free.
+#[cfg(feature = "glam")]
+pub mod glam_ext;
 
 pub use backend::{Backend, ScalarBackend};
 pub use dispatch::{Kernel, SimdDispatch, dispatch, run_scalar};
@@ -54,19 +60,30 @@ pub use matrix::{
     Tiles, dispatch_matrix, run_matrix_scalar,
 };
 pub use scalar::Scalar;
-pub use varying::{Chunks, Varying, Mask, Gang};
+pub use varying::{ChunksExact, Varying, VaryingI32, VaryingU32, Mask, Gang};
 
 /// The `#[kernel]` attribute: write a [`Kernel`]/[`MatrixKernel`] as a plain generic function.
-/// See [`kernel_macro`] for the shape. Available unless the `macros` feature is disabled, in which
-/// case the `macro_rules!` [`kernel!`](crate::kernel) fallback takes over the same name.
-#[cfg(feature = "macros")]
+/// The full shape — contexts, tuning flags (`tiny`, `noalias`, `unroll = N`), the generated
+/// `<name>_on` companion for calling one kernel from another without re-dispatching, and the
+/// `matrix` form — is documented on [the attribute itself](macro@kernel) (the `hydroplane_macros`
+/// crate docs).
 pub use hydroplane_macros::kernel;
 
 /// `f16`/`bf16` element types (from the `half` crate), usable anywhere a [`Scalar`] is expected.
 pub use half::{bf16, f16};
 
+/// Re-export of the crate supplying [`Scalar`]'s numeric supertrait
+/// ([`FloatCore`](num_traits::float::FloatCore)), so generic kernels can name its traits without
+/// depending on `num-traits` themselves.
+pub use num_traits;
+
+#[cfg(feature = "alloc")]
+pub use cols::Cols;
 #[cfg(feature = "alloc")]
 pub use soa::Soa;
+
+#[cfg(feature = "glam")]
+pub use glam_ext::{GangGlamExt, Mat3Wide, Vec3Wide};
 
 /// Test hook: the unroll factor in effect — `0` until the first dispatch resolves it via the runtime
 /// sweep, or the `build.rs`-baked constant when it was resolved at compile time. Not part of the
@@ -103,7 +120,7 @@ mod tests {
         }
         // scalar tail
         while i < xs.len() {
-            if xs[i].le(r) && xs[i].neg().le(r) {
+            if xs[i] <= r && -xs[i] <= r {
                 return true;
             }
             i += 1;

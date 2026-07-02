@@ -99,8 +99,8 @@ sve1_binop_f32!(add_f32, "fadd z0.s, z0.s, z1.s");
 sve1_binop_f32!(sub_f32, "fsub z0.s, z0.s, z1.s");
 sve1_binop_f32!(mul_f32, "fmul z0.s, z0.s, z1.s");
 sve1_binop_f32!(div_f32, "fdiv z0.s, p0/m, z0.s, z1.s");
-sve1_binop_f32!(min_f32, "fmin z0.s, p0/m, z0.s, z1.s");
-sve1_binop_f32!(max_f32, "fmax z0.s, p0/m, z0.s, z1.s");
+sve1_binop_f32!(min_f32, "fminnm z0.s, p0/m, z0.s, z1.s");
+sve1_binop_f32!(max_f32, "fmaxnm z0.s, p0/m, z0.s, z1.s");
 
 /// `a * b + c`, fused.
 #[target_feature(enable = "sve")]
@@ -303,8 +303,8 @@ macro_rules! sve1_reduce_f32 {
 }
 
 sve1_reduce_f32!(reduce_sum_f32, "faddv s0, p0, z0.s");
-sve1_reduce_f32!(reduce_min_f32, "fminv s0, p0, z0.s");
-sve1_reduce_f32!(reduce_max_f32, "fmaxv s0, p0, z0.s");
+sve1_reduce_f32!(reduce_min_f32, "fminnmv s0, p0, z0.s");
+sve1_reduce_f32!(reduce_max_f32, "fmaxnmv s0, p0, z0.s");
 
 // ─────────────────────────────── f64 (C/8 lanes, `.d`) ───────────────────────────────
 
@@ -380,8 +380,8 @@ sve1_binop_f64!(add_f64, "fadd z0.d, z0.d, z1.d");
 sve1_binop_f64!(sub_f64, "fsub z0.d, z0.d, z1.d");
 sve1_binop_f64!(mul_f64, "fmul z0.d, z0.d, z1.d");
 sve1_binop_f64!(div_f64, "fdiv z0.d, p0/m, z0.d, z1.d");
-sve1_binop_f64!(min_f64, "fmin z0.d, p0/m, z0.d, z1.d");
-sve1_binop_f64!(max_f64, "fmax z0.d, p0/m, z0.d, z1.d");
+sve1_binop_f64!(min_f64, "fminnm z0.d, p0/m, z0.d, z1.d");
+sve1_binop_f64!(max_f64, "fmaxnm z0.d, p0/m, z0.d, z1.d");
 
 /// `a * b + c`, fused.
 #[target_feature(enable = "sve")]
@@ -502,8 +502,8 @@ macro_rules! sve1_reduce_f64 {
 }
 
 sve1_reduce_f64!(reduce_sum_f64, "faddv d0, p0, z0.d");
-sve1_reduce_f64!(reduce_min_f64, "fminv d0, p0, z0.d");
-sve1_reduce_f64!(reduce_max_f64, "fmaxv d0, p0, z0.d");
+sve1_reduce_f64!(reduce_min_f64, "fminnmv d0, p0, z0.d");
+sve1_reduce_f64!(reduce_max_f64, "fmaxnmv d0, p0, z0.d");
 
 use half::{bf16, f16};
 
@@ -586,8 +586,8 @@ sve1_binop_f16!(add_f16, "fadd z0.h, z0.h, z1.h");
 sve1_binop_f16!(sub_f16, "fsub z0.h, z0.h, z1.h");
 sve1_binop_f16!(mul_f16, "fmul z0.h, z0.h, z1.h");
 sve1_binop_f16!(div_f16, "fdiv z0.h, p0/m, z0.h, z1.h");
-sve1_binop_f16!(min_f16, "fmin z0.h, p0/m, z0.h, z1.h");
-sve1_binop_f16!(max_f16, "fmax z0.h, p0/m, z0.h, z1.h");
+sve1_binop_f16!(min_f16, "fminnm z0.h, p0/m, z0.h, z1.h");
+sve1_binop_f16!(max_f16, "fmaxnm z0.h, p0/m, z0.h, z1.h");
 
 /// `a * b + c`, fused, in native f16.
 #[target_feature(enable = "sve")]
@@ -708,8 +708,8 @@ macro_rules! sve1_reduce_f16 {
 }
 
 sve1_reduce_f16!(reduce_sum_f16, "faddv h0, p0, z0.h");
-sve1_reduce_f16!(reduce_min_f16, "fminv h0, p0, z0.h");
-sve1_reduce_f16!(reduce_max_f16, "fmaxv h0, p0, z0.h");
+sve1_reduce_f16!(reduce_min_f16, "fminnmv h0, p0, z0.h");
+sve1_reduce_f16!(reduce_max_f16, "fmaxnmv h0, p0, z0.h");
 
 // ──────────────── bf16 (storage 16-bit, compute f32 — no native bf16 ALU) ────────────────
 //

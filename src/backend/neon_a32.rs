@@ -96,8 +96,36 @@ macro_rules! binop {
 binop!(add, "vadd.f32 q0, q0, q1");
 binop!(sub, "vsub.f32 q0, q0, q1");
 binop!(mul, "vmul.f32 q0, q0, q1");
-binop!(min, "vmin.f32 q0, q0, q1");
-binop!(max, "vmax.f32 q0, q0, q1");
+
+/// IEEE minimumNumber / maximumNumber. ARMv7 NEON's `vmin`/`vmax` propagate NaN (and `VMINNM` is
+/// ARMv8-only), so patch: a-is-NaN lanes take `b`, b-is-NaN lanes take `a` (both-NaN stays NaN).
+/// `vceq x, x` is the ordered mask; `vbsl` selects with its destination as the mask.
+macro_rules! minmaxnm {
+    ($name:ident, $op:literal) => {
+        #[inline]
+        unsafe fn $name(a: &F32x4, b: &F32x4) -> F32x4 {
+            let mut o = F32x4::zeroed();
+            asm!(
+                ".fpu neon",
+                "vld1.32 {{q0}}, [{a}]",
+                "vld1.32 {{q1}}, [{b}]",
+                $op,
+                "vceq.f32 q3, q0, q0",
+                "vbsl q3, q2, q1",
+                "vceq.f32 q2, q1, q1",
+                "vbsl q2, q3, q0",
+                "vst1.32 {{q2}}, [{o}]",
+                a = in(reg) a.0.as_ptr(), b = in(reg) b.0.as_ptr(), o = in(reg) o.0.as_mut_ptr(),
+                out("q0") _, out("q1") _, out("q2") _, out("q3") _,
+                options(nostack),
+            );
+            o
+        }
+    };
+}
+
+minmaxnm!(min, "vmin.f32 q2, q0, q1");
+minmaxnm!(max, "vmax.f32 q2, q0, q1");
 
 /// Comparison → a `-1`/`0` lane mask.
 macro_rules! cmpop {
@@ -318,12 +346,23 @@ macro_rules! freduce {
 }
 
 freduce!(reduce_sum, "vpadd.f32");
-freduce!(reduce_min, "vpmin.f32");
-freduce!(reduce_max, "vpmax.f32");
 
 impl Backend<f32> for Neon {
     type Vector = F32x4;
     type Mask = F32x4;
+
+    type IVector = [u32; 4];
+    #[inline(always)]
+    fn iload(self, s: &[u32]) -> [u32; 4] {
+        let mut v = [0u32; 4];
+        v.copy_from_slice(s);
+        v
+    }
+    #[inline(always)]
+    fn istore(self, v: [u32; 4], out: &mut [u32]) {
+        out.copy_from_slice(&v);
+    }
+
 
     #[inline(always)]
     fn lanes(self) -> usize {
@@ -429,10 +468,11 @@ impl Backend<f32> for Neon {
     }
     #[inline(always)]
     fn reduce_min(self, v: F32x4) -> f32 {
-        unsafe { reduce_min(&v) }
+        // Scalar minimumNumber fold — the pairwise `vpmin.f32` would propagate NaN.
+        v.0.iter().copied().fold(f32::NAN, f32::min)
     }
     #[inline(always)]
     fn reduce_max(self, v: F32x4) -> f32 {
-        unsafe { reduce_max(&v) }
+        v.0.iter().copied().fold(f32::NAN, f32::max)
     }
 }

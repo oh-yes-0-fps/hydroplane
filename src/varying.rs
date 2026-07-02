@@ -16,7 +16,7 @@
 
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
-use core::ops::{Add, BitAnd, BitOr, Div, Mul, Neg, Not, Sub};
+use core::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
 use crate::backend::Backend;
 use crate::scalar::Scalar;
@@ -59,6 +59,46 @@ fn unroll_k<T: Scalar, S: Backend<T>>() -> usize {
     1
 }
 
+/// `s[..len]` without the bounds check, through a named lifetime so `array::map` closures can
+/// truncate a moved-in slice without the reborrow dying with the closure body. The multi-column
+/// maps call this once per column in their prologue; the checked form's dozen-plus panic
+/// branches are measurable there at small `len`.
+///
+/// # Safety
+/// `len <= s.len()`.
+#[inline(always)]
+unsafe fn head_unchecked<E>(s: &[E], len: usize) -> &[E] {
+    debug_assert!(len <= s.len());
+    // SAFETY: caller guarantees `len <= s.len()`.
+    unsafe { s.get_unchecked(..len) }
+}
+
+/// Mutable [`head_unchecked`].
+///
+/// # Safety
+/// `len <= s.len()`.
+#[inline(always)]
+unsafe fn head_mut_unchecked<E>(s: &mut [E], len: usize) -> &mut [E] {
+    debug_assert!(len <= s.len());
+    // SAFETY: caller guarantees `len <= s.len()`.
+    unsafe { s.get_unchecked_mut(..len) }
+}
+
+/// Chain-count budget for the multi-column maps: the scheduler interleaves the `k` unrolled
+/// steps, so roughly `k * live` vector values are in flight at once. Past the ~32-register
+/// architectural file that interleave spills, which costs more than the ILP it buys — cap `k`
+/// to the largest power of two keeping the product within budget (a 12-in/3-out point transform
+/// gets `k = 2`; low-arity kernels are left at the backend's full unroll).
+#[inline(always)]
+fn chain_cap(live: usize) -> usize {
+    let budget = 64 / live.max(1);
+    if budget == 0 {
+        1
+    } else {
+        1 << (usize::BITS - 1 - budget.leading_zeros())
+    }
+}
+
 /// The execution *context* for scalar `T` on backend `S` — the "gang" of lanes that step through
 /// the kernel together (the ISPC term for the group of program instances running in lockstep). It is
 /// the gateway, not a value: the varying value type is [`Varying`]. You never construct one — it is
@@ -91,32 +131,131 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
         Varying::wrap(self.backend, self.backend.splat(v))
     }
 
-    /// Load exactly one register; `s.len()` must equal [`Gang::lanes`].
+    /// Load exactly one register; `s.len()` must equal [`Gang::lanes`] or this panics.
     ///
-    /// The backend reads exactly `lanes()` elements from `s` with an unchecked SIMD load: passing a
-    /// slice of any other length is undefined behaviour. The length match is the caller's contract,
-    /// checked only under `debug_assertions`. For tails, use [`Gang::load_partial`] or the
-    /// [`Gang::chunks`] iterator.
+    /// The backend reads exactly `lanes()` elements from `s` with an unchecked SIMD load; the
+    /// length check guards it in every build. At the usual call shapes (`&a[off..off + n]` under a
+    /// loop guard, or via [`Gang::load_partial`]) the slice length is provably `lanes()`, so the
+    /// check folds away. For tails, use [`Gang::load_partial`] via
+    /// [`Gang::for_each_chunk`]/[`Gang::remainder`].
     #[inline(always)]
     pub fn load(self, s: &[T]) -> Varying<T, S> {
-        debug_assert!(
+        assert!(
             s.len() == self.backend.lanes(),
             "Gang::load: slice length must equal lanes()",
         );
         Varying::wrap(self.backend, self.backend.load(s))
     }
 
-    /// Iterate `len` elements in full-register chunks, yielding `(offset, count)` per step.
-    /// `count == lanes()` for every chunk except possibly the last. Pair with
-    /// [`Gang::load_partial`] to run a kernel directly over unpadded, borrowed slices (e.g.
-    /// the field slices of a `soa-rs` struct) — no copy and no padded [`Soa`](crate::Soa).
+    /// Run `f(offset, count)` over `len` elements in full-register chunks — `count == lanes()`
+    /// for every call except a final short tail. Pair with [`Gang::load_partial`] to run a
+    /// kernel directly over unpadded, borrowed slices (e.g. the field slices of a `soa-rs`
+    /// struct) — no copy and no padded [`Soa`](crate::Soa).
+    ///
+    /// This is a two-phase loop, not an iterator with a runtime `count`: `f` is inlined once
+    /// into a branch-free full-register loop (where `count` is the constant `lanes()`, so
+    /// `load_partial`'s full-vs-tail branch and the slice bounds checks fold away) and once for
+    /// the single tail call. A `(offset, count)`-yielding iterator doing the same job measures
+    /// 1.8x slower on a dot product because that fold can't happen. `f` cannot early-exit; for
+    /// short-circuiting predicates use [`any`](Self::any)/[`zip_any`](Self::zip_any) or a manual
+    /// [`chunks_exact`](Self::chunks_exact) + [`remainder`](Self::remainder) loop.
     #[inline]
-    pub fn chunks(self, len: usize) -> Chunks {
-        Chunks {
+    pub fn for_each_chunk(self, len: usize, mut f: impl FnMut(usize, usize)) {
+        let n = self.backend.lanes();
+        let mut off = 0;
+        while off + n <= len {
+            f(off, n);
+            off += n;
+        }
+        if off < len {
+            f(off, len - off);
+        }
+    }
+
+    /// Iterate only the full-register prefix of `len`: yields each `offset` (stepping by
+    /// [`lanes()`](Self::lanes)) whose chunk is exactly `lanes()` wide. The loop body is
+    /// branch-free — see [`ChunksExact`] — and the short tail is handled *once*, after the loop,
+    /// with [`remainder`](Self::remainder) + [`Gang::load_partial`] (or
+    /// [`Gang::active_mask`] when a `min`/`max` would scrub a NaN sentinel):
+    ///
+    /// ```ignore
+    /// let n = ctx.lanes();
+    /// for off in ctx.chunks_exact(a.len()) {
+    ///     acc = acc + ctx.load(&a[off..off + n]) * ctx.load(&b[off..off + n]);
+    /// }
+    /// if let Some((off, cnt)) = ctx.remainder(a.len()) {
+    ///     let x = ctx.load_partial(&a[off..off + cnt], 0.0);
+    ///     let y = ctx.load_partial(&b[off..off + cnt], 0.0);
+    ///     acc = acc + x * y;
+    /// }
+    /// ```
+    #[inline]
+    pub fn chunks_exact(self, len: usize) -> ChunksExact {
+        ChunksExact {
             lanes: self.backend.lanes(),
             pos: 0,
             len,
         }
+    }
+
+    /// The tail [`chunks_exact`](Self::chunks_exact) leaves: `Some((offset, count))` with
+    /// `0 < count < lanes()`, or `None` when `len` is a multiple of `lanes()`. Also available on
+    /// the iterator itself as [`ChunksExact::remainder`].
+    #[inline]
+    pub fn remainder(self, len: usize) -> Option<(usize, usize)> {
+        let cnt = len % self.backend.lanes();
+        (cnt != 0).then_some((len - cnt, cnt))
+    }
+
+    /// Broadcast one `u32` to every lane of the integer companion register.
+    #[inline(always)]
+    pub fn splat_u32(self, v: u32) -> VaryingU32<T, S> {
+        VaryingU32::wrap(self.backend, self.backend.isplat(v))
+    }
+
+    /// Load exactly one integer companion register; `s.len()` must equal `lanes()` or this
+    /// panics.
+    #[inline(always)]
+    pub fn load_u32(self, s: &[u32]) -> VaryingU32<T, S> {
+        assert!(
+            s.len() == self.backend.lanes(),
+            "Gang::load_u32: slice length must equal lanes()",
+        );
+        VaryingU32::wrap(self.backend, self.backend.iload(s))
+    }
+
+    /// The lane indices `0, 1, …, lanes()-1` as integer lanes — the seed for index tracking:
+    /// `ctx.ramp_u32() + ctx.splat_u32(off as u32)` is each lane's global element index inside a
+    /// chunk loop.
+    #[inline(always)]
+    pub fn ramp_u32(self) -> VaryingU32<T, S> {
+        VaryingU32::wrap(self.backend, self.backend.iramp())
+    }
+
+    /// Broadcast one `i32` to every lane of the integer companion (signed view).
+    #[inline(always)]
+    pub fn splat_i32(self, v: i32) -> VaryingI32<T, S> {
+        self.splat_u32(v as u32).as_i32()
+    }
+
+    /// Load exactly one signed integer companion register; `s.len()` must equal `lanes()` or
+    /// this panics.
+    #[inline]
+    pub fn load_i32(self, s: &[i32]) -> VaryingI32<T, S> {
+        let n = self.backend.lanes();
+        assert!(s.len() == n, "Gang::load_i32: slice length must equal lanes()");
+        let mut buf = [0u32; crate::MAX_LANES];
+        for (b, &x) in buf[..n].iter_mut().zip(s) {
+            *b = x as u32;
+        }
+        VaryingU32::wrap(self.backend, self.backend.iload(&buf[..n])).as_i32()
+    }
+
+    /// Reinterpret integer lanes as float lanes — [`VaryingU32::to_float_bits`] reachable from
+    /// the context, the inverse of [`Varying::to_bits`].
+    #[inline(always)]
+    pub fn from_bits(self, v: VaryingU32<T, S>) -> Varying<T, S> {
+        v.to_float_bits()
     }
 
     /// Load up to [`lanes()`](Gang::lanes) elements from `s` (`s.len()` must not exceed it),
@@ -362,6 +501,87 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
         }
     }
 
+    /// In-place two-column map: read a register from `a` (read-only) and from `b`, and write
+    /// `f(a_i, b_i)` back to `b`. The in-place sibling of [`zip_map`](Self::zip_map) for updates whose
+    /// output aliases an input — `y += a·x`, `y = max(y, x)` — which the borrow checker won't let you
+    /// spell as a separate `out: &mut` alongside `b: &`. Same full-register stride, single masked tail,
+    /// and `K`-chain ILP as [`map`](Self::map), so a memory-bound update gets the load/store clustering
+    /// without a hand-written `chunks` loop.
+    #[inline]
+    pub fn zip_map_inplace(
+        self,
+        a: &[T],
+        b: &mut [T],
+        fill_a: T,
+        fill_b: T,
+        mut f: impl FnMut(Varying<T, S>, Varying<T, S>) -> Varying<T, S>,
+    ) {
+        let n = self.backend.lanes();
+        let len = a.len().min(b.len());
+        let k = unroll_k::<T, S>();
+        let mut off = 0;
+        while off + k * n <= len {
+            let mut j = 0;
+            while j < k {
+                let o = off + j * n;
+                let va = self.load(&a[o..o + n]);
+                let vb = self.load(&b[o..o + n]);
+                f(va, vb).store(&mut b[o..o + n]);
+                j += 1;
+            }
+            off += k * n;
+        }
+        while off + n <= len {
+            let va = self.load(&a[off..off + n]);
+            let vb = self.load(&b[off..off + n]);
+            f(va, vb).store(&mut b[off..off + n]);
+            off += n;
+        }
+        if off < len {
+            let va = self.load_partial(&a[off..len], fill_a);
+            let vb = self.load_partial(&b[off..len], fill_b);
+            f(va, vb).store_partial(&mut b[off..len]);
+        }
+    }
+
+    // --- Streaming (auto-vectorized) combinators ---------------------------------------------------
+    //
+    // These take a *scalar* per-element function and emit a plain, bounds-check-free loop, leaving the
+    // vectorization to LLVM. For **memory-bandwidth-bound** elementwise work — `a·x + b`, clamps, a
+    // gamma curve, format conversions — the auto-vectorizer matches or beats hydroplane's explicit
+    // SIMD, and this skips the abstraction overhead (`saxpy`: ~280ns of explicit-SIMD `map` vs ~170ns
+    // here, matching a hand-written scalar loop). Reach for the SIMD [`map`](Self::map) family instead
+    // when the body is compute-bound or a reduction, where hydroplane's lanes and ILP are the win.
+    // Backend-independent: the loop is identical on every backend, so `self` only carries the element
+    // type — no dispatch work is used.
+
+    /// Stream `out[i] = f(a[i])` as an auto-vectorized scalar loop. The bandwidth-bound counterpart of
+    /// [`map`](Self::map); see the module note on the streaming combinators.
+    #[inline]
+    pub fn stream_map(self, a: &[T], out: &mut [T], mut f: impl FnMut(T) -> T) {
+        for (o, &x) in out.iter_mut().zip(a) {
+            *o = f(x);
+        }
+    }
+
+    /// Stream `out[i] = f(a[i], b[i])` as an auto-vectorized scalar loop — the bandwidth-bound
+    /// counterpart of [`zip_map`](Self::zip_map).
+    #[inline]
+    pub fn stream_zip(self, a: &[T], b: &[T], out: &mut [T], mut f: impl FnMut(T, T) -> T) {
+        for (o, (&x, &y)) in out.iter_mut().zip(a.iter().zip(b)) {
+            *o = f(x, y);
+        }
+    }
+
+    /// Stream `b[i] = f(a[i], b[i])` in place as an auto-vectorized scalar loop — the bandwidth-bound
+    /// counterpart of [`zip_map_inplace`](Self::zip_map_inplace), for updates like `y += a·x`.
+    #[inline]
+    pub fn stream_zip_inplace(self, a: &[T], b: &mut [T], mut f: impl FnMut(T, T) -> T) {
+        for (bi, &x) in b.iter_mut().zip(a) {
+            *bi = f(x, *bi);
+        }
+    }
+
     /// In-place `N`-column element-wise transform: load one register from each of the `N` columns,
     /// hand the `[Varying; N]` lane-tuple to `f`, and write its `[Varying; N]` result back to the
     /// same columns. The multi-channel companion to [`map`](Self::map) for the case where every
@@ -377,8 +597,12 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
         mut f: impl FnMut([Varying<T, S>; N]) -> [Varying<T, S>; N],
     ) {
         let n = self.backend.lanes();
-        let len = if N == 0 { 0 } else { cols[0].len() };
-        let k = unroll_k::<T, S>();
+        let len = cols.iter().map(|c| c.len()).min().unwrap_or(0);
+        // Same exact-`len` re-slice as `map_cols`, so the unrolled body's accesses check the
+        // loop guard's own bound and fold away.
+        // SAFETY: `len` is the minimum over these same columns' lengths.
+        let cols: [&mut [T]; N] = cols.map(|c| unsafe { head_mut_unchecked(c, len) });
+        let k = unroll_k::<T, S>().min(chain_cap(2 * N));
         let mut off = 0;
         while off + k * n <= len {
             let mut j = 0;
@@ -403,6 +627,66 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
             let rs = f(core::array::from_fn(|c| self.load_partial(&cols[c][off..len], fill)));
             for c in 0..N {
                 rs[c].store_partial(&mut cols[c][off..len]);
+            }
+        }
+    }
+
+    /// Asymmetric element-wise map: load one register from each of `IN` input columns, hand the
+    /// `[Varying; IN]` lane-tuple to `f`, and write its `[Varying; OUT]` result to `OUT` distinct
+    /// output columns. The general form of [`map`](Self::map)/[`zip_map`](Self::zip_map) for kernels
+    /// whose output arity differs from the input — a batched `M·v` (nine matrix + three vector columns
+    /// → three), a complex multiply (four → two) — that no fixed-arity combinator can express. The
+    /// pass is bounded by the shortest column so every access is in bounds, the tail is a single
+    /// masked step, and it carries the same `K`-chain ILP as [`map`](Self::map). Inputs and outputs
+    /// are distinct slices; for the in-place same-columns case use [`map_n`](Self::map_n).
+    #[inline]
+    pub fn map_cols<const IN: usize, const OUT: usize>(
+        self,
+        inp: [&[T]; IN],
+        out: [&mut [T]; OUT],
+        fill: T,
+        mut f: impl FnMut([Varying<T, S>; IN]) -> [Varying<T, S>; OUT],
+    ) {
+        let n = self.backend.lanes();
+        let len = inp
+            .iter()
+            .map(|c| c.len())
+            .chain(out.iter().map(|c| c.len()))
+            .min()
+            .unwrap_or(0);
+        // Re-slice every column to exactly `len`: each per-register access below is then checked
+        // against the very bound the loop guard tests, instead of that column's own (longer)
+        // length that relates to the guard only transitively through `min` — the difference
+        // between LLVM eliding the bounds checks in the unrolled body and keeping IN+OUT of them
+        // per step.
+        // SAFETY: `len` is the minimum over these same columns' lengths.
+        let inp: [&[T]; IN] = inp.map(|c| unsafe { head_unchecked(c, len) });
+        let out: [&mut [T]; OUT] = out.map(|c| unsafe { head_mut_unchecked(c, len) });
+        let k = unroll_k::<T, S>().min(chain_cap(IN + OUT));
+        let mut off = 0;
+        while off + k * n <= len {
+            let mut j = 0;
+            while j < k {
+                let o = off + j * n;
+                let rs = f(core::array::from_fn(|c| self.load(&inp[c][o..o + n])));
+                for c in 0..OUT {
+                    rs[c].store(&mut out[c][o..o + n]);
+                }
+                j += 1;
+            }
+            off += k * n;
+        }
+        while off + n <= len {
+            let rs = f(core::array::from_fn(|c| self.load(&inp[c][off..off + n])));
+            for c in 0..OUT {
+                rs[c].store(&mut out[c][off..off + n]);
+            }
+            off += n;
+        }
+        if off < len {
+            let rs = f(core::array::from_fn(|c| self.load_partial(&inp[c][off..len], fill)));
+            for c in 0..OUT {
+                rs[c].store_partial(&mut out[c][off..len]);
             }
         }
     }
@@ -592,7 +876,7 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
         // const-generic helper needed. `K == 1` (and too-small inputs) take the single-chain fold.
         let k = <S as Backend<T>>::UNROLL;
         if k == 1 || len / n < 8 {
-            return self.count_n_fold(cols, pred).reduce_sum().to_f64() as usize;
+            return self.count_n_fold(cols, pred).reduce_sum().into_f64() as usize;
         }
         let one = self.splat(T::ONE);
         let zero = self.splat(T::ZERO);
@@ -637,7 +921,7 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
             let mask = pred(vs) & self.active_mask(cnt);
             result = result + one.select(mask, zero);
         }
-        result.reduce_sum().to_f64() as usize
+        result.reduce_sum().into_f64() as usize
     }
 
     /// ILP compiled out: the single-accumulator chain is the whole story.
@@ -648,7 +932,7 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
         cols: [&[T]; N],
         pred: impl FnMut([Varying<T, S>; N]) -> Mask<T, S>,
     ) -> usize {
-        self.count_n_fold(cols, pred).reduce_sum().to_f64() as usize
+        self.count_n_fold(cols, pred).reduce_sum().into_f64() as usize
     }
 
     /// Single-chain count accumulator (the shared tail/small-input path), returning the per-lane
@@ -709,15 +993,22 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
         any
     }
 
-    /// Per-chunk [`active_mask`](Self::active_mask) alongside the [`chunks`](Self::chunks) walk:
-    /// yields `(offset, count, active)` per step. The two-phase collision kernels (broadphase reject,
+    /// Per-chunk [`active_mask`](Self::active_mask) alongside the full-register walk:
+    /// yields `(offset, count, active)` per step, `count == lanes()` (all-active mask) for every
+    /// chunk except a final short tail. The two-phase collision kernels (broadphase reject,
     /// then narrowphase on the survivors) need the same tail mask for both `any()` reductions while
     /// keeping their own `continue`-on-empty control flow — which a single-predicate `any_n` can't
     /// express. This collapses the hand-written `base`/`cnt`/`active_mask`/`base += n` loop — the most
     /// repeated shape in those kernels — to `for (off, cnt, active) in ctx.masked_chunks(len)`.
     #[inline]
     pub fn masked_chunks(self, len: usize) -> impl Iterator<Item = (usize, usize, Mask<T, S>)> {
-        self.chunks(len).map(move |(off, cnt)| (off, cnt, self.active_mask(cnt)))
+        let n = self.backend.lanes();
+        self.chunks_exact(len)
+            .map(move |off| (off, n, self.active_mask(n)))
+            .chain(
+                self.remainder(len)
+                    .map(|(off, cnt)| (off, cnt, self.active_mask(cnt))),
+            )
     }
 
     /// Splat each element of a fixed-size array to its own [`Varying`], returning them as an array —
@@ -1105,7 +1396,7 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
                             |acc, x, y| x.fma(y, acc),
                             |p, q| p + q,
                         );
-                        sink += r.reduce_sum().to_f64();
+                        sink += r.reduce_sum().into_f64();
                     }
                     black_box(sink);
                     let e = t.elapsed().as_nanos() as u64;
@@ -1159,38 +1450,56 @@ impl<T: Scalar, S: Backend<T>> Gang<T, S> {
     }
 }
 
-/// Full-register chunk iterator produced by [`Gang::chunks`]. Yields `(offset, count)` where
-/// `count` is the number of valid elements in the chunk — `lanes()` for all but a final
-/// short tail.
+/// Full-register-only chunk iterator produced by [`Gang::chunks_exact`]. Yields each `offset`
+/// whose chunk is exactly `lanes()` wide, stepping by `lanes()`, and stops before any short tail
+/// — pick that up once, after the loop, via [`remainder`](ChunksExact::remainder) (or
+/// [`Gang::remainder`]).
+///
+/// `next` re-tests `offset + lanes <= len` — the same guard a hand-written full-register `while`
+/// loop carries — so after inlining, the guard dominates the body's `&col[off..off + lanes]`
+/// slice constructions and their bounds checks fold away. That is the difference from
+/// [`Gang::chunks`], whose runtime `count` keeps a partial-vs-full branch and live bounds checks
+/// in the hot loop.
 #[derive(Clone, Copy, Debug)]
-pub struct Chunks {
+pub struct ChunksExact {
     lanes: usize,
     pos: usize,
     len: usize,
 }
 
-impl Iterator for Chunks {
-    type Item = (usize, usize);
+impl ChunksExact {
+    /// The tail the full-register pass leaves: `Some((offset, count))` with
+    /// `0 < count < lanes()`, or `None` when `len` divides evenly. Independent of iteration
+    /// progress, so it can be read before, during, or after the loop.
+    #[inline]
+    pub fn remainder(self) -> Option<(usize, usize)> {
+        let cnt = self.len % self.lanes;
+        (cnt != 0).then_some((self.len - cnt, cnt))
+    }
+}
+
+impl Iterator for ChunksExact {
+    type Item = usize;
 
     #[inline]
-    fn next(&mut self) -> Option<(usize, usize)> {
-        if self.pos >= self.len {
-            return None;
+    fn next(&mut self) -> Option<usize> {
+        if self.pos + self.lanes <= self.len {
+            let off = self.pos;
+            self.pos += self.lanes;
+            Some(off)
+        } else {
+            None
         }
-        let count = core::cmp::min(self.lanes, self.len - self.pos);
-        let off = self.pos;
-        self.pos += count;
-        Some((off, count))
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = (self.len - self.pos).div_ceil(self.lanes);
+        let remaining = (self.len - self.pos.min(self.len)) / self.lanes;
         (remaining, Some(remaining))
     }
 }
 
-impl ExactSizeIterator for Chunks {}
+impl ExactSizeIterator for ChunksExact {}
 
 /// A varying value: `lanes()` elements of `T`, on backend `S`.
 #[derive(Clone, Copy)]
@@ -1216,14 +1525,14 @@ impl<T: Scalar, S: Backend<T>> Varying<T, S> {
         self.v
     }
 
-    /// Store this register; `out.len()` must equal `lanes()`.
+    /// Store this register; `out.len()` must equal `lanes()` or this panics.
     ///
-    /// The backend writes exactly `lanes()` elements with an unchecked SIMD store: passing a slice
-    /// of any other length is undefined behaviour. The length match is the caller's contract,
-    /// checked only under `debug_assertions`. For tails, use [`Varying::store_partial`].
+    /// The backend writes exactly `lanes()` elements with an unchecked SIMD store; the length
+    /// check guards it in every build and folds away at the usual provable-length call shapes
+    /// (see [`Gang::load`]). For tails, use [`Varying::store_partial`].
     #[inline(always)]
     pub fn store(self, out: &mut [T]) {
-        debug_assert!(
+        assert!(
             out.len() == self.backend.lanes(),
             "Varying::store: slice length must equal lanes()",
         );
@@ -1249,26 +1558,35 @@ impl<T: Scalar, S: Backend<T>> Varying<T, S> {
     pub fn sqrt(self) -> Self {
         Self::wrap(self.backend, self.backend.sqrt(self.v))
     }
+    /// Lane-wise reciprocal `1/self`, full-precision (an IEEE divide, not a fast `rcp` estimate).
+    #[inline(always)]
+    pub fn recip(self) -> Self {
+        let one = self.backend.splat(T::ONE);
+        Self::wrap(self.backend, self.backend.div(one, self.v))
+    }
     /// Absolute value. Backends with a dedicated abs instruction (NEON `fabs`, wasm `f*.abs`,
-    /// AVX-512 `vabs`) or a single sign-bit clear use it; the rest fall back to `max(self, -self)`,
-    /// which is non-NaN-propagating — see the [`max`](Self::max) note before relying on `abs` to keep
-    /// a NaN-poisoned tail out of a later comparison, and reach for
-    /// [`Gang::active_mask`](crate::Gang::active_mask) there instead.
+    /// AVX-512 `vabs`) or a single sign-bit clear use it; the rest fall back to `max(self, -self)`.
+    /// `abs(NaN)` is NaN on every backend (both fallback operands are NaN, and minimumNumber
+    /// `max` only scrubs when exactly one operand is), so `abs` alone never breaks a NaN-poisoned
+    /// tail — only an intervening [`min`](Self::min)/[`max`](Self::max) against a non-NaN does.
     #[inline(always)]
     pub fn abs(self) -> Self {
         Self::wrap(self.backend, self.backend.abs(self.v))
     }
-    /// Lane-wise minimum. **Non-NaN-propagating**, matching the hardware `min`/`max` and the scalar
-    /// oracle: a NaN operand is not guaranteed to survive — the result may take the other operand.
+    /// Lane-wise IEEE 754-2019 **minimumNumber**, identically on every backend: a lane with
+    /// exactly one NaN operand takes the *other* operand; NaN comes out only when both operands
+    /// are NaN. Which zero wins a `-0.0`/`+0.0` tie is the one backend-specific detail — don't
+    /// build logic on it.
     #[inline(always)]
     pub fn min(self, o: Self) -> Self {
         Self::wrap(self.backend, self.backend.min(self.v, o.v))
     }
-    /// Lane-wise maximum, with the same **non-NaN-propagating** rule as [`min`](Self::min). The sharp
-    /// edge: a NaN-poisoned tail (a `load_partial` NaN fill, used to make a compare reject padding) is
-    /// silently scrubbed if a `min`/`max`/[`abs`](Self::abs) sits between the fill and that compare, so
-    /// the padding then leaks into the reduction. Use [`Gang::active_mask`](crate::Gang::active_mask)
-    /// whenever such an op intervenes.
+    /// Lane-wise IEEE 754-2019 **maximumNumber**, with the same NaN rule as [`min`](Self::min).
+    /// The sharp edge that rule creates: a NaN-poisoned tail (a `load_partial` NaN fill, used to
+    /// make a compare reject padding) is *always* scrubbed when a `min`/`max` against a non-NaN
+    /// operand sits between the fill and that compare — deterministically, on every backend — so
+    /// the padding then leaks into the reduction. Use
+    /// [`Gang::active_mask`](crate::Gang::active_mask) whenever such an op intervenes.
     #[inline(always)]
     pub fn max(self, o: Self) -> Self {
         Self::wrap(self.backend, self.backend.max(self.v, o.v))
@@ -1277,6 +1595,15 @@ impl<T: Scalar, S: Backend<T>> Varying<T, S> {
     #[inline(always)]
     pub fn fma(self, b: Self, c: Self) -> Self {
         Self::wrap(self.backend, self.backend.fma(self.v, b.v, c.v))
+    }
+
+    /// Each lane's bit pattern as an integer-companion lane — free on backends whose integer
+    /// lanes share the register file. Exact for 32-bit `T` (exponent/mantissa bit tricks, sign
+    /// manipulation); see [`Scalar::to_bits32`] for the 16/64-bit story. Inverse:
+    /// [`VaryingU32::to_float_bits`] / [`Gang::from_bits`].
+    #[inline(always)]
+    pub fn to_bits(self) -> VaryingU32<T, S> {
+        VaryingU32::wrap(self.backend, self.backend.to_bits(self.v))
     }
 
     #[inline(always)]
@@ -1306,10 +1633,13 @@ impl<T: Scalar, S: Backend<T>> Varying<T, S> {
     pub fn reduce_sum(self) -> T {
         self.backend.reduce_sum(self.v)
     }
+    /// Horizontal minimum with [`min`](Self::min)'s minimumNumber rule folded across the lanes:
+    /// NaN lanes are ignored; the result is NaN only if every lane is NaN.
     #[inline(always)]
     pub fn reduce_min(self) -> T {
         self.backend.reduce_min(self.v)
     }
+    /// Horizontal maximum; see [`reduce_min`](Self::reduce_min).
     #[inline(always)]
     pub fn reduce_max(self) -> T {
         self.backend.reduce_max(self.v)
@@ -1422,5 +1752,217 @@ impl<T: Scalar, S: Backend<T>> Not for Mask<T, S> {
     #[inline(always)]
     fn not(self) -> Self {
         Mask::wrap(self.backend, self.backend.mask_not(self.m))
+    }
+}
+
+/// The 32-bit unsigned integer companion register: [`lanes()`](Gang::lanes) lanes of `u32`
+/// riding alongside a gang's float lanes — lane indices ([`Gang::ramp_u32`]), counters, and the
+/// integer half of float bit tricks ([`Varying::to_bits`]). Arithmetic is wrapping, matching
+/// SIMD integer instructions. Compares produce the same [`Mask`] the float compares do, so
+/// float- and integer-derived conditions compose freely (`&`, `|`, [`select`](Self::select)),
+/// which is what makes argmin-style index tracking a three-line loop body.
+#[derive(Clone, Copy)]
+pub struct VaryingU32<T: Scalar, S: Backend<T>> {
+    backend: S,
+    v: S::IVector,
+    _t: PhantomData<T>,
+}
+
+/// The signed view of the integer companion — same register, arithmetic (sign-filling) right
+/// shift and signed compares. Convert freely with [`VaryingU32::as_i32`]/[`VaryingI32::as_u32`]
+/// (bit-identical, free).
+#[derive(Clone, Copy)]
+pub struct VaryingI32<T: Scalar, S: Backend<T>> {
+    backend: S,
+    v: S::IVector,
+    _t: PhantomData<T>,
+}
+
+impl<T: Scalar, S: Backend<T>> VaryingU32<T, S> {
+    #[inline(always)]
+    fn wrap(backend: S, v: S::IVector) -> Self {
+        Self { backend, v, _t: PhantomData }
+    }
+    /// The raw backend integer register.
+    #[inline(always)]
+    pub fn raw(self) -> S::IVector {
+        self.v
+    }
+    /// Store this register; `out.len()` must equal `lanes()` or this panics.
+    #[inline(always)]
+    pub fn store(self, out: &mut [u32]) {
+        assert!(
+            out.len() == self.backend.lanes(),
+            "VaryingU32::store: slice length must equal lanes()",
+        );
+        self.backend.istore(self.v, out)
+    }
+    /// Reinterpret as the signed view (free).
+    #[inline(always)]
+    pub fn as_i32(self) -> VaryingI32<T, S> {
+        VaryingI32 { backend: self.backend, v: self.v, _t: PhantomData }
+    }
+    /// Reinterpret each lane's bits as the gang's float element — the inverse of
+    /// [`Varying::to_bits`]. Exact for 32-bit `T`; see [`Scalar::from_bits32`] for the
+    /// 16/64-bit story.
+    #[inline(always)]
+    pub fn to_float_bits(self) -> Varying<T, S> {
+        Varying::wrap(self.backend, self.backend.from_bits(self.v))
+    }
+    #[inline(always)]
+    pub fn eq(self, o: Self) -> Mask<T, S> {
+        Mask::wrap(self.backend, self.backend.ieq(self.v, o.v))
+    }
+    #[inline(always)]
+    pub fn ne(self, o: Self) -> Mask<T, S> {
+        !self.eq(o)
+    }
+    /// Unsigned lane-wise `<`.
+    #[inline(always)]
+    pub fn lt(self, o: Self) -> Mask<T, S> {
+        Mask::wrap(self.backend, self.backend.ilt_u(self.v, o.v))
+    }
+    #[inline(always)]
+    pub fn gt(self, o: Self) -> Mask<T, S> {
+        o.lt(self)
+    }
+    #[inline(always)]
+    pub fn le(self, o: Self) -> Mask<T, S> {
+        !o.lt(self)
+    }
+    #[inline(always)]
+    pub fn ge(self, o: Self) -> Mask<T, S> {
+        !self.lt(o)
+    }
+    /// `mask ? self : other`, lane-wise — the same [`Mask`] the float compares produce.
+    #[inline(always)]
+    pub fn select(self, mask: Mask<T, S>, other: Self) -> Self {
+        Self::wrap(self.backend, self.backend.iselect(mask.m, self.v, other.v))
+    }
+}
+
+impl<T: Scalar, S: Backend<T>> VaryingI32<T, S> {
+    /// The raw backend integer register.
+    #[inline(always)]
+    pub fn raw(self) -> S::IVector {
+        self.v
+    }
+    /// Store this register; `out.len()` must equal `lanes()` or this panics.
+    #[inline(always)]
+    pub fn store(self, out: &mut [i32]) {
+        let n = self.backend.lanes();
+        assert!(out.len() == n, "VaryingI32::store: slice length must equal lanes()");
+        let mut buf = [0u32; crate::MAX_LANES];
+        self.backend.istore(self.v, &mut buf[..n]);
+        for (o, &b) in out.iter_mut().zip(&buf[..n]) {
+            *o = b as i32;
+        }
+    }
+    /// Reinterpret as the unsigned view (free).
+    #[inline(always)]
+    pub fn as_u32(self) -> VaryingU32<T, S> {
+        VaryingU32 { backend: self.backend, v: self.v, _t: PhantomData }
+    }
+    #[inline(always)]
+    pub fn eq(self, o: Self) -> Mask<T, S> {
+        Mask::wrap(self.backend, self.backend.ieq(self.v, o.v))
+    }
+    #[inline(always)]
+    pub fn ne(self, o: Self) -> Mask<T, S> {
+        !self.eq(o)
+    }
+    /// Signed lane-wise `<`.
+    #[inline(always)]
+    pub fn lt(self, o: Self) -> Mask<T, S> {
+        Mask::wrap(self.backend, self.backend.ilt_s(self.v, o.v))
+    }
+    #[inline(always)]
+    pub fn gt(self, o: Self) -> Mask<T, S> {
+        o.lt(self)
+    }
+    #[inline(always)]
+    pub fn le(self, o: Self) -> Mask<T, S> {
+        !o.lt(self)
+    }
+    #[inline(always)]
+    pub fn ge(self, o: Self) -> Mask<T, S> {
+        !self.lt(o)
+    }
+    /// `mask ? self : other`, lane-wise.
+    #[inline(always)]
+    pub fn select(self, mask: Mask<T, S>, other: Self) -> Self {
+        Self { backend: self.backend, v: self.backend.iselect(mask.m, self.v, other.v), _t: PhantomData }
+    }
+}
+
+macro_rules! int_binop {
+    ($ty:ident, $trait:ident, $method:ident, $bk:ident) => {
+        impl<T: Scalar, S: Backend<T>> $trait for $ty<T, S> {
+            type Output = $ty<T, S>;
+            #[inline(always)]
+            fn $method(self, rhs: Self) -> Self {
+                Self { backend: self.backend, v: self.backend.$bk(self.v, rhs.v), _t: PhantomData }
+            }
+        }
+    };
+}
+
+int_binop!(VaryingU32, Add, add, iadd);
+int_binop!(VaryingU32, Sub, sub, isub);
+int_binop!(VaryingU32, Mul, mul, imul);
+int_binop!(VaryingU32, BitAnd, bitand, iand);
+int_binop!(VaryingU32, BitOr, bitor, ior);
+int_binop!(VaryingU32, BitXor, bitxor, ixor);
+int_binop!(VaryingI32, Add, add, iadd);
+int_binop!(VaryingI32, Sub, sub, isub);
+int_binop!(VaryingI32, Mul, mul, imul);
+int_binop!(VaryingI32, BitAnd, bitand, iand);
+int_binop!(VaryingI32, BitOr, bitor, ior);
+int_binop!(VaryingI32, BitXor, bitxor, ixor);
+
+impl<T: Scalar, S: Backend<T>> Not for VaryingU32<T, S> {
+    type Output = Self;
+    #[inline(always)]
+    fn not(self) -> Self {
+        Self { backend: self.backend, v: self.backend.inot(self.v), _t: PhantomData }
+    }
+}
+impl<T: Scalar, S: Backend<T>> Not for VaryingI32<T, S> {
+    type Output = Self;
+    #[inline(always)]
+    fn not(self) -> Self {
+        Self { backend: self.backend, v: self.backend.inot(self.v), _t: PhantomData }
+    }
+}
+/// Lane-wise shift by a uniform count (`k < 32`).
+impl<T: Scalar, S: Backend<T>> core::ops::Shl<u32> for VaryingU32<T, S> {
+    type Output = Self;
+    #[inline(always)]
+    fn shl(self, k: u32) -> Self {
+        Self { backend: self.backend, v: self.backend.ishl(self.v, k), _t: PhantomData }
+    }
+}
+/// Logical (zero-filling) right shift by a uniform count (`k < 32`).
+impl<T: Scalar, S: Backend<T>> core::ops::Shr<u32> for VaryingU32<T, S> {
+    type Output = Self;
+    #[inline(always)]
+    fn shr(self, k: u32) -> Self {
+        Self { backend: self.backend, v: self.backend.ishr(self.v, k), _t: PhantomData }
+    }
+}
+/// Lane-wise shift by a uniform count (`k < 32`).
+impl<T: Scalar, S: Backend<T>> core::ops::Shl<u32> for VaryingI32<T, S> {
+    type Output = Self;
+    #[inline(always)]
+    fn shl(self, k: u32) -> Self {
+        Self { backend: self.backend, v: self.backend.ishl(self.v, k), _t: PhantomData }
+    }
+}
+/// Arithmetic (sign-filling) right shift by a uniform count (`k < 32`).
+impl<T: Scalar, S: Backend<T>> core::ops::Shr<u32> for VaryingI32<T, S> {
+    type Output = Self;
+    #[inline(always)]
+    fn shr(self, k: u32) -> Self {
+        Self { backend: self.backend, v: self.backend.ishr_arith(self.v, k), _t: PhantomData }
     }
 }

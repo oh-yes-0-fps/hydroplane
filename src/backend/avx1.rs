@@ -61,6 +61,18 @@ impl Backend<f32> for Avx1 {
     type Vector = __m256;
     type Mask = __m256;
 
+    type IVector = [u32; 8];
+    #[inline(always)]
+    fn iload(self, s: &[u32]) -> [u32; 8] {
+        let mut v = [0u32; 8];
+        v.copy_from_slice(s);
+        v
+    }
+    #[inline(always)]
+    fn istore(self, v: [u32; 8], out: &mut [u32]) {
+        out.copy_from_slice(&v);
+    }
+
     #[inline(always)]
     fn lanes(self) -> usize {
         8
@@ -239,12 +251,16 @@ unsafe fn f32_sqrt(a: __m256) -> __m256 {
 #[target_feature(enable = "avx")]
 #[inline]
 unsafe fn f32_min(a: __m256, b: __m256) -> __m256 {
-    _mm256_min_ps(a, b)
+    // IEEE minimumNumber: `vminps` already yields `b` when `a` is NaN; blend patches the
+    // b-is-NaN case (bare `vminps` would return the NaN).
+    let m = _mm256_min_ps(a, b);
+    _mm256_blendv_ps(m, a, _mm256_cmp_ps::<_CMP_UNORD_Q>(b, b))
 }
 #[target_feature(enable = "avx")]
 #[inline]
 unsafe fn f32_max(a: __m256, b: __m256) -> __m256 {
-    _mm256_max_ps(a, b)
+    let m = _mm256_max_ps(a, b);
+    _mm256_blendv_ps(m, a, _mm256_cmp_ps::<_CMP_UNORD_Q>(b, b))
 }
 #[target_feature(enable = "avx")]
 #[inline]
@@ -284,8 +300,14 @@ unsafe fn f32_reduce<const OP: i32>(v: __m256) -> f32 {
     #[inline(always)]
     unsafe fn combine<const OP: i32>(a: __m128, b: __m128) -> __m128 {
         match OP {
-            1 => _mm_min_ps(a, b),
-            2 => _mm_max_ps(a, b),
+            1 => {
+                let m = _mm_min_ps(a, b);
+                _mm_blendv_ps(m, a, _mm_cmpunord_ps(b, b))
+            }
+            2 => {
+                let m = _mm_max_ps(a, b);
+                _mm_blendv_ps(m, a, _mm_cmpunord_ps(b, b))
+            }
             _ => _mm_add_ps(a, b),
         }
     }
@@ -302,6 +324,18 @@ unsafe fn f32_reduce<const OP: i32>(v: __m256) -> f32 {
 impl Backend<f64> for Avx1 {
     type Vector = __m256d;
     type Mask = __m256d;
+
+    type IVector = [u32; 4];
+    #[inline(always)]
+    fn iload(self, s: &[u32]) -> [u32; 4] {
+        let mut v = [0u32; 4];
+        v.copy_from_slice(s);
+        v
+    }
+    #[inline(always)]
+    fn istore(self, v: [u32; 4], out: &mut [u32]) {
+        out.copy_from_slice(&v);
+    }
 
     #[inline(always)]
     fn lanes(self) -> usize {
@@ -479,12 +513,14 @@ unsafe fn f64_sqrt(a: __m256d) -> __m256d {
 #[target_feature(enable = "avx")]
 #[inline]
 unsafe fn f64_min(a: __m256d, b: __m256d) -> __m256d {
-    _mm256_min_pd(a, b)
+    let m = _mm256_min_pd(a, b);
+    _mm256_blendv_pd(m, a, _mm256_cmp_pd::<_CMP_UNORD_Q>(b, b))
 }
 #[target_feature(enable = "avx")]
 #[inline]
 unsafe fn f64_max(a: __m256d, b: __m256d) -> __m256d {
-    _mm256_max_pd(a, b)
+    let m = _mm256_max_pd(a, b);
+    _mm256_blendv_pd(m, a, _mm256_cmp_pd::<_CMP_UNORD_Q>(b, b))
 }
 #[target_feature(enable = "avx")]
 #[inline]
@@ -524,8 +560,14 @@ unsafe fn f64_reduce<const OP: i32>(v: __m256d) -> f64 {
     #[inline(always)]
     unsafe fn combine<const OP: i32>(a: __m128d, b: __m128d) -> __m128d {
         match OP {
-            1 => _mm_min_pd(a, b),
-            2 => _mm_max_pd(a, b),
+            1 => {
+                let m = _mm_min_pd(a, b);
+                _mm_blendv_pd(m, a, _mm_cmpunord_pd(b, b))
+            }
+            2 => {
+                let m = _mm_max_pd(a, b);
+                _mm_blendv_pd(m, a, _mm_cmpunord_pd(b, b))
+            }
             _ => _mm_add_pd(a, b),
         }
     }

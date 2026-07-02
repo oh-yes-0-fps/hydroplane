@@ -8,11 +8,11 @@ use wide::f32x4;
 #[kernel]
 fn dot<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> f32 {
     let mut acc = ctx.splat(0.0);
-    for (off, cnt) in ctx.chunks(a.len()) {
+    ctx.for_each_chunk(a.len(), |off, cnt| {
         let x = ctx.load_partial(&a[off..off + cnt], 0.0);
         let y = ctx.load_partial(&b[off..off + cnt], 0.0);
         acc = acc + x * y;
-    }
+    });
     acc.reduce_sum()
 }
 

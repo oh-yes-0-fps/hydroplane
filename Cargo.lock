@@ -197,6 +197,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "glam"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f70749695b063ecbf6b62949ccccde2e733ec3ecbbd71d467dca4e5c6c97cca0"
+dependencies = [
+ "libm",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -204,6 +213,7 @@ checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
 dependencies = [
  "cfg-if",
  "crunchy",
+ "num-traits",
  "zerocopy",
 ]
 
@@ -212,9 +222,11 @@ name = "hydroplane"
 version = "0.0.1"
 dependencies = [
  "criterion",
+ "glam 0.32.1",
  "half",
  "hydroplane-macros",
  "libm",
+ "num-traits",
  "rand",
  "soa-rs",
  "spirv-std",
@@ -222,9 +234,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydroplane-auto"
+version = "0.0.1"
+
+[[package]]
+name = "hydroplane-example"
+version = "0.0.0"
+dependencies = [
+ "criterion",
+ "glam 0.32.1",
+ "hydroplane",
+ "hydroplane-auto",
+ "wide",
+]
+
+[[package]]
 name = "hydroplane-macros"
 version = "0.0.1"
 dependencies = [
+ "hydroplane-auto",
  "proc-macro2",
  "quote",
  "syn",
@@ -474,7 +502,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68cdc5ca01151f2627fdf1cff34bf6452f5dc212a6d09f4aa5a9b4f17e9bc8e3"
 dependencies = [
  "bitflags",
- "glam",
+ "glam 0.30.8",
  "libm",
  "num-traits",
  "spirv-std-macros",

@@ -78,11 +78,11 @@ impl Backend<f32> for Neon {
     }
     #[inline(always)]
     fn min(self, a: float32x4_t, b: float32x4_t) -> float32x4_t {
-        unsafe { vminq_f32(a, b) }
+        unsafe { vminnmq_f32(a, b) }
     }
     #[inline(always)]
     fn max(self, a: float32x4_t, b: float32x4_t) -> float32x4_t {
-        unsafe { vmaxq_f32(a, b) }
+        unsafe { vmaxnmq_f32(a, b) }
     }
     #[inline(always)]
     fn le(self, a: float32x4_t, b: float32x4_t) -> uint32x4_t {
@@ -136,11 +136,96 @@ impl Backend<f32> for Neon {
     }
     #[inline(always)]
     fn reduce_min(self, v: float32x4_t) -> f32 {
-        unsafe { vminvq_f32(v) }
+        unsafe { vminnmvq_f32(v) }
     }
     #[inline(always)]
     fn reduce_max(self, v: float32x4_t) -> f32 {
-        unsafe { vmaxvq_f32(v) }
+        unsafe { vmaxnmvq_f32(v) }
+    }
+
+    type IVector = uint32x4_t;
+    #[inline(always)]
+    fn iload(self, s: &[u32]) -> uint32x4_t {
+        debug_assert_eq!(s.len(), 4);
+        unsafe { vld1q_u32(s.as_ptr()) }
+    }
+    #[inline(always)]
+    fn istore(self, v: uint32x4_t, out: &mut [u32]) {
+        debug_assert_eq!(out.len(), 4);
+        unsafe { vst1q_u32(out.as_mut_ptr(), v) }
+    }
+    #[inline(always)]
+    fn isplat(self, v: u32) -> uint32x4_t {
+        unsafe { vdupq_n_u32(v) }
+    }
+    #[inline(always)]
+    fn iadd(self, a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+        unsafe { vaddq_u32(a, b) }
+    }
+    #[inline(always)]
+    fn isub(self, a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+        unsafe { vsubq_u32(a, b) }
+    }
+    #[inline(always)]
+    fn imul(self, a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+        unsafe { vmulq_u32(a, b) }
+    }
+    #[inline(always)]
+    fn iand(self, a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+        unsafe { vandq_u32(a, b) }
+    }
+    #[inline(always)]
+    fn ior(self, a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+        unsafe { vorrq_u32(a, b) }
+    }
+    #[inline(always)]
+    fn ixor(self, a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+        unsafe { veorq_u32(a, b) }
+    }
+    #[inline(always)]
+    fn inot(self, a: uint32x4_t) -> uint32x4_t {
+        unsafe { vmvnq_u32(a) }
+    }
+    #[inline(always)]
+    fn ishl(self, a: uint32x4_t, k: u32) -> uint32x4_t {
+        debug_assert!(k < 32);
+        unsafe { vshlq_u32(a, vdupq_n_s32(k as i32)) }
+    }
+    #[inline(always)]
+    fn ishr(self, a: uint32x4_t, k: u32) -> uint32x4_t {
+        debug_assert!(k < 32);
+        unsafe { vshlq_u32(a, vdupq_n_s32(-(k as i32))) }
+    }
+    #[inline(always)]
+    fn ishr_arith(self, a: uint32x4_t, k: u32) -> uint32x4_t {
+        debug_assert!(k < 32);
+        unsafe {
+            vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(a), vdupq_n_s32(-(k as i32))))
+        }
+    }
+    #[inline(always)]
+    fn ieq(self, a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+        unsafe { vceqq_u32(a, b) }
+    }
+    #[inline(always)]
+    fn ilt_u(self, a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+        unsafe { vcltq_u32(a, b) }
+    }
+    #[inline(always)]
+    fn ilt_s(self, a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+        unsafe { vcltq_s32(vreinterpretq_s32_u32(a), vreinterpretq_s32_u32(b)) }
+    }
+    #[inline(always)]
+    fn iselect(self, m: uint32x4_t, a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+        unsafe { vbslq_u32(m, a, b) }
+    }
+    #[inline(always)]
+    fn to_bits(self, v: float32x4_t) -> uint32x4_t {
+        unsafe { vreinterpretq_u32_f32(v) }
+    }
+    #[inline(always)]
+    fn from_bits(self, v: uint32x4_t) -> float32x4_t {
+        unsafe { vreinterpretq_f32_u32(v) }
     }
 }
 
@@ -200,11 +285,11 @@ impl Backend<f64> for Neon {
     }
     #[inline(always)]
     fn min(self, a: float64x2_t, b: float64x2_t) -> float64x2_t {
-        unsafe { vminq_f64(a, b) }
+        unsafe { vminnmq_f64(a, b) }
     }
     #[inline(always)]
     fn max(self, a: float64x2_t, b: float64x2_t) -> float64x2_t {
-        unsafe { vmaxq_f64(a, b) }
+        unsafe { vmaxnmq_f64(a, b) }
     }
     #[inline(always)]
     fn le(self, a: float64x2_t, b: float64x2_t) -> uint64x2_t {
@@ -262,6 +347,18 @@ impl Backend<f64> for Neon {
     #[inline(always)]
     fn reduce_max(self, v: float64x2_t) -> f64 {
         unsafe { vgetq_lane_f64::<0>(v).max(vgetq_lane_f64::<1>(v)) }
+    }
+
+    type IVector = [u32; 2];
+    #[inline(always)]
+    fn iload(self, s: &[u32]) -> [u32; 2] {
+        let mut v = [0u32; 2];
+        v.copy_from_slice(s);
+        v
+    }
+    #[inline(always)]
+    fn istore(self, v: [u32; 2], out: &mut [u32]) {
+        out.copy_from_slice(&v);
     }
 }
 
@@ -343,11 +440,11 @@ mod bf16_impl {
         }
         #[inline(always)]
         fn min(self, a: float32x4_t, b: float32x4_t) -> float32x4_t {
-            unsafe { vminq_f32(a, b) }
+            unsafe { vminnmq_f32(a, b) }
         }
         #[inline(always)]
         fn max(self, a: float32x4_t, b: float32x4_t) -> float32x4_t {
-            unsafe { vmaxq_f32(a, b) }
+            unsafe { vmaxnmq_f32(a, b) }
         }
         #[inline(always)]
         fn le(self, a: float32x4_t, b: float32x4_t) -> uint32x4_t {
@@ -400,11 +497,23 @@ mod bf16_impl {
         }
         #[inline(always)]
         fn reduce_min(self, v: float32x4_t) -> bf16 {
-            bf16::from_f32(unsafe { vminvq_f32(v) })
+            bf16::from_f32(unsafe { vminnmvq_f32(v) })
         }
         #[inline(always)]
         fn reduce_max(self, v: float32x4_t) -> bf16 {
-            bf16::from_f32(unsafe { vmaxvq_f32(v) })
+            bf16::from_f32(unsafe { vmaxnmvq_f32(v) })
+        }
+
+        type IVector = [u32; 4];
+        #[inline(always)]
+        fn iload(self, s: &[u32]) -> [u32; 4] {
+            let mut v = [0u32; 4];
+            v.copy_from_slice(s);
+            v
+        }
+        #[inline(always)]
+        fn istore(self, v: [u32; 4], out: &mut [u32]) {
+            out.copy_from_slice(&v);
         }
     }
 }
@@ -469,11 +578,11 @@ mod f16_impl {
     }
     #[target_feature(enable = "fp16")]
     unsafe fn min(a: float16x8_t, b: float16x8_t) -> float16x8_t {
-        vminq_f16(a, b)
+        vminnmq_f16(a, b)
     }
     #[target_feature(enable = "fp16")]
     unsafe fn max(a: float16x8_t, b: float16x8_t) -> float16x8_t {
-        vmaxq_f16(a, b)
+        vmaxnmq_f16(a, b)
     }
     #[target_feature(enable = "fp16")]
     unsafe fn le(a: float16x8_t, b: float16x8_t) -> uint16x8_t {
@@ -620,15 +729,27 @@ mod f16_impl {
         fn reduce_min(self, v: float16x8_t) -> f16 {
             unsafe {
                 let (lo, hi) = widen(v);
-                f16::from_f32(vminvq_f32(vminq_f32(lo, hi)))
+                f16::from_f32(vminnmvq_f32(vminnmq_f32(lo, hi)))
             }
         }
         #[inline(always)]
         fn reduce_max(self, v: float16x8_t) -> f16 {
             unsafe {
                 let (lo, hi) = widen(v);
-                f16::from_f32(vmaxvq_f32(vmaxq_f32(lo, hi)))
+                f16::from_f32(vmaxnmvq_f32(vmaxnmq_f32(lo, hi)))
             }
+        }
+
+        type IVector = [u32; 8];
+        #[inline(always)]
+        fn iload(self, s: &[u32]) -> [u32; 8] {
+            let mut v = [0u32; 8];
+            v.copy_from_slice(s);
+            v
+        }
+        #[inline(always)]
+        fn istore(self, v: [u32; 8], out: &mut [u32]) {
+            out.copy_from_slice(&v);
         }
     }
 }

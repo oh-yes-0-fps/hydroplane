@@ -34,16 +34,27 @@ impl Kernel<f32> for AnyOverlap<'_> {
             ctx.splat(self.q[2]),
             ctx.splat(self.q[3]),
         );
-        for (k, cnt) in ctx.chunks(self.xs.len()) {
-            let dx = cx - ctx.load_partial(&self.xs[k..k + cnt], 0.0);
-            let dy = cy - ctx.load_partial(&self.ys[k..k + cnt], 0.0);
-            let dz = cz - ctx.load_partial(&self.zs[k..k + cnt], 0.0);
-            let r = ctx.load_partial(&self.rs[k..k + cnt], f32::NAN);
+        let n = ctx.lanes();
+        for k in ctx.chunks_exact(self.xs.len()) {
+            let dx = cx - ctx.load(&self.xs[k..k + n]);
+            let dy = cy - ctx.load(&self.ys[k..k + n]);
+            let dz = cz - ctx.load(&self.zs[k..k + n]);
+            let r = ctx.load(&self.rs[k..k + n]);
             let d2 = dx * dx + dy * dy + dz * dz;
             let rsum = sr + r;
             if d2.le(rsum * rsum).any() {
                 return true;
             }
+        }
+        if let Some((k, cnt)) = ctx.remainder(self.xs.len()) {
+            let dx = cx - ctx.load_partial(&self.xs[k..k + cnt], 0.0);
+            let dy = cy - ctx.load_partial(&self.ys[k..k + cnt], 0.0);
+            let dz = cz - ctx.load_partial(&self.zs[k..k + cnt], 0.0);
+            // NaN radius fill: `d2 <= (sr + NaN)^2` is false, so padding lanes can never hit.
+            let r = ctx.load_partial(&self.rs[k..k + cnt], f32::NAN);
+            let d2 = dx * dx + dy * dy + dz * dz;
+            let rsum = sr + r;
+            return d2.le(rsum * rsum).any();
         }
         false
     }

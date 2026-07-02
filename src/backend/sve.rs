@@ -160,6 +160,21 @@ macro_rules! impl_sve_backend {
             fn reduce_max(self, v: SveVec<C>) -> $t {
                 unsafe { sve1::$rmax::<C>(&v) }
             }
+
+            // Scalable vector length, so the integer companion rides a fixed max-width array;
+            // every op takes the trait's portable default.
+            type IVector = [u32; crate::MAX_LANES];
+            #[inline(always)]
+            fn iload(self, s: &[u32]) -> [u32; crate::MAX_LANES] {
+                let mut v = [0u32; crate::MAX_LANES];
+                v[..s.len()].copy_from_slice(s);
+                v
+            }
+            #[inline(always)]
+            fn istore(self, v: [u32; crate::MAX_LANES], out: &mut [u32]) {
+                let n = out.len();
+                out.copy_from_slice(&v[..n]);
+            }
         }
     };
 }

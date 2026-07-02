@@ -292,6 +292,8 @@ binop!(add_f32, "e32", 4, "vle32.v", "vse32.v", "vfadd.vv v1, v1, v2");
 binop!(sub_f32, "e32", 4, "vle32.v", "vse32.v", "vfsub.vv v1, v1, v2");
 binop!(mul_f32, "e32", 4, "vle32.v", "vse32.v", "vfmul.vv v1, v1, v2");
 binop!(div_f32, "e32", 4, "vle32.v", "vse32.v", "vfdiv.vv v1, v1, v2");
+// `vfmin`/`vfmax` are IEEE 754-2019 minimumNumber/maximumNumber by spec — exactly the crate-wide
+// `Backend::min`/`max` contract, no fixup needed (unlike x86/wasm).
 binop!(min_f32, "e32", 4, "vle32.v", "vse32.v", "vfmin.vv v1, v1, v2");
 binop!(max_f32, "e32", 4, "vle32.v", "vse32.v", "vfmax.vv v1, v1, v2");
 unop!(neg_f32, "e32", 4, "vle32.v", "vse32.v", "vfneg.v v1, v1");

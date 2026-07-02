@@ -15,8 +15,175 @@ use crate::scalar::Scalar;
 type BinOp<T> = fn(ScalarBackend, T, T) -> T;
 
 fn rel_eq<T: Scalar>(got: T, want: T, tol: f64) -> bool {
-    let (g, w) = (got.to_f64(), want.to_f64());
+    let (g, w) = (got.into_f64(), want.into_f64());
     (g - w).abs() <= tol * (1.0 + w.abs())
+}
+
+/// minimumNumber/abs/reduction agreement on the values the random stream never draws: NaN, ±inf,
+/// ±0. Exact-operand identity is required except on a `-0.0`/`+0.0` tie (which zero wins is
+/// backend-specific), so equality here treats the zeros as equal and NaN as equal to NaN.
+fn check_specials<T, S>(b: S)
+where
+    T: Scalar,
+    S: Backend<T>,
+{
+    let s = ScalarBackend;
+    let n = b.lanes();
+    let eq = |g: f64, w: f64| (g.is_nan() && w.is_nan()) || g == w;
+    let store = |v: S::Vector| {
+        let mut o = vec![T::ZERO; n];
+        b.store(v, &mut o);
+        o
+    };
+    let specials = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.0, 0.0, -3.5, 2.25];
+
+    for off_a in 0..specials.len() {
+        let a: Vec<T> = (0..n).map(|i| T::from_f64(specials[(i + off_a) % specials.len()])).collect();
+        let va = b.load(&a);
+        for off_b in 0..specials.len() {
+            let bb: Vec<T> = (0..n).map(|i| T::from_f64(specials[(i + off_b) % specials.len()])).collect();
+            let vb = b.load(&bb);
+            let gmin = store(b.min(va, vb));
+            let gmax = store(b.max(va, vb));
+            for i in 0..n {
+                let (x, y) = (a[i].into_f64(), bb[i].into_f64());
+                let wmin = s.min(a[i], bb[i]).into_f64();
+                let wmax = s.max(a[i], bb[i]).into_f64();
+                assert!(eq(gmin[i].into_f64(), wmin), "min({x}, {y}) lane {i}: got {}, want {wmin}", gmin[i].into_f64());
+                assert!(eq(gmax[i].into_f64(), wmax), "max({x}, {y}) lane {i}: got {}, want {wmax}", gmax[i].into_f64());
+            }
+        }
+
+        let gabs = store(b.abs(va));
+        for i in 0..n {
+            let x = a[i].into_f64();
+            assert!(eq(gabs[i].into_f64(), x.abs()), "abs({x}) lane {i}: got {}", gabs[i].into_f64());
+        }
+
+        // f64::min/max are themselves minimumNumber, so a NaN-seeded fold ignores NaN lanes and
+        // stays NaN only if every lane is.
+        let wmin = a.iter().map(|x| x.into_f64()).fold(f64::NAN, f64::min);
+        let wmax = a.iter().map(|x| x.into_f64()).fold(f64::NAN, f64::max);
+        assert!(eq(b.reduce_min(va).into_f64(), wmin), "reduce_min specials (offset {off_a})");
+        assert!(eq(b.reduce_max(va).into_f64(), wmax), "reduce_max specials (offset {off_a})");
+    }
+
+    let all_nan: Vec<T> = (0..n).map(|_| T::from_f64(f64::NAN)).collect();
+    let vnan = b.load(&all_nan);
+    assert!(b.reduce_min(vnan).into_f64().is_nan(), "reduce_min of all-NaN must stay NaN");
+    assert!(b.reduce_max(vnan).into_f64().is_nan(), "reduce_max of all-NaN must stay NaN");
+}
+
+/// The 32-bit integer companion against plain scalar `u32`/`i32` arithmetic, exercising the
+/// native overrides where present and the store-roundtrip defaults everywhere else. Masks are
+/// observed through `mask_bitmask` (verified separately) so integer and float compares are held
+/// to the same lane layout.
+fn check_ints<T, S>(b: S)
+where
+    T: Scalar,
+    S: Backend<T>,
+{
+    use rand::Rng;
+    let n = b.lanes();
+    let mut rng = rand::rng();
+    let istore = |v: S::IVector| {
+        let mut o = vec![0u32; n];
+        b.istore(v, &mut o);
+        o
+    };
+
+    for round in 0..200 {
+        let a: Vec<u32> = (0..n).map(|_| rng.random()).collect();
+        let c: Vec<u32> = (0..n)
+            .map(|i| if round % 3 == 0 { a[i] } else { rng.random() })
+            .collect();
+        let va = b.iload(&a);
+        let vc = b.iload(&c);
+
+        type IntOp = fn(u32, u32) -> u32;
+        let bin: [(&str, Vec<u32>, IntOp); 6] = [
+            ("iadd", istore(b.iadd(va, vc)), u32::wrapping_add),
+            ("isub", istore(b.isub(va, vc)), u32::wrapping_sub),
+            ("imul", istore(b.imul(va, vc)), u32::wrapping_mul),
+            ("iand", istore(b.iand(va, vc)), |x, y| x & y),
+            ("ior", istore(b.ior(va, vc)), |x, y| x | y),
+            ("ixor", istore(b.ixor(va, vc)), |x, y| x ^ y),
+        ];
+        for (name, got, op) in bin {
+            for i in 0..n {
+                assert_eq!(got[i], op(a[i], c[i]), "{name} lane {i}");
+            }
+        }
+
+        let got = istore(b.inot(va));
+        for i in 0..n {
+            assert_eq!(got[i], !a[i], "inot lane {i}");
+        }
+
+        let k = rng.random_range(0..32u32);
+        let got = istore(b.ishl(va, k));
+        for i in 0..n {
+            assert_eq!(got[i], a[i] << k, "ishl({k}) lane {i}");
+        }
+        let got = istore(b.ishr(va, k));
+        for i in 0..n {
+            assert_eq!(got[i], a[i] >> k, "ishr({k}) lane {i}");
+        }
+        let got = istore(b.ishr_arith(va, k));
+        for i in 0..n {
+            assert_eq!(got[i], ((a[i] as i32) >> k) as u32, "ishr_arith({k}) lane {i}");
+        }
+
+        type IntPred = fn(u32, u32) -> bool;
+        let cmps: [(&str, u32, IntPred); 3] = [
+            ("ieq", b.mask_bitmask(b.ieq(va, vc)), |x, y| x == y),
+            ("ilt_u", b.mask_bitmask(b.ilt_u(va, vc)), |x, y| x < y),
+            ("ilt_s", b.mask_bitmask(b.ilt_s(va, vc)), |x, y| (x as i32) < (y as i32)),
+        ];
+        for (name, bits, pred) in cmps {
+            let mut want = 0u32;
+            for i in 0..n {
+                if pred(a[i], c[i]) {
+                    want |= 1 << i;
+                }
+            }
+            assert_eq!(bits, want, "{name} bitmask");
+        }
+
+        let m = b.ilt_u(va, vc);
+        let got = istore(b.iselect(m, va, vc));
+        for i in 0..n {
+            assert_eq!(got[i], if a[i] < c[i] { a[i] } else { c[i] }, "iselect lane {i}");
+        }
+
+        let got = istore(b.isplat(a[0]));
+        for (i, &g) in got.iter().enumerate() {
+            assert_eq!(g, a[0], "isplat lane {i}");
+        }
+        let got = istore(b.iramp());
+        for (i, &g) in got.iter().enumerate() {
+            assert_eq!(g, i as u32, "iramp lane {i}");
+        }
+
+        let f: Vec<T> = (0..n).map(|_| T::from_f64(rng.random_range(-100.0f64..100.0))).collect();
+        let vf = b.load(&f);
+        let got = istore(b.to_bits(vf));
+        for i in 0..n {
+            assert_eq!(got[i], f[i].to_bits32(), "to_bits lane {i}");
+        }
+        let round_trip = {
+            let mut o = vec![T::ZERO; n];
+            b.store(b.from_bits(b.to_bits(vf)), &mut o);
+            o
+        };
+        for i in 0..n {
+            assert_eq!(
+                round_trip[i].to_bits32(),
+                T::from_bits32(f[i].to_bits32()).to_bits32(),
+                "from_bits(to_bits) lane {i}"
+            );
+        }
+    }
 }
 
 fn check<T, S>(b: S, sample: impl Fn(&mut dyn FnMut() -> f64) -> T)
@@ -24,6 +191,8 @@ where
     T: Scalar,
     S: Backend<T>,
 {
+    check_specials(b);
+    check_ints(b);
     let s = ScalarBackend;
     let n = b.lanes();
     let mut rng = rand::rng();
@@ -52,21 +221,21 @@ where
         for (name, got, op) in exact {
             for i in 0..n {
                 let want = op(s, a[i], bb[i]);
-                assert_eq!(got[i].to_f64(), want.to_f64(), "{name} lane {i}");
+                assert_eq!(got[i].into_f64(), want.into_f64(), "{name} lane {i}");
             }
         }
 
         let got = store(&b, b.neg(va));
         for i in 0..n {
-            assert_eq!(got[i].to_f64(), a[i].neg().to_f64(), "neg lane {i}");
+            assert_eq!(got[i].into_f64(), a[i].neg().into_f64(), "neg lane {i}");
         }
 
         let got = store(&b, b.abs(va));
         for i in 0..n {
-            assert_eq!(got[i].to_f64(), a[i].to_f64().abs(), "abs lane {i}");
+            assert_eq!(got[i].into_f64(), a[i].into_f64().abs(), "abs lane {i}");
         }
 
-        let aa: Vec<T> = a.iter().map(|x| T::from_f64(x.to_f64().abs())).collect();
+        let aa: Vec<T> = a.iter().map(|x| T::from_f64(x.into_f64().abs())).collect();
         let got = store(&b, b.sqrt(b.load(&aa)));
         for i in 0..n {
             assert!(rel_eq(got[i], aa[i].sqrt(), 1e-4), "sqrt lane {i}");
@@ -74,7 +243,7 @@ where
 
         let got = store(&b, b.fma(va, vb, va));
         for i in 0..n {
-            let want = T::from_f64(a[i].to_f64() * bb[i].to_f64() + a[i].to_f64());
+            let want = T::from_f64(a[i].into_f64() * bb[i].into_f64() + a[i].into_f64());
             assert!(rel_eq(got[i], want, 1e-4), "fma lane {i}");
         }
 
@@ -86,8 +255,8 @@ where
         ] {
             let any = b.any(m);
             let all = b.all(m);
-            let want_any = (0..n).any(|i| pred(a[i].to_f64(), bb[i].to_f64()));
-            let want_all = (0..n).all(|i| pred(a[i].to_f64(), bb[i].to_f64()));
+            let want_any = (0..n).any(|i| pred(a[i].into_f64(), bb[i].into_f64()));
+            let want_all = (0..n).all(|i| pred(a[i].into_f64(), bb[i].into_f64()));
             assert_eq!(any, want_any, "{name}.any");
             assert_eq!(all, want_all, "{name}.all");
         }
@@ -95,23 +264,23 @@ where
         let mle = b.le(va, vb);
         let got = store(&b, b.select(mle, va, vb));
         for i in 0..n {
-            let want = if a[i].to_f64() <= bb[i].to_f64() { a[i] } else { bb[i] };
-            assert_eq!(got[i].to_f64(), want.to_f64(), "select lane {i}");
+            let want = if a[i].into_f64() <= bb[i].into_f64() { a[i] } else { bb[i] };
+            assert_eq!(got[i].into_f64(), want.into_f64(), "select lane {i}");
         }
         let mnot = b.mask_not(mle);
         let got = store(&b, b.select(mnot, va, vb));
         for i in 0..n {
-            let want = if a[i].to_f64() > bb[i].to_f64() { a[i] } else { bb[i] };
-            assert_eq!(got[i].to_f64(), want.to_f64(), "select(!m) lane {i}");
+            let want = if a[i].into_f64() > bb[i].into_f64() { a[i] } else { bb[i] };
+            assert_eq!(got[i].into_f64(), want.into_f64(), "select(!m) lane {i}");
         }
 
-        let sum = b.reduce_sum(va).to_f64();
-        let want_sum: f64 = a.iter().map(|x| x.to_f64()).sum();
+        let sum = b.reduce_sum(va).into_f64();
+        let want_sum: f64 = a.iter().map(|x| x.into_f64()).sum();
         assert!((sum - want_sum).abs() <= 1e-3 * (1.0 + want_sum.abs()), "reduce_sum");
-        let rmin = b.reduce_min(va).to_f64();
-        let rmax = b.reduce_max(va).to_f64();
-        assert_eq!(rmin, a.iter().map(|x| x.to_f64()).fold(f64::INFINITY, f64::min));
-        assert_eq!(rmax, a.iter().map(|x| x.to_f64()).fold(f64::NEG_INFINITY, f64::max));
+        let rmin = b.reduce_min(va).into_f64();
+        let rmax = b.reduce_max(va).into_f64();
+        assert_eq!(rmin, a.iter().map(|x| x.into_f64()).fold(f64::INFINITY, f64::min));
+        assert_eq!(rmax, a.iter().map(|x| x.into_f64()).fold(f64::NEG_INFINITY, f64::max));
     }
 }
 
@@ -371,7 +540,7 @@ fn f16_native_matches_scalar() {
 
         let got = store(Backend::<f16>::neg(p, va));
         for i in 0..N {
-            assert_eq!(got[i].to_bits(), a[i].neg().to_bits(), "neg lane {i}");
+            assert_eq!(got[i].to_bits(), (-a[i]).to_bits(), "neg lane {i}");
         }
 
         let got = store(Backend::<f16>::div(p, va, vb));

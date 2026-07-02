@@ -52,6 +52,22 @@ macro_rules! impl_rvv_backend {
             type Vector = RvvVec<C>;
             type Mask = RvvVec<C>;
 
+            // Scalable/emulated targets ride the fixed max-width array; ops take the trait's
+            // portable defaults.
+            type IVector = [u32; crate::MAX_LANES];
+            #[inline(always)]
+            fn iload(self, s: &[u32]) -> [u32; crate::MAX_LANES] {
+                let mut v = [0u32; crate::MAX_LANES];
+                v[..s.len()].copy_from_slice(s);
+                v
+            }
+            #[inline(always)]
+            fn istore(self, v: [u32; crate::MAX_LANES], out: &mut [u32]) {
+                let n = out.len();
+                out.copy_from_slice(&v[..n]);
+            }
+
+
             #[inline(always)]
             fn lanes(self) -> usize {
                 C / $div

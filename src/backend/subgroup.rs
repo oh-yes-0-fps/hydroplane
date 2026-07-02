@@ -197,6 +197,17 @@ mod device {
                 type Vector = $ty;
                 type Mask = bool;
 
+                type IVector = u32;
+                #[inline]
+                fn iload(self, s: &[u32]) -> u32 {
+                    s[0]
+                }
+                #[inline]
+                fn istore(self, v: u32, out: &mut [u32]) {
+                    out[0] = v;
+                }
+
+
                 #[inline]
                 fn lanes(self) -> usize {
                     subgroup_size() as usize
@@ -253,19 +264,19 @@ mod device {
                 }
                 #[inline]
                 fn le(self, a: $ty, b: $ty) -> bool {
-                    a.le(b)
+                    a <= b
                 }
                 #[inline]
                 fn lt(self, a: $ty, b: $ty) -> bool {
-                    a.lt(b)
+                    a < b
                 }
                 #[inline]
                 fn ge(self, a: $ty, b: $ty) -> bool {
-                    a.ge(b)
+                    a >= b
                 }
                 #[inline]
                 fn gt(self, a: $ty, b: $ty) -> bool {
-                    a.gt(b)
+                    a > b
                 }
                 #[inline]
                 fn mask_and(self, a: bool, b: bool) -> bool {
@@ -346,6 +357,17 @@ mod device {
             impl Backend<$ty> for Subgroup {
                 type Vector = f32;
                 type Mask = bool;
+
+                type IVector = u32;
+                #[inline]
+                fn iload(self, s: &[u32]) -> u32 {
+                    s[0]
+                }
+                #[inline]
+                fn istore(self, v: u32, out: &mut [u32]) {
+                    out[0] = v;
+                }
+
 
                 #[inline]
                 fn lanes(self) -> usize {

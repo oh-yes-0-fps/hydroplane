@@ -46,6 +46,89 @@ impl Backend<f32> for Avx512 {
     type Vector = __m512;
     type Mask = __mmask16;
 
+    type IVector = __m512i;
+    #[inline(always)]
+    fn iload(self, s: &[u32]) -> __m512i {
+        debug_assert_eq!(s.len(), 16);
+        unsafe { zi_load(s.as_ptr()) }
+    }
+    #[inline(always)]
+    fn istore(self, v: __m512i, out: &mut [u32]) {
+        debug_assert_eq!(out.len(), 16);
+        unsafe { zi_store(out.as_mut_ptr(), v) }
+    }
+    #[inline(always)]
+    fn isplat(self, v: u32) -> __m512i {
+        unsafe { zi_splat(v) }
+    }
+    #[inline(always)]
+    fn iadd(self, a: __m512i, b: __m512i) -> __m512i {
+        unsafe { zi_add(a, b) }
+    }
+    #[inline(always)]
+    fn isub(self, a: __m512i, b: __m512i) -> __m512i {
+        unsafe { zi_sub(a, b) }
+    }
+    #[inline(always)]
+    fn imul(self, a: __m512i, b: __m512i) -> __m512i {
+        unsafe { zi_mul(a, b) }
+    }
+    #[inline(always)]
+    fn iand(self, a: __m512i, b: __m512i) -> __m512i {
+        unsafe { zi_and(a, b) }
+    }
+    #[inline(always)]
+    fn ior(self, a: __m512i, b: __m512i) -> __m512i {
+        unsafe { zi_or(a, b) }
+    }
+    #[inline(always)]
+    fn ixor(self, a: __m512i, b: __m512i) -> __m512i {
+        unsafe { zi_xor(a, b) }
+    }
+    #[inline(always)]
+    fn inot(self, a: __m512i) -> __m512i {
+        unsafe { zi_xor(a, zi_splat(u32::MAX)) }
+    }
+    #[inline(always)]
+    fn ishl(self, a: __m512i, k: u32) -> __m512i {
+        debug_assert!(k < 32);
+        unsafe { zi_shl(a, k) }
+    }
+    #[inline(always)]
+    fn ishr(self, a: __m512i, k: u32) -> __m512i {
+        debug_assert!(k < 32);
+        unsafe { zi_shr(a, k) }
+    }
+    #[inline(always)]
+    fn ishr_arith(self, a: __m512i, k: u32) -> __m512i {
+        debug_assert!(k < 32);
+        unsafe { zi_sra(a, k) }
+    }
+    #[inline(always)]
+    fn ieq(self, a: __m512i, b: __m512i) -> __mmask16 {
+        unsafe { zi_eq(a, b) }
+    }
+    #[inline(always)]
+    fn ilt_u(self, a: __m512i, b: __m512i) -> __mmask16 {
+        unsafe { zi_lt_u(a, b) }
+    }
+    #[inline(always)]
+    fn ilt_s(self, a: __m512i, b: __m512i) -> __mmask16 {
+        unsafe { zi_lt_s(a, b) }
+    }
+    #[inline(always)]
+    fn iselect(self, m: __mmask16, a: __m512i, b: __m512i) -> __m512i {
+        unsafe { zi_select(m, a, b) }
+    }
+    #[inline(always)]
+    fn to_bits(self, v: __m512) -> __m512i {
+        unsafe { zi_from_ps(v) }
+    }
+    #[inline(always)]
+    fn from_bits(self, v: __m512i) -> __m512 {
+        unsafe { zi_to_ps(v) }
+    }
+
     #[inline(always)]
     fn lanes(self) -> usize {
         16
@@ -155,11 +238,25 @@ impl Backend<f32> for Avx512 {
     }
     #[inline(always)]
     fn reduce_min(self, v: __m512) -> f32 {
-        unsafe { _mm512_reduce_min_ps(v) }
+        // minimumNumber fold: NaN lanes must not poison (or win) the reduction, so quiet them to
+        // the identity first; an all-NaN register still reduces to NaN.
+        unsafe {
+            let nan = _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(v, v);
+            if nan == 0xffff {
+                return f32::NAN;
+            }
+            _mm512_reduce_min_ps(_mm512_mask_mov_ps(v, nan, _mm512_set1_ps(f32::INFINITY)))
+        }
     }
     #[inline(always)]
     fn reduce_max(self, v: __m512) -> f32 {
-        unsafe { _mm512_reduce_max_ps(v) }
+        unsafe {
+            let nan = _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(v, v);
+            if nan == 0xffff {
+                return f32::NAN;
+            }
+            _mm512_reduce_max_ps(_mm512_mask_mov_ps(v, nan, _mm512_set1_ps(f32::NEG_INFINITY)))
+        }
     }
 }
 
@@ -222,12 +319,16 @@ unsafe fn z_sqrt(a: __m512) -> __m512 {
 #[target_feature(enable = "avx512f")]
 #[inline]
 unsafe fn z_min(a: __m512, b: __m512) -> __m512 {
-    _mm512_min_ps(a, b)
+    // IEEE minimumNumber: `vminps` already yields `b` when `a` is NaN; the masked move patches
+    // the b-is-NaN case (bare `vminps` would return the NaN).
+    let m = _mm512_min_ps(a, b);
+    _mm512_mask_mov_ps(m, _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(b, b), a)
 }
 #[target_feature(enable = "avx512f")]
 #[inline]
 unsafe fn z_max(a: __m512, b: __m512) -> __m512 {
-    _mm512_max_ps(a, b)
+    let m = _mm512_max_ps(a, b);
+    _mm512_mask_mov_ps(m, _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(b, b), a)
 }
 #[target_feature(enable = "avx512f")]
 #[inline]
@@ -240,9 +341,99 @@ unsafe fn z_blend(m: __mmask16, a: __m512, b: __m512) -> __m512 {
     _mm512_mask_blend_ps(m, a, b)
 }
 
+macro_rules! zi_binop {
+    ($name:ident, $intr:ident) => {
+        #[target_feature(enable = "avx512f")]
+        #[inline]
+        unsafe fn $name(a: __m512i, b: __m512i) -> __m512i {
+            $intr(a, b)
+        }
+    };
+}
+
+zi_binop!(zi_add, _mm512_add_epi32);
+zi_binop!(zi_sub, _mm512_sub_epi32);
+zi_binop!(zi_mul, _mm512_mullo_epi32);
+zi_binop!(zi_and, _mm512_and_si512);
+zi_binop!(zi_or, _mm512_or_si512);
+zi_binop!(zi_xor, _mm512_xor_si512);
+
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_load(p: *const u32) -> __m512i {
+    _mm512_loadu_si512(p as *const __m512i)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_store(p: *mut u32, v: __m512i) {
+    _mm512_storeu_si512(p as *mut __m512i, v)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_splat(v: u32) -> __m512i {
+    _mm512_set1_epi32(v as i32)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_shl(a: __m512i, k: u32) -> __m512i {
+    _mm512_sll_epi32(a, _mm_cvtsi32_si128(k as i32))
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_shr(a: __m512i, k: u32) -> __m512i {
+    _mm512_srl_epi32(a, _mm_cvtsi32_si128(k as i32))
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_sra(a: __m512i, k: u32) -> __m512i {
+    _mm512_sra_epi32(a, _mm_cvtsi32_si128(k as i32))
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_eq(a: __m512i, b: __m512i) -> __mmask16 {
+    _mm512_cmpeq_epi32_mask(a, b)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_lt_s(a: __m512i, b: __m512i) -> __mmask16 {
+    _mm512_cmplt_epi32_mask(a, b)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_lt_u(a: __m512i, b: __m512i) -> __mmask16 {
+    _mm512_cmplt_epu32_mask(a, b)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_select(m: __mmask16, a: __m512i, b: __m512i) -> __m512i {
+    _mm512_mask_mov_epi32(b, m, a)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_from_ps(v: __m512) -> __m512i {
+    _mm512_castps_si512(v)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_to_ps(v: __m512i) -> __m512 {
+    _mm512_castsi512_ps(v)
+}
+
 impl Backend<f64> for Avx512 {
     type Vector = __m512d;
     type Mask = __mmask8;
+
+    type IVector = [u32; 8];
+    #[inline(always)]
+    fn iload(self, s: &[u32]) -> [u32; 8] {
+        let mut v = [0u32; 8];
+        v.copy_from_slice(s);
+        v
+    }
+    #[inline(always)]
+    fn istore(self, v: [u32; 8], out: &mut [u32]) {
+        out.copy_from_slice(&v);
+    }
 
     #[inline(always)]
     fn lanes(self) -> usize {
@@ -352,11 +543,23 @@ impl Backend<f64> for Avx512 {
     }
     #[inline(always)]
     fn reduce_min(self, v: __m512d) -> f64 {
-        unsafe { _mm512_reduce_min_pd(v) }
+        unsafe {
+            let nan = _mm512_cmp_pd_mask::<_CMP_UNORD_Q>(v, v);
+            if nan == 0xff {
+                return f64::NAN;
+            }
+            _mm512_reduce_min_pd(_mm512_mask_mov_pd(v, nan, _mm512_set1_pd(f64::INFINITY)))
+        }
     }
     #[inline(always)]
     fn reduce_max(self, v: __m512d) -> f64 {
-        unsafe { _mm512_reduce_max_pd(v) }
+        unsafe {
+            let nan = _mm512_cmp_pd_mask::<_CMP_UNORD_Q>(v, v);
+            if nan == 0xff {
+                return f64::NAN;
+            }
+            _mm512_reduce_max_pd(_mm512_mask_mov_pd(v, nan, _mm512_set1_pd(f64::NEG_INFINITY)))
+        }
     }
 }
 
@@ -419,12 +622,14 @@ unsafe fn zd_sqrt(a: __m512d) -> __m512d {
 #[target_feature(enable = "avx512f")]
 #[inline]
 unsafe fn zd_min(a: __m512d, b: __m512d) -> __m512d {
-    _mm512_min_pd(a, b)
+    let m = _mm512_min_pd(a, b);
+    _mm512_mask_mov_pd(m, _mm512_cmp_pd_mask::<_CMP_UNORD_Q>(b, b), a)
 }
 #[target_feature(enable = "avx512f")]
 #[inline]
 unsafe fn zd_max(a: __m512d, b: __m512d) -> __m512d {
-    _mm512_max_pd(a, b)
+    let m = _mm512_max_pd(a, b);
+    _mm512_mask_mov_pd(m, _mm512_cmp_pd_mask::<_CMP_UNORD_Q>(b, b), a)
 }
 #[target_feature(enable = "avx512f")]
 #[inline]
@@ -465,6 +670,18 @@ mod bf16_impl {
     impl Backend<bf16> for Avx512 {
         type Vector = __m512;
         type Mask = __mmask16;
+
+        type IVector = [u32; 16];
+        #[inline(always)]
+        fn iload(self, s: &[u32]) -> [u32; 16] {
+            let mut v = [0u32; 16];
+            v.copy_from_slice(s);
+            v
+        }
+        #[inline(always)]
+        fn istore(self, v: [u32; 16], out: &mut [u32]) {
+            out.copy_from_slice(&v);
+        }
 
         #[inline(always)]
         fn lanes(self) -> usize {
@@ -607,6 +824,18 @@ mod f16_impl {
     impl Backend<f16> for Avx512 {
         type Vector = __m512;
         type Mask = __mmask16;
+
+        type IVector = [u32; 16];
+        #[inline(always)]
+        fn iload(self, s: &[u32]) -> [u32; 16] {
+            let mut v = [0u32; 16];
+            v.copy_from_slice(s);
+            v
+        }
+        #[inline(always)]
+        fn istore(self, v: [u32; 16], out: &mut [u32]) {
+            out.copy_from_slice(&v);
+        }
 
         #[inline(always)]
         fn lanes(self) -> usize {

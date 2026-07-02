@@ -45,6 +45,89 @@ impl Backend<f32> for Sse4 {
     type Vector = __m128;
     type Mask = __m128;
 
+    type IVector = __m128i;
+    #[inline(always)]
+    fn iload(self, s: &[u32]) -> __m128i {
+        debug_assert_eq!(s.len(), 4);
+        unsafe { si_load(s.as_ptr()) }
+    }
+    #[inline(always)]
+    fn istore(self, v: __m128i, out: &mut [u32]) {
+        debug_assert_eq!(out.len(), 4);
+        unsafe { si_store(out.as_mut_ptr(), v) }
+    }
+    #[inline(always)]
+    fn isplat(self, v: u32) -> __m128i {
+        unsafe { si_splat(v) }
+    }
+    #[inline(always)]
+    fn iadd(self, a: __m128i, b: __m128i) -> __m128i {
+        unsafe { si_add(a, b) }
+    }
+    #[inline(always)]
+    fn isub(self, a: __m128i, b: __m128i) -> __m128i {
+        unsafe { si_sub(a, b) }
+    }
+    #[inline(always)]
+    fn imul(self, a: __m128i, b: __m128i) -> __m128i {
+        unsafe { si_mul(a, b) }
+    }
+    #[inline(always)]
+    fn iand(self, a: __m128i, b: __m128i) -> __m128i {
+        unsafe { si_and(a, b) }
+    }
+    #[inline(always)]
+    fn ior(self, a: __m128i, b: __m128i) -> __m128i {
+        unsafe { si_or(a, b) }
+    }
+    #[inline(always)]
+    fn ixor(self, a: __m128i, b: __m128i) -> __m128i {
+        unsafe { si_xor(a, b) }
+    }
+    #[inline(always)]
+    fn inot(self, a: __m128i) -> __m128i {
+        unsafe { si_xor(a, si_splat(u32::MAX)) }
+    }
+    #[inline(always)]
+    fn ishl(self, a: __m128i, k: u32) -> __m128i {
+        debug_assert!(k < 32);
+        unsafe { si_shl(a, k) }
+    }
+    #[inline(always)]
+    fn ishr(self, a: __m128i, k: u32) -> __m128i {
+        debug_assert!(k < 32);
+        unsafe { si_shr(a, k) }
+    }
+    #[inline(always)]
+    fn ishr_arith(self, a: __m128i, k: u32) -> __m128i {
+        debug_assert!(k < 32);
+        unsafe { si_sra(a, k) }
+    }
+    #[inline(always)]
+    fn ieq(self, a: __m128i, b: __m128i) -> __m128 {
+        unsafe { si_eq(a, b) }
+    }
+    #[inline(always)]
+    fn ilt_u(self, a: __m128i, b: __m128i) -> __m128 {
+        unsafe { si_lt_u(a, b) }
+    }
+    #[inline(always)]
+    fn ilt_s(self, a: __m128i, b: __m128i) -> __m128 {
+        unsafe { si_lt_s(a, b) }
+    }
+    #[inline(always)]
+    fn iselect(self, m: __m128, a: __m128i, b: __m128i) -> __m128i {
+        unsafe { si_select(m, a, b) }
+    }
+    #[inline(always)]
+    fn to_bits(self, v: __m128) -> __m128i {
+        unsafe { si_from_ps(v) }
+    }
+    #[inline(always)]
+    fn from_bits(self, v: __m128i) -> __m128 {
+        unsafe { si_to_ps(v) }
+    }
+
     #[inline(always)]
     fn lanes(self) -> usize {
         4
@@ -204,12 +287,16 @@ unsafe fn s_sqrt(a: __m128) -> __m128 {
 #[target_feature(enable = "sse4.1")]
 #[inline]
 unsafe fn s_min(a: __m128, b: __m128) -> __m128 {
-    _mm_min_ps(a, b)
+    // IEEE minimumNumber: `minps` already yields `b` when `a` is NaN; blend patches the
+    // b-is-NaN case (bare `minps` would return the NaN).
+    let m = _mm_min_ps(a, b);
+    _mm_blendv_ps(m, a, _mm_cmpunord_ps(b, b))
 }
 #[target_feature(enable = "sse4.1")]
 #[inline]
 unsafe fn s_max(a: __m128, b: __m128) -> __m128 {
-    _mm_max_ps(a, b)
+    let m = _mm_max_ps(a, b);
+    _mm_blendv_ps(m, a, _mm_cmpunord_ps(b, b))
 }
 #[target_feature(enable = "sse4.1")]
 #[inline]
@@ -258,8 +345,8 @@ unsafe fn s_reduce<const OP: i32>(v: __m128) -> f32 {
     #[inline(always)]
     unsafe fn combine<const OP: i32>(a: __m128, b: __m128) -> __m128 {
         match OP {
-            1 => _mm_min_ps(a, b),
-            2 => _mm_max_ps(a, b),
+            1 => s_min(a, b),
+            2 => s_max(a, b),
             _ => _mm_add_ps(a, b),
         }
     }
@@ -270,9 +357,102 @@ unsafe fn s_reduce<const OP: i32>(v: __m128) -> f32 {
     _mm_cvtss_f32(r)
 }
 
+macro_rules! si_binop {
+    ($name:ident, $intr:ident) => {
+        #[target_feature(enable = "sse4.1")]
+        #[inline]
+        unsafe fn $name(a: __m128i, b: __m128i) -> __m128i {
+            $intr(a, b)
+        }
+    };
+}
+
+si_binop!(si_add, _mm_add_epi32);
+si_binop!(si_sub, _mm_sub_epi32);
+si_binop!(si_mul, _mm_mullo_epi32);
+si_binop!(si_and, _mm_and_si128);
+si_binop!(si_or, _mm_or_si128);
+si_binop!(si_xor, _mm_xor_si128);
+
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_load(p: *const u32) -> __m128i {
+    _mm_loadu_si128(p as *const __m128i)
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_store(p: *mut u32, v: __m128i) {
+    _mm_storeu_si128(p as *mut __m128i, v)
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_splat(v: u32) -> __m128i {
+    _mm_set1_epi32(v as i32)
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_shl(a: __m128i, k: u32) -> __m128i {
+    _mm_sll_epi32(a, _mm_cvtsi32_si128(k as i32))
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_shr(a: __m128i, k: u32) -> __m128i {
+    _mm_srl_epi32(a, _mm_cvtsi32_si128(k as i32))
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_sra(a: __m128i, k: u32) -> __m128i {
+    _mm_sra_epi32(a, _mm_cvtsi32_si128(k as i32))
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_eq(a: __m128i, b: __m128i) -> __m128 {
+    _mm_castsi128_ps(_mm_cmpeq_epi32(a, b))
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_lt_s(a: __m128i, b: __m128i) -> __m128 {
+    _mm_castsi128_ps(_mm_cmplt_epi32(a, b))
+}
+/// Unsigned `<` via the sign-flip trick: biasing both operands by `1 << 31` maps unsigned order
+/// onto signed order, which is the only integer compare pre-AVX-512 hardware has.
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_lt_u(a: __m128i, b: __m128i) -> __m128 {
+    let bias = _mm_set1_epi32(i32::MIN);
+    _mm_castsi128_ps(_mm_cmplt_epi32(_mm_xor_si128(a, bias), _mm_xor_si128(b, bias)))
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_select(m: __m128, a: __m128i, b: __m128i) -> __m128i {
+    _mm_blendv_epi8(b, a, _mm_castps_si128(m))
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_from_ps(v: __m128) -> __m128i {
+    _mm_castps_si128(v)
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn si_to_ps(v: __m128i) -> __m128 {
+    _mm_castsi128_ps(v)
+}
+
 impl Backend<f64> for Sse4 {
     type Vector = __m128d;
     type Mask = __m128d;
+
+    type IVector = [u32; 2];
+    #[inline(always)]
+    fn iload(self, s: &[u32]) -> [u32; 2] {
+        let mut v = [0u32; 2];
+        v.copy_from_slice(s);
+        v
+    }
+    #[inline(always)]
+    fn istore(self, v: [u32; 2], out: &mut [u32]) {
+        out.copy_from_slice(&v);
+    }
 
     #[inline(always)]
     fn lanes(self) -> usize {
@@ -433,12 +613,14 @@ unsafe fn d_sqrt(a: __m128d) -> __m128d {
 #[target_feature(enable = "sse4.1")]
 #[inline]
 unsafe fn d_min(a: __m128d, b: __m128d) -> __m128d {
-    _mm_min_pd(a, b)
+    let m = _mm_min_pd(a, b);
+    _mm_blendv_pd(m, a, _mm_cmpunord_pd(b, b))
 }
 #[target_feature(enable = "sse4.1")]
 #[inline]
 unsafe fn d_max(a: __m128d, b: __m128d) -> __m128d {
-    _mm_max_pd(a, b)
+    let m = _mm_max_pd(a, b);
+    _mm_blendv_pd(m, a, _mm_cmpunord_pd(b, b))
 }
 #[target_feature(enable = "sse4.1")]
 #[inline]
@@ -486,8 +668,8 @@ unsafe fn d_abs(a: __m128d) -> __m128d {
 unsafe fn d_reduce<const OP: i32>(v: __m128d) -> f64 {
     let sh = _mm_unpackhi_pd(v, v);
     let r = match OP {
-        1 => _mm_min_pd(v, sh),
-        2 => _mm_max_pd(v, sh),
+        1 => d_min(v, sh),
+        2 => d_max(v, sh),
         _ => _mm_add_pd(v, sh),
     };
     _mm_cvtsd_f64(r)
@@ -520,6 +702,18 @@ macro_rules! sse4_widen_half {
             impl Backend<$t> for Sse4 {
                 type Vector = __m128;
                 type Mask = __m128;
+
+                type IVector = [u32; 4];
+                #[inline(always)]
+                fn iload(self, s: &[u32]) -> [u32; 4] {
+                    let mut v = [0u32; 4];
+                    v.copy_from_slice(s);
+                    v
+                }
+                #[inline(always)]
+                fn istore(self, v: [u32; 4], out: &mut [u32]) {
+                    out.copy_from_slice(&v);
+                }
 
                 #[inline(always)]
                 fn lanes(self) -> usize {

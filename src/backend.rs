@@ -50,7 +50,13 @@ pub trait Backend<T: Scalar>: Copy {
     fn abs(self, a: Self::Vector) -> Self::Vector {
         self.max(a, self.neg(a))
     }
+    /// Lane-wise IEEE 754-2019 minimumNumber: if exactly one operand of a lane is NaN, that lane
+    /// takes the *other* operand; NaN comes out only when both are NaN. Which zero wins a
+    /// `-0.0`/`+0.0` tie is backend-specific. Every backend implements this contract — natively
+    /// where the ISA has it (aarch64 `FMINNM`, SVE `FMINNM`, RVV `vfmin`), with a NaN-patching
+    /// fixup where it doesn't (x86 `min` + unord-blend, wasm `pmin` + bitselect).
     fn min(self, a: Self::Vector, b: Self::Vector) -> Self::Vector;
+    /// Lane-wise IEEE 754-2019 maximumNumber; see [`min`](Backend::min) for the NaN contract.
     fn max(self, a: Self::Vector, b: Self::Vector) -> Self::Vector;
 
     fn le(self, a: Self::Vector, b: Self::Vector) -> Self::Mask;
@@ -94,8 +100,207 @@ pub trait Backend<T: Scalar>: Copy {
     }
 
     fn reduce_sum(self, v: Self::Vector) -> T;
+    /// Horizontal minimum with [`min`](Backend::min)'s minimumNumber semantics folded pairwise:
+    /// NaN lanes are ignored, and the result is NaN only if *every* lane is NaN.
     fn reduce_min(self, v: Self::Vector) -> T;
+    /// Horizontal maximum; see [`reduce_min`](Backend::reduce_min).
     fn reduce_max(self, v: Self::Vector) -> T;
+
+    /// The 32-bit integer companion register: `lanes()` lanes of `u32` (reinterpretable as
+    /// `i32`) riding alongside the float lanes — lane indices, counters, and bit manipulation of
+    /// float lane patterns. Every default below is a correct-but-slow store/compute/reload
+    /// round-trip (the [`mask_bitmask`](Backend::mask_bitmask) precedent); backends with native
+    /// integer lanes override the ones that matter.
+    type IVector: Copy;
+
+    /// Load exactly [`lanes()`](Backend::lanes) integers.
+    fn iload(self, s: &[u32]) -> Self::IVector;
+    /// Store exactly [`lanes()`](Backend::lanes) integers.
+    fn istore(self, v: Self::IVector, out: &mut [u32]);
+
+    #[doc(hidden)]
+    #[inline]
+    fn i_map(self, a: Self::IVector, f: impl Fn(u32) -> u32) -> Self::IVector {
+        let n = self.lanes();
+        let mut x = [0u32; crate::MAX_LANES];
+        self.istore(a, &mut x[..n]);
+        let mut i = 0;
+        while i < n {
+            x[i] = f(x[i]);
+            i += 1;
+        }
+        self.iload(&x[..n])
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    fn i_zip(self, a: Self::IVector, b: Self::IVector, f: impl Fn(u32, u32) -> u32) -> Self::IVector {
+        let n = self.lanes();
+        let (mut x, mut y) = ([0u32; crate::MAX_LANES], [0u32; crate::MAX_LANES]);
+        self.istore(a, &mut x[..n]);
+        self.istore(b, &mut y[..n]);
+        let mut i = 0;
+        while i < n {
+            x[i] = f(x[i], y[i]);
+            i += 1;
+        }
+        self.iload(&x[..n])
+    }
+
+    /// Build a [`Mask`](Backend::Mask) from a per-lane integer predicate. The portable default
+    /// routes through a `1.0`/`0.0` float image and a `gt` compare; native backends compare the
+    /// integer lanes directly (the mask layouts coincide on every fixed-width ISA).
+    #[doc(hidden)]
+    #[inline]
+    fn i_cmp(self, a: Self::IVector, b: Self::IVector, f: impl Fn(u32, u32) -> bool) -> Self::Mask {
+        let n = self.lanes();
+        let (mut x, mut y) = ([0u32; crate::MAX_LANES], [0u32; crate::MAX_LANES]);
+        self.istore(a, &mut x[..n]);
+        self.istore(b, &mut y[..n]);
+        let mut sel = [T::ZERO; crate::MAX_LANES];
+        let mut i = 0;
+        while i < n {
+            if f(x[i], y[i]) {
+                sel[i] = T::ONE;
+            }
+            i += 1;
+        }
+        self.gt(self.load(&sel[..n]), self.splat(T::ZERO))
+    }
+
+    #[inline]
+    fn isplat(self, v: u32) -> Self::IVector {
+        let buf = [v; crate::MAX_LANES];
+        self.iload(&buf[..self.lanes()])
+    }
+
+    /// Lane indices `0, 1, …, lanes()-1`.
+    #[inline]
+    fn iramp(self) -> Self::IVector {
+        let mut buf = [0u32; crate::MAX_LANES];
+        let mut i = 0;
+        while i < self.lanes() {
+            buf[i] = i as u32;
+            i += 1;
+        }
+        self.iload(&buf[..self.lanes()])
+    }
+
+    /// Wrapping lane-wise arithmetic, matching SIMD integer instruction semantics.
+    #[inline]
+    fn iadd(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.i_zip(a, b, u32::wrapping_add)
+    }
+    #[inline]
+    fn isub(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.i_zip(a, b, u32::wrapping_sub)
+    }
+    /// Low 32 bits of the lane-wise product (`vmul`/`pmulld` semantics — identical for `u32`
+    /// and `i32`).
+    #[inline]
+    fn imul(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.i_zip(a, b, u32::wrapping_mul)
+    }
+    #[inline]
+    fn iand(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.i_zip(a, b, |x, y| x & y)
+    }
+    #[inline]
+    fn ior(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.i_zip(a, b, |x, y| x | y)
+    }
+    #[inline]
+    fn ixor(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.i_zip(a, b, |x, y| x ^ y)
+    }
+    #[inline]
+    fn inot(self, a: Self::IVector) -> Self::IVector {
+        self.i_map(a, |x| !x)
+    }
+    /// Lane-wise shifts by a uniform count; `k` must be `< 32`.
+    #[inline]
+    fn ishl(self, a: Self::IVector, k: u32) -> Self::IVector {
+        debug_assert!(k < 32);
+        self.i_map(a, |x| x << k)
+    }
+    /// Logical (zero-filling) right shift; `k` must be `< 32`.
+    #[inline]
+    fn ishr(self, a: Self::IVector, k: u32) -> Self::IVector {
+        debug_assert!(k < 32);
+        self.i_map(a, |x| x >> k)
+    }
+    /// Arithmetic (sign-filling) right shift, for the `i32` view; `k` must be `< 32`.
+    #[inline]
+    fn ishr_arith(self, a: Self::IVector, k: u32) -> Self::IVector {
+        debug_assert!(k < 32);
+        self.i_map(a, |x| ((x as i32) >> k) as u32)
+    }
+
+    #[inline]
+    fn ieq(self, a: Self::IVector, b: Self::IVector) -> Self::Mask {
+        self.i_cmp(a, b, |x, y| x == y)
+    }
+    /// Unsigned lane-wise `<`.
+    #[inline]
+    fn ilt_u(self, a: Self::IVector, b: Self::IVector) -> Self::Mask {
+        self.i_cmp(a, b, |x, y| x < y)
+    }
+    /// Signed lane-wise `<` (the `i32` view).
+    #[inline]
+    fn ilt_s(self, a: Self::IVector, b: Self::IVector) -> Self::Mask {
+        self.i_cmp(a, b, |x, y| (x as i32) < (y as i32))
+    }
+
+    /// `m ? a : b` on integer lanes, with the same [`Mask`](Backend::Mask) the float compares
+    /// produce.
+    #[inline]
+    fn iselect(self, m: Self::Mask, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        let n = self.lanes();
+        let (mut x, mut y) = ([0u32; crate::MAX_LANES], [0u32; crate::MAX_LANES]);
+        self.istore(a, &mut x[..n]);
+        self.istore(b, &mut y[..n]);
+        let bits = self.mask_bitmask(m);
+        let mut i = 0;
+        while i < n {
+            if bits & (1 << i) == 0 {
+                x[i] = y[i];
+            }
+            i += 1;
+        }
+        self.iload(&x[..n])
+    }
+
+    /// Reinterpret each float lane's bit pattern as a `u32` lane — exact for 32-bit `T`, and
+    /// free on backends whose integer companion shares the register file. 16-bit `T`
+    /// zero-extends; `f64` truncates to the low half (see [`Scalar::to_bits32`]).
+    #[inline]
+    fn to_bits(self, v: Self::Vector) -> Self::IVector {
+        let n = self.lanes();
+        let mut f = [T::ZERO; crate::MAX_LANES];
+        self.store(v, &mut f[..n]);
+        let mut u = [0u32; crate::MAX_LANES];
+        let mut i = 0;
+        while i < n {
+            u[i] = f[i].to_bits32();
+            i += 1;
+        }
+        self.iload(&u[..n])
+    }
+    /// Inverse of [`to_bits`](Backend::to_bits).
+    #[inline]
+    #[allow(clippy::wrong_self_convention)] // `self` is the execution token, not the value
+    fn from_bits(self, v: Self::IVector) -> Self::Vector {
+        let n = self.lanes();
+        let mut u = [0u32; crate::MAX_LANES];
+        self.istore(v, &mut u[..n]);
+        let mut f = [T::ZERO; crate::MAX_LANES];
+        let mut i = 0;
+        while i < n {
+            f[i] = T::from_bits32(u[i]);
+            i += 1;
+        }
+        self.load(&f[..n])
+    }
 }
 
 /// The always-available 1-lane backend.
@@ -132,23 +337,23 @@ impl<T: Scalar> Backend<T> for ScalarBackend {
     }
     #[inline(always)]
     fn add(self, a: T, b: T) -> T {
-        a.add(b)
+        a + b
     }
     #[inline(always)]
     fn sub(self, a: T, b: T) -> T {
-        a.sub(b)
+        a - b
     }
     #[inline(always)]
     fn mul(self, a: T, b: T) -> T {
-        a.mul(b)
+        a * b
     }
     #[inline(always)]
     fn div(self, a: T, b: T) -> T {
-        a.div(b)
+        a / b
     }
     #[inline(always)]
     fn neg(self, a: T) -> T {
-        a.neg()
+        -a
     }
     #[inline(always)]
     fn fma(self, a: T, b: T, c: T) -> T {
@@ -160,27 +365,45 @@ impl<T: Scalar> Backend<T> for ScalarBackend {
     }
     #[inline(always)]
     fn min(self, a: T, b: T) -> T {
-        a.min(b)
+        // Explicit minimumNumber, so the oracle's NaN contract can't drift with a scalar type's
+        // own `FloatCore::min` (half's, in particular).
+        if a.is_nan() {
+            b
+        } else if b.is_nan() {
+            a
+        } else if b < a {
+            b
+        } else {
+            a
+        }
     }
     #[inline(always)]
     fn max(self, a: T, b: T) -> T {
-        a.max(b)
+        if a.is_nan() {
+            b
+        } else if b.is_nan() {
+            a
+        } else if b > a {
+            b
+        } else {
+            a
+        }
     }
     #[inline(always)]
     fn le(self, a: T, b: T) -> bool {
-        a.le(b)
+        a <= b
     }
     #[inline(always)]
     fn lt(self, a: T, b: T) -> bool {
-        a.lt(b)
+        a < b
     }
     #[inline(always)]
     fn ge(self, a: T, b: T) -> bool {
-        a.ge(b)
+        a >= b
     }
     #[inline(always)]
     fn gt(self, a: T, b: T) -> bool {
-        a.gt(b)
+        a > b
     }
     #[inline(always)]
     fn mask_and(self, a: bool, b: bool) -> bool {
@@ -221,6 +444,16 @@ impl<T: Scalar> Backend<T> for ScalarBackend {
     #[inline(always)]
     fn reduce_max(self, v: T) -> T {
         v
+    }
+
+    type IVector = u32;
+    #[inline(always)]
+    fn iload(self, s: &[u32]) -> u32 {
+        s[0]
+    }
+    #[inline(always)]
+    fn istore(self, v: u32, out: &mut [u32]) {
+        out[0] = v;
     }
 }
 
@@ -351,6 +584,88 @@ impl<T: Scalar, B: Backend<T>, const K: usize> Backend<T> for Unroll<B, K> {
     #[inline(always)]
     fn reduce_max(self, v: Self::Vector) -> T {
         self.0.reduce_max(v)
+    }
+
+    type IVector = B::IVector;
+    #[inline(always)]
+    fn iload(self, s: &[u32]) -> Self::IVector {
+        self.0.iload(s)
+    }
+    #[inline(always)]
+    fn istore(self, v: Self::IVector, out: &mut [u32]) {
+        self.0.istore(v, out)
+    }
+    #[inline(always)]
+    fn isplat(self, v: u32) -> Self::IVector {
+        self.0.isplat(v)
+    }
+    #[inline(always)]
+    fn iramp(self) -> Self::IVector {
+        self.0.iramp()
+    }
+    #[inline(always)]
+    fn iadd(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.0.iadd(a, b)
+    }
+    #[inline(always)]
+    fn isub(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.0.isub(a, b)
+    }
+    #[inline(always)]
+    fn imul(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.0.imul(a, b)
+    }
+    #[inline(always)]
+    fn iand(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.0.iand(a, b)
+    }
+    #[inline(always)]
+    fn ior(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.0.ior(a, b)
+    }
+    #[inline(always)]
+    fn ixor(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.0.ixor(a, b)
+    }
+    #[inline(always)]
+    fn inot(self, a: Self::IVector) -> Self::IVector {
+        self.0.inot(a)
+    }
+    #[inline(always)]
+    fn ishl(self, a: Self::IVector, k: u32) -> Self::IVector {
+        self.0.ishl(a, k)
+    }
+    #[inline(always)]
+    fn ishr(self, a: Self::IVector, k: u32) -> Self::IVector {
+        self.0.ishr(a, k)
+    }
+    #[inline(always)]
+    fn ishr_arith(self, a: Self::IVector, k: u32) -> Self::IVector {
+        self.0.ishr_arith(a, k)
+    }
+    #[inline(always)]
+    fn ieq(self, a: Self::IVector, b: Self::IVector) -> Self::Mask {
+        self.0.ieq(a, b)
+    }
+    #[inline(always)]
+    fn ilt_u(self, a: Self::IVector, b: Self::IVector) -> Self::Mask {
+        self.0.ilt_u(a, b)
+    }
+    #[inline(always)]
+    fn ilt_s(self, a: Self::IVector, b: Self::IVector) -> Self::Mask {
+        self.0.ilt_s(a, b)
+    }
+    #[inline(always)]
+    fn iselect(self, m: Self::Mask, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.0.iselect(m, a, b)
+    }
+    #[inline(always)]
+    fn to_bits(self, v: Self::Vector) -> Self::IVector {
+        self.0.to_bits(v)
+    }
+    #[inline(always)]
+    fn from_bits(self, v: Self::IVector) -> Self::Vector {
+        self.0.from_bits(v)
     }
 }
 

@@ -58,6 +58,18 @@ impl Backend<bf16> for Avx512Bf16 {
     type Vector = __m512; // f32x16 (compute precision)
     type Mask = __mmask16;
 
+    type IVector = [u32; 16];
+    #[inline(always)]
+    fn iload(self, s: &[u32]) -> [u32; 16] {
+        let mut v = [0u32; 16];
+        v.copy_from_slice(s);
+        v
+    }
+    #[inline(always)]
+    fn istore(self, v: [u32; 16], out: &mut [u32]) {
+        out.copy_from_slice(&v);
+    }
+
     #[inline(always)]
     fn lanes(self) -> usize {
         16

@@ -71,8 +71,37 @@ binop!(add, "vaddph");
 binop!(sub, "vsubph");
 binop!(mul, "vmulph");
 binop!(div, "vdivph");
-binop!(min, "vminph");
-binop!(max, "vmaxph");
+
+/// IEEE minimumNumber: `vminph` already yields `b` when `a` is NaN; the masked move patches the
+/// b-is-NaN case (bare `vminph` would return the NaN). The `3` imm is `_CMP_UNORD_Q`.
+#[target_feature(enable = "avx512fp16,avx512f,avx512bw")]
+#[inline]
+pub unsafe fn min(a: __m512i, b: __m512i) -> __m512i {
+    let r;
+    asm!(
+        "vminph {r}, {a}, {b}",
+        "vcmpph {k}, {b}, {b}, 3",
+        "vmovdqu16 {r}{{{k}}}, {a}",
+        r = out(zmm_reg) r, a = in(zmm_reg) a, b = in(zmm_reg) b, k = out(kreg) _,
+        options(pure, nomem, nostack, preserves_flags),
+    );
+    r
+}
+
+/// IEEE maximumNumber; see [`min`].
+#[target_feature(enable = "avx512fp16,avx512f,avx512bw")]
+#[inline]
+pub unsafe fn max(a: __m512i, b: __m512i) -> __m512i {
+    let r;
+    asm!(
+        "vmaxph {r}, {a}, {b}",
+        "vcmpph {k}, {b}, {b}, 3",
+        "vmovdqu16 {r}{{{k}}}, {a}",
+        r = out(zmm_reg) r, a = in(zmm_reg) a, b = in(zmm_reg) b, k = out(kreg) _,
+        options(pure, nomem, nostack, preserves_flags),
+    );
+    r
+}
 
 #[target_feature(enable = "avx512fp16,avx512f,avx512bw")]
 #[inline]

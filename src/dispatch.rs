@@ -216,6 +216,15 @@ pub(crate) use arm_dispatch_tail;
 /// it, via [`Gang::backend`].
 pub trait Kernel<T: Scalar> {
     type Output;
+
+    /// Ceiling on the ILP unroll factor for *this* kernel, `min`'d against the factor the runtime
+    /// sweep resolves for the core. The default is [`MAX_UNROLL`](crate::MAX_UNROLL) — no cap. The
+    /// `#[kernel]` macro overrides it from build-time MIR analysis (register-footprint estimate) so a
+    /// register-heavy kernel is not unrolled past the point where it spills; hand-written kernels keep
+    /// the default. Only the runtime dispatch path reads it — the build-resolved static path bakes `K`
+    /// as a const and cannot be per-kernel-capped on stable.
+    const K_CAP: usize = crate::MAX_UNROLL;
+
     fn run<S: Backend<T>>(self, simd: Gang<T, S>) -> Self::Output;
 }
 
@@ -250,7 +259,7 @@ impl<T: Scalar, K: Kernel<T>> Kernel<T> for UnrollSelect<K> {
     fn run<S: Backend<T>>(self, g: Gang<T, S>) -> Self::Output {
         use crate::backend::Unroll;
         let b = g.backend();
-        match g.unroll() {
+        match g.unroll().min(<K as Kernel<T>>::K_CAP) {
             2 => self.0.run(Gang::new(Unroll::<S, 2>(b))),
             4 => self.0.run(Gang::new(Unroll::<S, 4>(b))),
             8 => self.0.run(Gang::new(Unroll::<S, 8>(b))),

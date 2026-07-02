@@ -3,7 +3,7 @@ use hydroplane::{Backend, Gang, Kernel, Scalar, SimdDispatch, dispatch, run_scal
 fn oracle_dot<T: Scalar>(a: &[T], b: &[T]) -> f64 {
     a.iter()
         .zip(b)
-        .map(|(&x, &y)| x.to_f64() * y.to_f64())
+        .map(|(&x, &y)| x.into_f64() * y.into_f64())
         .sum()
 }
 
@@ -18,13 +18,13 @@ fn dot_zip_reduce<T: Scalar, S: Backend<T>>(g: Gang<T, S>, a: &[T], b: &[T]) -> 
         |p, q| p + q,
     )
     .reduce_sum()
-    .to_f64()
+    .into_f64()
 }
 
 fn sum_reduce<T: Scalar, S: Backend<T>>(g: Gang<T, S>, a: &[T]) -> f64 {
     g.reduce(a, T::ZERO, g.splat(T::ZERO), |acc, x| acc + x, |p, q| p + q)
         .reduce_sum()
-        .to_f64()
+        .into_f64()
 }
 
 // The unroll factor K is now chosen automatically (dispatch wraps the backend in `Unroll<S, K>`),
@@ -53,7 +53,7 @@ fn check_all<T: Scalar + SimdDispatch>() {
             .collect();
 
         let want = oracle_dot(&a, &b);
-        let sum_want: f64 = a.iter().map(|&x| x.to_f64()).sum();
+        let sum_want: f64 = a.iter().map(|&x| x.into_f64()).sum();
         let tol = 1e-3 * (1.0 + want.abs());
         let sum_tol = 1e-3 * (1.0 + sum_want.abs());
 

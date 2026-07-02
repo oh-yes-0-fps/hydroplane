@@ -2,18 +2,23 @@
 name = "hydroplane"
 version = "0.0.1"
 edition = "2024"
+rust-version = "1.94"
 license = "Apache-2.0"
 description = "Floating but fast: float-agnostic, ISPC-style SPMD/SIMD infrastructure — write one kernel generic over the scalar element (f32/f64/f16/bf16) and run it with runtime ISA dispatch."
-repository = "https://github.com/valstad-shipworks/wreck"
+repository = "https://github.com/valstad-shipworks/hydroplane"
+documentation = "https://docs.rs/hydroplane"
+readme = "README.md"
+keywords = ["simd", "spmd", "ispc", "vectorization", "no-std"]
+categories = ["hardware-support", "no-std", "mathematics"]
 
 [features]
-default = ["std", "macros"]
-std = ["alloc", "half/std"]
+default = ["std"]
+std = ["alloc", "half/std", "glam?/std"]
 alloc = []
-libm = ["dep:libm"]
-# The `#[kernel]` attribute (proc-macro). On by default; disable for a build with no proc-macro
-# dependency — the `macro_rules!` `kernel!` fallback then takes over.
-macros = ["dep:hydroplane-macros"]
+libm = ["dep:libm", "glam?/libm"]
+# Opt-in `glam`-aware wide-vector helpers (`Vec3Wide`/`Mat3Wide`/`GangGlamExt`). Off by default so
+# the core stays geometry-free; pulls `glam` (no-std unless `std`/`libm` are also on).
+glam = ["dep:glam"]
 
 # Declare `target_arch = "spirv"` (the rust-gpu target) and the opt-out `no_apple_accelerate`
 # cfg as known, so the platform-specific `#[cfg]`s don't trip the unexpected_cfgs lint.
@@ -29,17 +34,22 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(no_avx512)',
     'cfg(static_dispatch)',
     'cfg(neon_over_sve)',
+    # Set by the analysis driver's rustc pass; activates the `#[kernel]`-emitted metrics tool
+    # attribute so build-time MIR analysis can find each kernel's body.
+    'cfg(hydro_analyze)',
     # Set by build.rs when static_dispatch + a pinned target-cpu let the unroll factor be resolved at
     # build time instead of by the runtime sweep.
     'cfg(hp_resolved_unroll)',
 ] }
 
 [dependencies]
+glam = { version = "0.32", default-features = false, optional = true }
 # f16/bf16 element support (widen-to-f32 compute path; native AVX-512-FP16 / NEON-fp16 lanes layer
 # on top where the target supports them). Always present — `f16`/`bf16` are re-exported from the crate root.
-half = { version = "2", default-features = false }
-hydroplane-macros = { version = "0.0.1", path = "hydroplane-macros", optional = true }
+half = { version = "2", default-features = false, features = ["num-traits"] }
+hydroplane-macros = { version = "0.0.1", path = "hydroplane-macros" }
 libm = { version = "0.2", optional = true }
+num-traits = { version = "0.2.19", default-features = false }
 
 # rust-gpu subgroup intrinsics — only pulled in when compiling to SPIR-V.
 [target.'cfg(target_arch = "spirv")'.dependencies]
@@ -51,19 +61,6 @@ rand = "0.9"
 soa-rs = "1.0.0"
 wide = "1.5.0"
 
-# Use the `#[kernel]` attribute, so they only build with the (default) `macros` feature.
-[[example]]
-name = "spheres"
-required-features = ["macros"]
-
-[[example]]
-name = "micro_kernel"
-required-features = ["macros"]
-
-[[example]]
-name = "asm_probe"
-required-features = ["macros"]
-
 # Same f32 GEMM kernel through `dispatch_matrix`; compare default (Accelerate) vs
 # `--cfg no_apple_accelerate` (SME) via criterion baselines — see the file header.
 [[bench]]
@@ -74,17 +71,30 @@ harness = false
 [[bench]]
 name = "micro_vs_wide"
 harness = false
-required-features = ["macros"]
 
 # New fixed-`N` column combinators (`count_n`, `for_each_hit_n`, `masked_chunks` + `gather_n`) vs
 # hand-written `wide` SIMD vs scalar — the zero-cost check.
 [[bench]]
 name = "combinators_vs_wide"
 harness = false
-required-features = ["macros"]
 
 # `Gang::map`/`map_n` ILP unroll: unrolled (default) vs `--cfg no_ilp` (K=1) vs hand-written `wide`.
 [[bench]]
 name = "map_ilp"
 harness = false
-required-features = ["macros"]
+
+# Batched 3x3 inverse (`Mat3Wide::inverse`, the FEM Jacobian-inversion kernel) vs hand-written
+# `wide` SIMD vs scalar `glam`.
+[[bench]]
+name = "mat3_inverse_vs_wide"
+harness = false
+required-features = ["glam"]
+
+[[example]]
+name = "asm_mat3"
+required-features = ["glam"]
+
+[workspace]
+members = ["hydroplane-macros", "hydroplane-auto", "hydroplane-example"]
+resolver = "2"
+

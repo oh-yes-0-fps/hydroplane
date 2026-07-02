@@ -66,6 +66,89 @@ macro_rules! wasm_backend {
             type Vector = v128;
             type Mask = v128;
 
+            type IVector = v128;
+            #[inline(always)]
+            fn iload(self, s: &[u32]) -> v128 {
+                debug_assert_eq!(s.len(), 4);
+                unsafe { v128_load(s.as_ptr() as *const v128) }
+            }
+            #[inline(always)]
+            fn istore(self, v: v128, out: &mut [u32]) {
+                debug_assert_eq!(out.len(), 4);
+                unsafe { v128_store(out.as_mut_ptr() as *mut v128, v) }
+            }
+            #[inline(always)]
+            fn isplat(self, v: u32) -> v128 {
+                u32x4_splat(v)
+            }
+            #[inline(always)]
+            fn iadd(self, a: v128, b: v128) -> v128 {
+                i32x4_add(a, b)
+            }
+            #[inline(always)]
+            fn isub(self, a: v128, b: v128) -> v128 {
+                i32x4_sub(a, b)
+            }
+            #[inline(always)]
+            fn imul(self, a: v128, b: v128) -> v128 {
+                i32x4_mul(a, b)
+            }
+            #[inline(always)]
+            fn iand(self, a: v128, b: v128) -> v128 {
+                v128_and(a, b)
+            }
+            #[inline(always)]
+            fn ior(self, a: v128, b: v128) -> v128 {
+                v128_or(a, b)
+            }
+            #[inline(always)]
+            fn ixor(self, a: v128, b: v128) -> v128 {
+                v128_xor(a, b)
+            }
+            #[inline(always)]
+            fn inot(self, a: v128) -> v128 {
+                v128_not(a)
+            }
+            #[inline(always)]
+            fn ishl(self, a: v128, k: u32) -> v128 {
+                debug_assert!(k < 32);
+                i32x4_shl(a, k)
+            }
+            #[inline(always)]
+            fn ishr(self, a: v128, k: u32) -> v128 {
+                debug_assert!(k < 32);
+                u32x4_shr(a, k)
+            }
+            #[inline(always)]
+            fn ishr_arith(self, a: v128, k: u32) -> v128 {
+                debug_assert!(k < 32);
+                i32x4_shr(a, k)
+            }
+            #[inline(always)]
+            fn ieq(self, a: v128, b: v128) -> v128 {
+                i32x4_eq(a, b)
+            }
+            #[inline(always)]
+            fn ilt_u(self, a: v128, b: v128) -> v128 {
+                u32x4_lt(a, b)
+            }
+            #[inline(always)]
+            fn ilt_s(self, a: v128, b: v128) -> v128 {
+                i32x4_lt(a, b)
+            }
+            #[inline(always)]
+            fn iselect(self, m: v128, a: v128, b: v128) -> v128 {
+                v128_bitselect(a, b, m)
+            }
+            #[inline(always)]
+            fn to_bits(self, v: v128) -> v128 {
+                v
+            }
+            #[inline(always)]
+            fn from_bits(self, v: v128) -> v128 {
+                v
+            }
+
             #[inline(always)]
             fn lanes(self) -> usize {
                 4
@@ -118,11 +201,14 @@ macro_rules! wasm_backend {
             }
             #[inline(always)]
             fn min(self, a: v128, b: v128) -> v128 {
-                f32x4_min(a, b)
+                // IEEE minimumNumber: `pmin` (`b < a ? b : a`) already yields `a` when `b` is
+                // NaN; the bitselect patches the a-is-NaN case (wasm's `f32x4.min` would
+                // propagate the NaN instead).
+                v128_bitselect(b, f32x4_pmin(a, b), f32x4_ne(a, a))
             }
             #[inline(always)]
             fn max(self, a: v128, b: v128) -> v128 {
-                f32x4_max(a, b)
+                v128_bitselect(b, f32x4_pmax(a, b), f32x4_ne(a, a))
             }
             #[inline(always)]
             fn le(self, a: v128, b: v128) -> v128 {
@@ -195,6 +281,19 @@ macro_rules! wasm_backend {
             type Vector = v128;
             type Mask = v128;
 
+            type IVector = [u32; 2];
+            #[inline(always)]
+            fn iload(self, s: &[u32]) -> [u32; 2] {
+                let mut v = [0u32; 2];
+                v.copy_from_slice(s);
+                v
+            }
+            #[inline(always)]
+            fn istore(self, v: [u32; 2], out: &mut [u32]) {
+                out.copy_from_slice(&v);
+            }
+
+
             #[inline(always)]
             fn lanes(self) -> usize {
                 2
@@ -247,11 +346,11 @@ macro_rules! wasm_backend {
             }
             #[inline(always)]
             fn min(self, a: v128, b: v128) -> v128 {
-                f64x2_min(a, b)
+                v128_bitselect(b, f64x2_pmin(a, b), f64x2_ne(a, a))
             }
             #[inline(always)]
             fn max(self, a: v128, b: v128) -> v128 {
-                f64x2_max(a, b)
+                v128_bitselect(b, f64x2_pmax(a, b), f64x2_ne(a, a))
             }
             #[inline(always)]
             fn le(self, a: v128, b: v128) -> v128 {
@@ -317,6 +416,19 @@ macro_rules! wasm_backend {
             type Vector = v128;
             type Mask = v128;
 
+            type IVector = [u32; 4];
+            #[inline(always)]
+            fn iload(self, s: &[u32]) -> [u32; 4] {
+                let mut v = [0u32; 4];
+                v.copy_from_slice(s);
+                v
+            }
+            #[inline(always)]
+            fn istore(self, v: [u32; 4], out: &mut [u32]) {
+                out.copy_from_slice(&v);
+            }
+
+
             #[inline(always)]
             fn lanes(self) -> usize {
                 4
@@ -369,11 +481,14 @@ macro_rules! wasm_backend {
             }
             #[inline(always)]
             fn min(self, a: v128, b: v128) -> v128 {
-                f32x4_min(a, b)
+                // IEEE minimumNumber: `pmin` (`b < a ? b : a`) already yields `a` when `b` is
+                // NaN; the bitselect patches the a-is-NaN case (wasm's `f32x4.min` would
+                // propagate the NaN instead).
+                v128_bitselect(b, f32x4_pmin(a, b), f32x4_ne(a, a))
             }
             #[inline(always)]
             fn max(self, a: v128, b: v128) -> v128 {
-                f32x4_max(a, b)
+                v128_bitselect(b, f32x4_pmax(a, b), f32x4_ne(a, a))
             }
             #[inline(always)]
             fn le(self, a: v128, b: v128) -> v128 {
@@ -454,6 +569,19 @@ macro_rules! wasm_backend {
             type Vector = v128;
             type Mask = v128;
 
+            type IVector = [u32; 4];
+            #[inline(always)]
+            fn iload(self, s: &[u32]) -> [u32; 4] {
+                let mut v = [0u32; 4];
+                v.copy_from_slice(s);
+                v
+            }
+            #[inline(always)]
+            fn istore(self, v: [u32; 4], out: &mut [u32]) {
+                out.copy_from_slice(&v);
+            }
+
+
             #[inline(always)]
             fn lanes(self) -> usize {
                 4
@@ -506,11 +634,14 @@ macro_rules! wasm_backend {
             }
             #[inline(always)]
             fn min(self, a: v128, b: v128) -> v128 {
-                f32x4_min(a, b)
+                // IEEE minimumNumber: `pmin` (`b < a ? b : a`) already yields `a` when `b` is
+                // NaN; the bitselect patches the a-is-NaN case (wasm's `f32x4.min` would
+                // propagate the NaN instead).
+                v128_bitselect(b, f32x4_pmin(a, b), f32x4_ne(a, a))
             }
             #[inline(always)]
             fn max(self, a: v128, b: v128) -> v128 {
-                f32x4_max(a, b)
+                v128_bitselect(b, f32x4_pmax(a, b), f32x4_ne(a, a))
             }
             #[inline(always)]
             fn le(self, a: v128, b: v128) -> v128 {

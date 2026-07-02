@@ -109,11 +109,10 @@ impl<T: Scalar> Soa<T> {
         self.padded
     }
 
-    /// Padded slice of column `c` (length [`Soa::padded`]). `c < cols()` is the caller's contract,
-    /// checked only under `debug_assertions`.
+    /// Padded slice of column `c` (length [`Soa::padded`]). Panics if `c >= cols()`.
     #[inline]
     pub fn column(&self, c: usize) -> &[T] {
-        debug_assert!(c < self.cols);
+        assert!(c < self.cols);
         let p = self.padded;
         unsafe { self.buf.get_unchecked(c * p..(c + 1) * p) }
     }
@@ -122,17 +121,16 @@ impl<T: Scalar> Soa<T> {
     /// actually iterate, as opposed to the padded [`column`](Soa::column).
     #[inline]
     pub fn column_active(&self, c: usize) -> &[T] {
-        debug_assert!(c < self.cols);
+        assert!(c < self.cols);
         let p = self.padded;
         unsafe { self.buf.get_unchecked(c * p..c * p + self.len) }
     }
 
-    /// Mutable padded slice of column `c`. The caller must keep padding lanes consistent
-    /// (`[len..padded]` are inactive) and pass `c < cols()` (checked only under `debug_assertions`);
-    /// prefer [`Soa::push_row`] for appends.
+    /// Mutable padded slice of column `c`; panics if `c >= cols()`. The caller must keep padding
+    /// lanes consistent (`[len..padded]` are inactive); prefer [`Soa::push_row`] for appends.
     #[inline]
     pub fn column_mut(&mut self, c: usize) -> &mut [T] {
-        debug_assert!(c < self.cols);
+        assert!(c < self.cols);
         let p = self.padded;
         unsafe { self.buf.get_unchecked_mut(c * p..(c + 1) * p) }
     }
@@ -142,7 +140,7 @@ impl<T: Scalar> Soa<T> {
     /// it borrows one column at a time. `N` must equal [`cols()`](Soa::cols).
     #[inline]
     pub fn columns_active_mut<const N: usize>(&mut self) -> [&mut [T]; N] {
-        debug_assert_eq!(N, self.cols, "Soa::columns_active_mut: N must equal cols()");
+        assert_eq!(N, self.cols, "Soa::columns_active_mut: N must equal cols()");
         let p = self.padded;
         let len = self.len;
         let base = self.buf.as_mut_ptr();

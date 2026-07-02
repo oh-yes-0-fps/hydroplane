@@ -56,12 +56,12 @@ impl<T: Scalar> Kernel<T> for AnyOverlap<'_, T> {
 /// SIMD path must agree bit-for-bit (the kernel uses no FMA).
 fn naive<T: Scalar>(rows: &[[T; 4]], q: [T; 4]) -> bool {
     rows.iter().any(|s| {
-        let dx = q[0].sub(s[0]);
-        let dy = q[1].sub(s[1]);
-        let dz = q[2].sub(s[2]);
-        let d2 = dx.mul(dx).add(dy.mul(dy).add(dz.mul(dz)));
-        let rsum = q[3].add(s[3]);
-        d2.le(rsum.mul(rsum))
+        let dx = q[0] - s[0];
+        let dy = q[1] - s[1];
+        let dz = q[2] - s[2];
+        let d2 = dx * dx + (dy * dy + dz * dz);
+        let rsum = q[3] + s[3];
+        d2 <= rsum * rsum
     })
 }
 

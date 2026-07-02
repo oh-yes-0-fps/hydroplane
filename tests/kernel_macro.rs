@@ -1,8 +1,7 @@
 //! `#[kernel]` attribute: the generated kernels must behave exactly like the hand-written
-//! struct+impl form, for both the element-wise and matrix flavours, including lifetimes and const
-//! generics — plus the shapes the `macro_rules!` fallback can't express (ordinary `<…>` generics,
-//! multiple bounds, where-clauses, a renamed/overridden scalar, several type parameters).
-#![cfg(feature = "macros")]
+//! struct+impl form, for both the element-wise and matrix flavours, including lifetimes, const
+//! generics, ordinary `<…>` generics, multiple bounds, where-clauses, a renamed/overridden
+//! scalar, and several type parameters.
 
 use hydroplane::{Scalar, Gang, kernel};
 
@@ -10,11 +9,11 @@ use hydroplane::{Scalar, Gang, kernel};
 /// Sum of `xs` scaled by `k`, reduced across lanes — exercises load/operators/reduce.
 pub fn scaled_sum<'a, T: Scalar>(ctx: Gang<T>, xs: &'a [T], k: T) -> f64 {
     let mut acc = ctx.splat(T::ZERO);
-    for (off, cnt) in ctx.chunks(xs.len()) {
+    ctx.for_each_chunk(xs.len(), |off, cnt| {
         let v = ctx.load_partial(&xs[off..off + cnt], T::ZERO);
         acc = acc + v * k;
-    }
-    acc.reduce_sum().to_f64()
+    });
+    acc.reduce_sum().into_f64()
 }
 
 // Multiple bounds on the scalar + an extra non-scalar type parameter used only in the return type:
@@ -22,10 +21,10 @@ pub fn scaled_sum<'a, T: Scalar>(ctx: Gang<T>, xs: &'a [T], k: T) -> f64 {
 #[kernel]
 pub fn scaled_sum_into<'a, T: Scalar + Copy, R: From<f64>>(ctx: Gang<T>, xs: &'a [T], k: T) -> R {
     let mut acc = ctx.splat(T::ZERO);
-    for (off, cnt) in ctx.chunks(xs.len()) {
+    ctx.for_each_chunk(xs.len(), |off, cnt| {
         acc = acc + ctx.load_partial(&xs[off..off + cnt], T::ZERO) * k;
-    }
-    R::from(acc.reduce_sum().to_f64())
+    });
+    R::from(acc.reduce_sum().into_f64())
 }
 
 // Scalar bound expressed in a where-clause (the fallback can't parse this at all).
@@ -35,12 +34,12 @@ where
     T: Scalar,
 {
     let mut acc = ctx.splat(T::ZERO);
-    for (off, cnt) in ctx.chunks(xs.len()) {
+    ctx.for_each_chunk(xs.len(), |off, cnt| {
         let x = ctx.load_partial(&xs[off..off + cnt], T::ZERO);
         let y = ctx.load_partial(&ys[off..off + cnt], T::ZERO);
         acc = acc + x * y;
-    }
-    acc.reduce_sum().to_f64()
+    });
+    acc.reduce_sum().into_f64()
 }
 
 // The scalar parameter need not be named `T` — it's found by its `Scalar` bound (the `macro_rules!`
@@ -48,32 +47,37 @@ where
 #[kernel]
 pub fn renamed_scalar<'a, Elem: Scalar>(ctx: Gang<Elem>, xs: &'a [Elem]) -> f64 {
     let mut acc = ctx.splat(Elem::ZERO);
-    for (off, cnt) in ctx.chunks(xs.len()) {
+    ctx.for_each_chunk(xs.len(), |off, cnt| {
         acc = acc + ctx.load_partial(&xs[off..off + cnt], Elem::ZERO);
-    }
-    acc.reduce_sum().to_f64()
+    });
+    acc.reduce_sum().into_f64()
 }
 
-// Explicit `vector` mode is identical to the bare form.
-#[kernel(vector)]
+// A plain vector reduction over a generic scalar (bare `#[kernel]`).
+#[kernel]
 pub fn vector_sum<'a, T: Scalar>(ctx: Gang<T>, xs: &'a [T]) -> f64 {
     let mut acc = ctx.splat(T::ZERO);
-    for (off, cnt) in ctx.chunks(xs.len()) {
+    ctx.for_each_chunk(xs.len(), |off, cnt| {
         acc = acc + ctx.load_partial(&xs[off..off + cnt], T::ZERO);
-    }
-    acc.reduce_sum().to_f64()
+    });
+    acc.reduce_sum().into_f64()
 }
 
 // A concrete-`f32` micro-kernel (scalar inferred from the context type) — like a joint-limit check.
-// The tail is staged with sentinels so inactive lanes never produce a false hit.
+// The full-register pass short-circuits with plain loads; only the remainder stages sentinels so
+// inactive lanes never produce a false hit.
 #[kernel]
 pub fn any_gt<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> bool {
-    for (off, cnt) in ctx.chunks(a.len()) {
-        let x = ctx.load_partial(&a[off..off + cnt], f32::NEG_INFINITY);
-        let y = ctx.load_partial(&b[off..off + cnt], f32::INFINITY);
-        if x.gt(y).any() {
+    let n = ctx.lanes();
+    for off in ctx.chunks_exact(a.len()) {
+        if ctx.load(&a[off..off + n]).gt(ctx.load(&b[off..off + n])).any() {
             return true;
         }
+    }
+    if let Some((off, cnt)) = ctx.remainder(a.len()) {
+        let x = ctx.load_partial(&a[off..off + cnt], f32::NEG_INFINITY);
+        let y = ctx.load_partial(&b[off..off + cnt], f32::INFINITY);
+        return x.gt(y).any();
     }
     false
 }
@@ -91,27 +95,25 @@ pub fn gemm<'a, T: Scalar, const M: usize, const N: usize, const K: usize>(
     tl.mma::<M, N, K>(at, bt, tl.zero_acc::<M, N>()).store_rm(out);
 }
 
-// Two leading contexts in declared order — a vector handle `v` and a matrix handle `m`, both over the
-// same dispatched backend. Stores `out = A·B` via the tile surface and returns the lane-sum of `a`
-// via the vector surface, proving both handles are live in one kernel.
-#[kernel(vector, matrix)]
+// A matrix context is also a `Backend`, so one `ctx` drives both the tile matmul (`out = A·B`) and a
+// vector reduction (the lane-sum of `a`) in the same kernel.
+#[kernel(matrix)]
 pub fn gemm_and_sum_a<'a, T: Scalar, const M: usize, const N: usize, const K: usize>(
-    v: Gang<T>,
-    m: Gang<T>,
+    ctx: Gang<T>,
     a: &'a [T],
     b: &'a [T],
     out: &'a mut [T::Compute],
 ) -> f64 {
-    let tl = m.tiles();
+    let tl = ctx.tiles();
     let at = tl.load_a_rm::<M, K>(a);
     let bt = tl.load_b_rm::<K, N>(b);
     tl.mma::<M, N, K>(at, bt, tl.zero_acc::<M, N>()).store_rm(out);
 
-    let mut acc = v.splat(T::ZERO);
-    for (off, cnt) in v.chunks(a.len()) {
-        acc = acc + v.load_partial(&a[off..off + cnt], T::ZERO);
-    }
-    acc.reduce_sum().to_f64()
+    let mut acc = ctx.splat(T::ZERO);
+    ctx.for_each_chunk(a.len(), |off, cnt| {
+        acc = acc + ctx.load_partial(&a[off..off + cnt], T::ZERO);
+    });
+    acc.reduce_sum().into_f64()
 }
 
 #[test]
@@ -153,10 +155,10 @@ fn scalar_param_need_not_be_named_t() {
 #[kernel]
 pub fn scaled<'a, T: Scalar>(ctx: Gang<T>, xs: &'a [T], k: T) -> f64 {
     let mut acc = ctx.splat(T::ZERO);
-    for (off, cnt) in ctx.chunks(xs.len()) {
+    ctx.for_each_chunk(xs.len(), |off, cnt| {
         acc = acc + ctx.load_partial(&xs[off..off + cnt], T::ZERO) * k;
-    }
-    acc.reduce_sum().to_f64()
+    });
+    acc.reduce_sum().into_f64()
 }
 
 #[kernel]
@@ -211,10 +213,10 @@ pub fn scale7<'a>(
     a6: f32,
 ) -> f32 {
     let mut acc = ctx.splat(0.0);
-    for (off, cnt) in ctx.chunks(xs.len()) {
+    ctx.for_each_chunk(xs.len(), |off, cnt| {
         let v = ctx.load_partial(&xs[off..off + cnt], 0.0);
         acc = acc + v * a0 * a1 * a2 * a3 * a4 * a5 * a6;
-    }
+    });
     acc.reduce_sum()
 }
 

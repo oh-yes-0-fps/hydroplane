@@ -16,36 +16,45 @@
 
 use hydroplane::{Gang, kernel};
 
-/// Any `a[i] > b[i]`? The partial tail loads inactive lanes with `-inf` (lhs) / `+inf` (rhs), so
-/// `-inf > +inf` is false and padding never trips the reduction.
-#[kernel]
+/// Any `a[i] > b[i]`? The full-register pass short-circuits on plain loads; only the remainder
+/// stages sentinels — `-inf` (lhs) / `+inf` (rhs), so `-inf > +inf` is false and padding never
+/// trips the reduction.
+#[kernel(tiny)]
 fn any_gt<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> bool {
-    for (off, cnt) in ctx.chunks(a.len()) {
-        let x = ctx.load_partial(&a[off..off + cnt], f32::NEG_INFINITY);
-        let y = ctx.load_partial(&b[off..off + cnt], f32::INFINITY);
-        if x.gt(y).any() {
+    let n = ctx.lanes();
+    for off in ctx.chunks_exact(a.len()) {
+        if ctx.load(&a[off..off + n]).gt(ctx.load(&b[off..off + n])).any() {
             return true;
         }
+    }
+    if let Some((off, cnt)) = ctx.remainder(a.len()) {
+        let x = ctx.load_partial(&a[off..off + cnt], f32::NEG_INFINITY);
+        let y = ctx.load_partial(&b[off..off + cnt], f32::INFINITY);
+        return x.gt(y).any();
     }
     false
 }
 
-/// Any `a[i] < b[i]`? Tail sentinels are swapped: `+inf < -inf` is false.
-#[kernel]
+/// Any `a[i] < b[i]`? Remainder sentinels are swapped: `+inf < -inf` is false.
+#[kernel(tiny)]
 fn any_lt<'a>(ctx: Gang<f32>, a: &'a [f32], b: &'a [f32]) -> bool {
-    for (off, cnt) in ctx.chunks(a.len()) {
-        let x = ctx.load_partial(&a[off..off + cnt], f32::INFINITY);
-        let y = ctx.load_partial(&b[off..off + cnt], f32::NEG_INFINITY);
-        if x.lt(y).any() {
+    let n = ctx.lanes();
+    for off in ctx.chunks_exact(a.len()) {
+        if ctx.load(&a[off..off + n]).lt(ctx.load(&b[off..off + n])).any() {
             return true;
         }
+    }
+    if let Some((off, cnt)) = ctx.remainder(a.len()) {
+        let x = ctx.load_partial(&a[off..off + cnt], f32::INFINITY);
+        let y = ctx.load_partial(&b[off..off + cnt], f32::NEG_INFINITY);
+        return x.lt(y).any();
     }
     false
 }
 
 /// Below `lo` anywhere, or above `hi` anywhere? One dispatch (at this kernel's entry); the two
 /// sub-kernels run on the same already-chosen backend via their `_on` companions.
-#[kernel]
+#[kernel(tiny)]
 fn out_of_limits<'a>(ctx: Gang<f32>, q: &'a [f32], lo: &'a [f32], hi: &'a [f32]) -> bool {
     any_lt_on(ctx, q, lo) || any_gt_on(ctx, q, hi)
 }
@@ -53,7 +62,7 @@ fn out_of_limits<'a>(ctx: Gang<f32>, q: &'a [f32], lo: &'a [f32], hi: &'a [f32])
 /// Squared distance between two joint configs: `Σ (q[i] - p[i])²`. A plain sum reduction — `zip_sum`
 /// supplies the `0` identity, the masked tail, the chain combine, and the per-core unroll factor, so
 /// nothing here mentions accumulators-per-pipe yet the loop runs them all.
-#[kernel]
+#[kernel(tiny)]
 fn dist_sq<'a>(ctx: Gang<f32>, q: &'a [f32], p: &'a [f32]) -> f32 {
     ctx.zip_sum(q, p, |acc, a, b| {
         let d = a - b;

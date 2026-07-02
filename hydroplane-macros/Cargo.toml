@@ -2,14 +2,17 @@
 name = "hydroplane-macros"
 version = "0.0.1"
 edition = "2024"
+rust-version = "1.85"
 license = "Apache-2.0"
 description = "Proc-macro `#[kernel]` attribute for hydroplane: write a SIMD/SPMD kernel as a plain generic function."
-repository = "https://github.com/valstad-shipworks/wreck"
+repository = "https://github.com/valstad-shipworks/hydroplane"
+documentation = "https://docs.rs/hydroplane-macros"
 
 [lib]
 proc-macro = true
 
 [dependencies]
+hydroplane-auto = { version = "0.0.1", path = "../hydroplane-auto" }
 proc-macro2 = "1.0.106"
 quote = "1.0.46"
 syn = { version = "2.0.118", features = ["full"] }

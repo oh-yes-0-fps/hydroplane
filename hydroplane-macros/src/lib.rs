@@ -20,29 +20,37 @@
 //! field carried across the dispatch boundary. The scalar type parameter is the one bound by
 //! `Scalar` (or, failing that, the one named `T`); override the choice with `#[kernel(scalar = U)]`.
 //!
-//! ## Modes
+//! ## Surface
 //!
-//! The attribute lists the execution surfaces the kernel needs, in the order their context
-//! parameters appear:
-//!
-//! * `#[kernel(vector)]` (the default, also written bare `#[kernel]`) — one [`Backend<T>`] context.
-//! * `#[kernel(matrix)]` — one [`MatrixBackend<T>`] context (adds the `.tiles()` matmul surface).
-//! * `#[kernel(vector, matrix)]` — two leading contexts in that order, both over the *same*
-//!   dispatched backend (so the first is a plain vector handle, the second a matrix handle).
-//!
-//! Whenever `matrix` is requested the kernel is a [`MatrixKernel`] dispatched via `dispatch_matrix`
-//! and every context is bound by `MatrixBackend<T>` (which is itself a `Backend<T>`, so the vector
-//! handle works too); otherwise it is a [`Kernel`] dispatched via `dispatch`.
+//! A kernel takes exactly one leading context parameter (`ctx: Gang<T>`). Bare `#[kernel]` binds it to
+//! a [`Backend<T>`] — the element-wise SIMD surface (`splat`/`load`/`map`/`sum`…). `#[kernel(matrix)]`
+//! binds it to a [`MatrixBackend<T>`] instead, adding the `.tiles()` matmul surface — and since
+//! `MatrixBackend<T>: Backend<T>`, a matrix context still does every vector op, so one `ctx` serves
+//! both. A matrix kernel is a [`MatrixKernel`] dispatched via `dispatch_matrix`; a vector kernel is a
+//! [`Kernel`] dispatched via `dispatch`.
 //!
 //! ```ignore
-//! #[hydroplane::kernel(vector, matrix)]
-//! fn gemv<'a, T: Scalar, const M: usize, const K: usize>(
-//!     v: Gang<T>, m: Gang<T>, a: &'a [T], x: &'a [T], out: &'a mut [T::Compute],
+//! #[hydroplane::kernel(matrix)]
+//! fn gemm<'a, T: Scalar, const M: usize, const N: usize, const K: usize>(
+//!     ctx: Gang<T>, a: &'a [T], b: &'a [T], out: &'a mut [T::Compute],
 //! ) {
-//!     let _ = v.lanes();        // vector handle
-//!     let _tiles = m.tiles();   // matrix handle, same backend
+//!     let tl = ctx.tiles();                                   // matmul surface
+//!     tl.mma::<M, N, K>(tl.load_a_rm::<M, K>(a), tl.load_b_rm::<K, N>(b), tl.zero_acc::<M, N>())
+//!         .store_rm(out);
+//!     let _ = ctx.lanes();                                    // …and vector ops on the same ctx
 //! }
 //! ```
+//!
+//! ## Tuning
+//!
+//! By default the body runs behind a non-inlined `noalias` boundary: its data parameters are passed
+//! as real function arguments, so `&`/`&mut` slices carry the `noalias` attribute a load through the
+//! generated kernel struct would drop — worth up to ~1.6x on memory-bound kernels by letting LLVM
+//! cluster and reorder loads/stores. The trade is a single per-invocation call. `#[kernel(tiny)]`
+//! opts out (fully inlined, no call) for micro-kernels whose fixed work is smaller than that call;
+//! `#[kernel(noalias)]` states the default explicitly. `tiny` and `noalias` are mutually exclusive.
+//! `#[kernel(unroll = N)]` pins the ILP unroll factor. `noalias`/`tiny` and `unroll` are also what the
+//! build-time analysis (`hydroplane-auto`) chooses automatically; the attribute is the manual override.
 //!
 //! The scalar may be concrete: `#[kernel] fn any_gt(ctx: Gang<f32>, …)` infers `f32` from the context
 //! type, so no generic parameter is required. Backend selection inside `dispatch` is itself cached
@@ -74,6 +82,8 @@
 //! [`Kernel`]: ../hydroplane/trait.Kernel.html
 //! [`MatrixKernel`]: ../hydroplane/trait.MatrixKernel.html
 
+use hydroplane_auto::analysis;
+
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
@@ -101,41 +111,55 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-/// A requested execution surface. Each mode contributes one leading context parameter, in the order
-/// listed in the attribute, and determines the backend bound: [`Vector`](Mode::Vector) needs
-/// `Backend<T>`, [`Matrix`](Mode::Matrix) needs `MatrixBackend<T>`. The kernel is dispatched through
-/// the most capable surface requested (matrix when present, since `MatrixBackend<T>: Backend<T>`),
-/// and every context parameter shares that one backend.
-#[derive(Clone, Copy, PartialEq)]
-enum Mode {
-    Vector,
-    Matrix,
-}
-
 struct KernelOpts {
-    modes: Vec<Mode>,
+    /// `#[kernel(matrix)]` — the single context is a [`MatrixBackend`], adding the `.tiles()` matmul
+    /// surface (and it is still a [`Backend`], so vector ops work too). Bare `#[kernel]` is a plain
+    /// vector context.
+    matrix: bool,
     scalar: Option<Ident>,
+    /// Run the body behind a non-inlined `noalias` boundary. On by default (worth up to ~1.6x on
+    /// memory-bound kernels); `tiny` turns it off for micro-kernels that can't afford the call.
+    noalias: bool,
+    /// The author wrote `tiny` or `noalias` explicitly. When set, build-time analysis must not
+    /// override the boundary choice — an explicit annotation always wins.
+    explicit_boundary: bool,
+    /// Explicit ILP unroll cap, overriding the build-time estimate. The escape hatch for kernels
+    /// whose register pressure the analysis can't measure — a `map_cols` transform that keeps its
+    /// varyings in a closure the register proxy under-counts, so the author pins `unroll = 1`.
+    unroll: Option<usize>,
 }
 
 impl KernelOpts {
     fn parse(tokens: TokenStream2) -> syn::Result<Self> {
-        let mut modes = Vec::new();
+        let mut matrix = false;
         let mut scalar = None;
+        let mut noalias = true;
+        let mut tiny_span = None;
+        let mut noalias_span = None;
+        let mut unroll = None;
         let metas = Punctuated::<Meta, Token![,]>::parse_terminated.parse2(tokens)?;
         for meta in metas {
-            let push_mode = |modes: &mut Vec<Mode>, m: Mode, span| -> syn::Result<()> {
-                if modes.contains(&m) {
-                    return Err(syn::Error::new(span, "duplicate mode"));
-                }
-                modes.push(m);
-                Ok(())
-            };
             match meta {
-                Meta::Path(p) if p.is_ident("vector") => {
-                    push_mode(&mut modes, Mode::Vector, p.span())?
-                }
                 Meta::Path(p) if p.is_ident("matrix") => {
-                    push_mode(&mut modes, Mode::Matrix, p.span())?
+                    if matrix {
+                        return Err(syn::Error::new(p.span(), "duplicate `matrix`"));
+                    }
+                    matrix = true;
+                }
+                Meta::Path(p) if p.is_ident("tiny") => {
+                    if tiny_span.is_some() {
+                        return Err(syn::Error::new(p.span(), "duplicate `tiny`"));
+                    }
+                    tiny_span = Some(p.span());
+                    noalias = false;
+                }
+                // The `noalias` boundary is the default; `noalias` is accepted as an explicit
+                // affirmation, so a kernel can state its intent (and to keep older annotations valid).
+                Meta::Path(p) if p.is_ident("noalias") => {
+                    if noalias_span.is_some() {
+                        return Err(syn::Error::new(p.span(), "duplicate `noalias`"));
+                    }
+                    noalias_span = Some(p.span());
                 }
                 Meta::NameValue(nv) if nv.path.is_ident("scalar") => {
                     let id = match &nv.value {
@@ -152,19 +176,33 @@ impl KernelOpts {
                         }
                     }
                 }
+                Meta::NameValue(nv) if nv.path.is_ident("unroll") => match &nv.value {
+                    syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(i), .. }) => {
+                        unroll = Some(i.base10_parse::<usize>()?);
+                    }
+                    _ => {
+                        return Err(syn::Error::new_spanned(
+                            &nv.value,
+                            "expected an integer, e.g. `unroll = 4`",
+                        ));
+                    }
+                },
                 other => {
                     return Err(syn::Error::new_spanned(
                         other,
-                        "unknown `#[kernel]` option; expected `vector`, `matrix`, or `scalar = Ident`",
+                        "unknown `#[kernel]` option; expected `matrix`, `scalar = Ident`, \
+                         `unroll = N`, `tiny`, or `noalias`",
                     ));
                 }
             }
         }
-        // Bare `#[kernel]` (or `#[kernel(scalar = …)]` alone) means a single vector context.
-        if modes.is_empty() {
-            modes.push(Mode::Vector);
+        if let (Some(ts), Some(ns)) = (tiny_span, noalias_span) {
+            let mut e = syn::Error::new(ns, "`noalias` and `tiny` are opposites — pick one");
+            e.combine(syn::Error::new(ts, "`tiny` set here"));
+            return Err(e);
         }
-        Ok(KernelOpts { modes, scalar })
+        let explicit_boundary = tiny_span.is_some() || noalias_span.is_some();
+        Ok(KernelOpts { matrix, scalar, noalias, explicit_boundary, unroll })
     }
 }
 
@@ -186,12 +224,12 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         return Err(syn::Error::new_spanned(v, "a kernel cannot be variadic"));
     }
 
-    let n_ctx = opts.modes.len();
+    // A kernel takes exactly one leading context parameter (`ctx: Gang<T>`).
     let mut inputs = sig.inputs.into_iter();
-    let mut ctx_idents = Vec::with_capacity(n_ctx);
-    let mut ctx_tys = Vec::with_capacity(n_ctx);
+    let mut ctx_idents = Vec::with_capacity(1);
+    let mut ctx_tys = Vec::with_capacity(1);
     let mut ctx_scalar = None;
-    for _ in 0..n_ctx {
+    for _ in 0..1 {
         match inputs.next() {
             Some(FnArg::Typed(pt)) => {
                 match *pt.pat {
@@ -218,10 +256,8 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
             None => {
                 return Err(syn::Error::new_spanned(
                     &sig.ident,
-                    format!(
-                        "this kernel declares {n_ctx} mode(s), so it needs {n_ctx} leading context \
-                         parameter(s) (e.g. `ctx: Gang<T>`) before its data parameters",
-                    ),
+                    "a kernel needs a leading context parameter (e.g. `ctx: Gang<T>`) before its \
+                     data parameters",
                 ));
             }
         }
@@ -232,6 +268,10 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
     for arg in inputs {
         match arg {
             FnArg::Typed(pt) => {
+                // `#[hint_cnt(N)]` on a data parameter is a length hint for the passed slice/iterator.
+                // Parsed and thrown out for now — reserved for future count-driven codegen (static tail
+                // specialization, prefetch distance). It is never re-emitted, so it can't reach rustc.
+                let _hint_cnt = parse_hint_cnt(&pt.attrs);
                 match *pt.pat {
                     Pat::Ident(pi) => field_idents.push(pi.ident),
                     other => {
@@ -308,7 +348,7 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         )
     };
 
-    let matrix_present = opts.modes.contains(&Mode::Matrix);
+    let matrix_present = opts.matrix;
     let (ktrait, bbound, dispatch_fn, dbound) = if matrix_present {
         (
             quote!(::hydroplane::MatrixKernel),
@@ -338,6 +378,44 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
 
     let name = sig.ident;
 
+    // Fold build-time MIR analysis (when available) into the codegen knobs. Matrix kernels dispatch
+    // through a different path (`dispatch_matrix`, no `Unroll` wrapper, no `run_scalar`), so they take
+    // none of it. An explicit `tiny`/`noalias` always wins over the analysis boundary choice.
+    let name_str = name.to_string();
+    let metrics = if matrix_present {
+        None
+    } else {
+        analysis::lookup(&name_str)
+    };
+    let use_noalias = match metrics {
+        Some(m) if !opts.explicit_boundary => m.noalias(),
+        _ => opts.noalias,
+    };
+    // An explicit `unroll = N` pins the cap; otherwise the build-time estimate (if any) sets it.
+    let k_cap = opts.unroll.or_else(|| metrics.map(|m| m.k_cap()));
+
+    // Under the (default) `noalias` boundary the real body lives in `_on`, so that is what the analysis
+    // driver measures. The attribute is inert until the driver compiles with `--cfg hydro_analyze`.
+    // Explicit-`tiny` and matrix kernels aren't measured (the body isn't in `_on`, or isn't capped).
+    // Only the analysis driver's nested build (which sets `HYDRO_ANALYZE_INNER` alongside
+    // `--cfg hydro_analyze`) ever evaluates the metrics attribute, so it is emitted only there.
+    // A normal consumer build never sees the `hydro_analyze` token: the `unexpected_cfgs` lint
+    // fires during expansion config, before any generated `#[allow]` could apply, so keeping the
+    // `cfg_attr` out entirely is the only way consumers stay warning-free without registering
+    // the cfg in their own check-cfg table.
+    let metrics_attr = if use_noalias
+        && !matrix_present
+        && std::env::var_os("HYDRO_ANALYZE_INNER").is_some()
+    {
+        quote!(#[cfg_attr(hydro_analyze, hydro_analyze::metrics(kernel = #name_str))])
+    } else {
+        quote!()
+    };
+    let k_cap_item = match k_cap {
+        Some(k) => quote!(const K_CAP: usize = #k;),
+        None => quote!(),
+    };
+
     // The trait's `run` takes one context. Every requested mode shares the single dispatched backend,
     // so the first context is the real parameter and the rest are `Copy` aliases of it (`Gang` is
     // `Copy`), giving each its declared name and surface inside the body.
@@ -356,6 +434,46 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
     on_generics.params.push(parse_quote!(__S: #bbound<#scalar>));
     let (on_impl_generics, _, on_where) = on_generics.split_for_impl();
 
+    // Default (`!tiny`): run the body inside `_on` — whose data parameters are real function
+    // arguments, so the `&`/`&mut` slices carry the `noalias` attribute that a load through the
+    // `__Kernel` struct field drops. That attribute lets LLVM cluster and reorder loads/stores across
+    // the loop (worth up to ~1.6x on memory-bound kernels), but only survives a genuine call, so `_on`
+    // is `#[inline(never)]`. `#[kernel(tiny)]` opts out — fully inlined, no per-invocation call — for
+    // micro-kernels whose fixed work is smaller than that call (~0.2ns).
+    let on_call_turbofish = if turbofish_args.is_empty() {
+        quote!(::<__S>)
+    } else {
+        quote!(::<#(#turbofish_args,)* __S>)
+    };
+    let (run_body, on_body, on_inline) = if use_noalias {
+        (
+            quote! {
+                let Self { #( #field_idents, )* .. } = self;
+                #on_name #on_call_turbofish ( #primary_ctx, #( #field_idents, )* )
+            },
+            quote! {
+                #( #ctx_aliases )*
+                #block
+            },
+            quote!(#[inline(never)]),
+        )
+    } else {
+        (
+            quote! {
+                #( #ctx_aliases )*
+                let Self { #( #field_idents, )* .. } = self;
+                #block
+            },
+            quote! {
+                #ktrait::run(#name::__Kernel #turbofish { #( #field_idents, )* #phantom_init }, #primary_ctx)
+            },
+            quote!(#[inline]),
+        )
+    };
+
+    let dispatch_call =
+        quote!(#dispatch_fn(#name::__Kernel #turbofish { #( #field_idents, )* #phantom_init }));
+
     Ok(quote! {
         #[doc(hidden)]
         #[allow(non_snake_case)]
@@ -369,11 +487,10 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
             }
             impl #impl_generics #ktrait<#scalar> for __Kernel #ty_generics #where_clause {
                 type Output = #ret;
+                #k_cap_item
                 #[inline]
                 fn run<__S: #bbound<#scalar>>(self, #primary_ctx: #primary_ty) -> #ret {
-                    #( #ctx_aliases )*
-                    let Self { #( #field_idents, )* .. } = self;
-                    #block
+                    #run_body
                 }
             }
         }
@@ -386,18 +503,29 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         #vis fn #name #w_impl_generics ( #( #field_idents: #field_tys ),* ) -> #ret
         #w_where
         {
-            #dispatch_fn(#name::__Kernel #turbofish { #( #field_idents, )* #phantom_init })
+            #dispatch_call
         }
         #[doc = concat!("Run [`", stringify!(#name), "`]'s body on an already-dispatched context, ")]
         #[doc = "skipping a second dispatch — call this from inside another kernel to reuse its backend."]
-        #[inline]
+        #metrics_attr
+        #on_inline
         #[allow(clippy::too_many_arguments)]
         #vis fn #on_name #on_impl_generics ( #primary_ctx: #primary_ty, #( #field_idents: #field_tys ),* ) -> #ret
         #on_where
         {
-            #ktrait::run(#name::__Kernel #turbofish { #( #field_idents, )* #phantom_init }, #primary_ctx)
+            #on_body
         }
     })
+}
+
+/// The value of a `#[hint_cnt(N)]` attribute on a kernel parameter, if present. Currently discarded
+/// by the caller (the hint is not yet wired into codegen); malformed forms are leniently ignored.
+fn parse_hint_cnt(attrs: &[syn::Attribute]) -> Option<u64> {
+    attrs
+        .iter()
+        .filter(|a| a.path().is_ident("hint_cnt"))
+        .find_map(|a| a.parse_args::<syn::LitInt>().ok())
+        .and_then(|lit| lit.base10_parse::<u64>().ok())
 }
 
 /// Turn the context parameter's written type into the backend-carrying form: `Gang<T>` (written by

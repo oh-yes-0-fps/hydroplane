@@ -34,6 +34,7 @@ pub mod dispatch;
 // The runtime unroll cache; gone when `build.rs` resolved the factor at compile time.
 #[cfg(not(hp_resolved_unroll))]
 pub(crate) mod ilp;
+pub mod dense;
 pub mod matrix;
 pub mod scalar;
 pub mod varying;
@@ -55,6 +56,9 @@ pub use dispatch::{Kernel, SimdDispatch, dispatch, run_scalar};
 /// on work size — subgroup-distributed vs. a single sequential invocation — instead of CPU ISA.
 #[cfg(target_arch = "spirv")]
 pub use backend::subgroup::dispatch_subgroup;
+pub use dense::{Diag, Mat, Side, Trans, Uplo, col_sums, fro_norm, gemv, row_sums};
+#[cfg(feature = "alloc")]
+pub use dense::{MatMut, gemm, potrf, syrk, trsm};
 pub use matrix::{
     Accumulator, Layout, MatrixA, MatrixB, MatrixBackend, MatrixDispatch, MatrixKernel, Role, Tile,
     Tiles, dispatch_matrix, run_matrix_scalar,
@@ -83,7 +87,7 @@ pub use cols::Cols;
 pub use soa::Soa;
 
 #[cfg(feature = "glam")]
-pub use glam_ext::{GangGlamExt, Mat3Wide, Vec3Wide};
+pub use glam_ext::{GangGlamExt, Mat3Wide, MatWide, Vec3Wide};
 
 /// The combo-dispatch tier tokens and codes, reachable by `#[kernel]`-generated wrappers.
 /// Implementation detail: application code never names a backend — the generated match does.

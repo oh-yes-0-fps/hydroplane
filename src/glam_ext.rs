@@ -216,6 +216,75 @@ impl<S: Backend<f32>> From<[Varying<f32, S>; 9]> for Mat3Wide<S> {
     }
 }
 
+/// A batched `R×C` matrix held one-per-lane over SoA planes: each `[i][j]` entry is a full register
+/// whose lanes are that entry across a register's worth of independent matrices. This is the
+/// [`Mat3Wide`] idea generalized — FEM's real shape is thousands of small independent products
+/// (`3×3`/`6×6`/`12×12` element matrices), the regime where the gang machinery wins and the
+/// big-matrix packing/streaming path in [`dense`](crate::dense) can't. Row-major nested storage
+/// (`[[_; C]; R]`) so the size stays expressible on stable without `generic_const_exprs`.
+#[derive(Clone, Copy)]
+pub struct MatWide<S: Backend<f32>, const R: usize, const C: usize>(pub [[Varying<f32, S>; C]; R]);
+
+impl<S: Backend<f32>, const R: usize, const C: usize> From<[[Varying<f32, S>; C]; R]>
+    for MatWide<S, R, C>
+{
+    #[inline(always)]
+    fn from(v: [[Varying<f32, S>; C]; R]) -> Self {
+        Self(v)
+    }
+}
+
+impl<S: Backend<f32>, const R: usize, const C: usize> MatWide<S, R, C> {
+    /// Batched matrix product `self · rhs`, one independent `R×C · C×N` product per lane. The
+    /// contraction is an FMA chain per output entry.
+    #[inline(always)]
+    pub fn matmul<const N: usize>(self, rhs: MatWide<S, C, N>) -> MatWide<S, R, N> {
+        MatWide(core::array::from_fn(|i| {
+            core::array::from_fn(|j| {
+                let mut acc = self.0[i][0] * rhs.0[0][j];
+                for k in 1..C {
+                    acc = self.0[i][k].fma(rhs.0[k][j], acc);
+                }
+                acc
+            })
+        }))
+    }
+
+    /// The per-lane transpose (`C×R`).
+    #[inline(always)]
+    pub fn transpose(self) -> MatWide<S, C, R> {
+        MatWide(core::array::from_fn(|j| core::array::from_fn(|i| self.0[i][j])))
+    }
+
+    /// The `R×C` entries in row-major order as nested `[Varying; C]` rows.
+    #[inline(always)]
+    pub fn rows(self) -> [[Varying<f32, S>; C]; R] {
+        self.0
+    }
+
+    /// Write each entry back to its SoA plane — `out[i][j]` receives entry `(i, j)`'s active lanes
+    /// (each plane's length must be exactly `lanes()`). See [`store_partial`](Self::store_partial)
+    /// for a short tail.
+    #[inline(always)]
+    pub fn store(self, out: [[&mut [f32]; C]; R]) {
+        for (row, orow) in self.0.into_iter().zip(out) {
+            for (v, o) in row.into_iter().zip(orow) {
+                v.store(o);
+            }
+        }
+    }
+
+    /// Write each entry back to its SoA plane, storing only the active lanes of a short tail.
+    #[inline(always)]
+    pub fn store_partial(self, out: [[&mut [f32]; C]; R]) {
+        for (row, orow) in self.0.into_iter().zip(out) {
+            for (v, o) in row.into_iter().zip(orow) {
+                v.store_partial(o);
+            }
+        }
+    }
+}
+
 /// Builds [`Vec3Wide`]/[`Mat3Wide`] from glam values — the conversion bridge over the [`Gang`]
 /// primitives (`splat_n`/`gather_n`/`load_n`/`load_partial_n`).
 pub trait GangGlamExt<S: Backend<f32>> {
@@ -235,6 +304,16 @@ pub trait GangGlamExt<S: Backend<f32>> {
     fn load_mat3(self, cols: [&[f32]; 9]) -> Mat3Wide<S>;
     /// Load up to one register from each of nine columns, inactive tail lanes filled with `fill`.
     fn load_partial_mat3(self, cols: [&[f32]; 9], fill: f32) -> Mat3Wide<S>;
+    /// Broadcast a uniform row-major `R×C` matrix across the lanes.
+    fn splat_mat<const R: usize, const C: usize>(self, m: [[f32; C]; R]) -> MatWide<S, R, C>;
+    /// Load one full register from each of the `R×C` SoA entry planes into a batched lane-matrix.
+    fn load_mat<const R: usize, const C: usize>(self, planes: [[&[f32]; C]; R]) -> MatWide<S, R, C>;
+    /// Load up to one register from each entry plane, inactive tail lanes filled with `fill`.
+    fn load_partial_mat<const R: usize, const C: usize>(
+        self,
+        planes: [[&[f32]; C]; R],
+        fill: f32,
+    ) -> MatWide<S, R, C>;
 }
 
 impl<S: Backend<f32>> GangGlamExt<S> for Gang<S> {
@@ -270,5 +349,21 @@ impl<S: Backend<f32>> GangGlamExt<S> for Gang<S> {
     #[inline(always)]
     fn load_partial_mat3(self, cols: [&[f32]; 9], fill: f32) -> Mat3Wide<S> {
         Mat3Wide(self.load_partial_n(cols, fill))
+    }
+    #[inline(always)]
+    fn splat_mat<const R: usize, const C: usize>(self, m: [[f32; C]; R]) -> MatWide<S, R, C> {
+        MatWide(core::array::from_fn(|i| self.splat_n(m[i])))
+    }
+    #[inline(always)]
+    fn load_mat<const R: usize, const C: usize>(self, planes: [[&[f32]; C]; R]) -> MatWide<S, R, C> {
+        MatWide(planes.map(|row| self.load_n(row)))
+    }
+    #[inline(always)]
+    fn load_partial_mat<const R: usize, const C: usize>(
+        self,
+        planes: [[&[f32]; C]; R],
+        fill: f32,
+    ) -> MatWide<S, R, C> {
+        MatWide(planes.map(|row| self.load_partial_n(row, fill)))
     }
 }

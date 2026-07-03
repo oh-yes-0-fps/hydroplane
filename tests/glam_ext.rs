@@ -261,3 +261,62 @@ fn mat3wide_inverse_matches_glam() {
         }
     }
 }
+
+use hydroplane::{Backend, BackendAll, Kernel, MatWide, dispatch};
+
+fn plane(n: usize, seed: f32) -> Vec<f32> {
+    (0..n).map(|i| ((i as f32 + seed) * 0.37).sin() * 3.0).collect()
+}
+
+struct BatMul<'a, const R: usize, const K: usize, const N: usize> {
+    a: &'a [Vec<f32>],
+    b: &'a [Vec<f32>],
+    out: &'a mut [Vec<f32>],
+}
+
+impl<'a, const R: usize, const K: usize, const N: usize> Kernel<f32> for BatMul<'a, R, K, N> {
+    type Output = ();
+    fn run<S: BackendAll + Backend<f32>>(self, ctx: Gang<S>) {
+        let BatMul { a, b, out } = self;
+        let n = out[0].len();
+        ctx.for_each_chunk::<f32>(n, |off, cnt| {
+            let r = off..off + cnt;
+            let am: MatWide<S, R, K> =
+                ctx.load_partial_mat(core::array::from_fn(|i| core::array::from_fn(|j| &a[i * K + j][r.clone()])), 0.0);
+            let bm: MatWide<S, K, N> =
+                ctx.load_partial_mat(core::array::from_fn(|i| core::array::from_fn(|j| &b[i * N + j][r.clone()])), 0.0);
+            let rows = am.matmul(bm).rows();
+            for i in 0..R {
+                for j in 0..N {
+                    rows[i][j].store_partial(&mut out[i * N + j][r.clone()]);
+                }
+            }
+        });
+    }
+}
+
+fn check_batmul<const R: usize, const K: usize, const N: usize>() {
+    for &len in &LENS {
+        let a: Vec<Vec<f32>> = (0..R * K).map(|p| plane(len, p as f32 + 0.2)).collect();
+        let b: Vec<Vec<f32>> = (0..K * N).map(|p| plane(len, p as f32 + 5.0)).collect();
+        let mut out: Vec<Vec<f32>> = (0..R * N).map(|_| vec![0.0; len]).collect();
+        dispatch::<f32, _>(BatMul::<R, K, N> { a: &a, b: &b, out: &mut out });
+        for idx in 0..len {
+            for i in 0..R {
+                for j in 0..N {
+                    let want: f32 = (0..K).map(|k| a[i * K + k][idx] * b[k * N + j][idx]).sum();
+                    let got = out[i * N + j][idx];
+                    assert!((got - want).abs() <= 1e-4 * (1.0 + want.abs()), "batmul {R}x{K}x{N} len{len} [{i}][{j}]@{idx}: {got} vs {want}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn matwide_batched_gemm_matches_scalar() {
+    check_batmul::<2, 3, 4>();
+    check_batmul::<4, 4, 4>();
+    check_batmul::<6, 6, 1>();
+    check_batmul::<3, 3, 3>();
+}

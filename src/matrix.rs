@@ -424,10 +424,18 @@ fn packed_gemm<
 // drop the framework link entirely — Cargo can't gate a dependency on a custom `--cfg`. These are
 // the same Accelerate symbols `apple-accelerate-sys` binds (`CblasRowMajor = 101`, `CblasNoTrans = 111`).
 #[cfg(all(target_vendor = "apple", not(no_apple_accelerate)))]
-mod accel {
+pub(crate) mod accel {
     use core::ffi::{c_int, c_uint};
     pub const ROW_MAJOR: c_uint = 101;
+    pub const COL_MAJOR: c_uint = 102;
     pub const NO_TRANS: c_uint = 111;
+    pub const TRANS: c_uint = 112;
+    pub const UPPER: c_uint = 121;
+    pub const LOWER: c_uint = 122;
+    pub const NON_UNIT: c_uint = 131;
+    pub const UNIT: c_uint = 132;
+    pub const LEFT: c_uint = 141;
+    pub const RIGHT: c_uint = 142;
 
     #[link(name = "Accelerate", kind = "framework")]
     unsafe extern "C" {
@@ -442,6 +450,38 @@ mod accel {
             order: c_uint, transa: c_uint, transb: c_uint, m: c_int, n: c_int, k: c_int,
             alpha: f64, a: *const f64, lda: c_int, b: *const f64, ldb: c_int,
             beta: f64, c: *mut f64, ldc: c_int,
+        );
+        #[allow(clippy::too_many_arguments)]
+        pub fn cblas_sgemv(
+            order: c_uint, trans: c_uint, m: c_int, n: c_int,
+            alpha: f32, a: *const f32, lda: c_int, x: *const f32, incx: c_int,
+            beta: f32, y: *mut f32, incy: c_int,
+        );
+        #[allow(clippy::too_many_arguments)]
+        pub fn cblas_dgemv(
+            order: c_uint, trans: c_uint, m: c_int, n: c_int,
+            alpha: f64, a: *const f64, lda: c_int, x: *const f64, incx: c_int,
+            beta: f64, y: *mut f64, incy: c_int,
+        );
+        #[allow(clippy::too_many_arguments)]
+        pub fn cblas_ssyrk(
+            order: c_uint, uplo: c_uint, trans: c_uint, n: c_int, k: c_int,
+            alpha: f32, a: *const f32, lda: c_int, beta: f32, c: *mut f32, ldc: c_int,
+        );
+        #[allow(clippy::too_many_arguments)]
+        pub fn cblas_dsyrk(
+            order: c_uint, uplo: c_uint, trans: c_uint, n: c_int, k: c_int,
+            alpha: f64, a: *const f64, lda: c_int, beta: f64, c: *mut f64, ldc: c_int,
+        );
+        #[allow(clippy::too_many_arguments)]
+        pub fn cblas_strsm(
+            order: c_uint, side: c_uint, uplo: c_uint, transa: c_uint, diag: c_uint,
+            m: c_int, n: c_int, alpha: f32, a: *const f32, lda: c_int, b: *mut f32, ldb: c_int,
+        );
+        #[allow(clippy::too_many_arguments)]
+        pub fn cblas_dtrsm(
+            order: c_uint, side: c_uint, uplo: c_uint, transa: c_uint, diag: c_uint,
+            m: c_int, n: c_int, alpha: f64, a: *const f64, lda: c_int, b: *mut f64, ldb: c_int,
         );
     }
 }
@@ -471,7 +511,7 @@ const SME_MIN_DIM: usize = 16;
     not(no_sme),
     any(not(target_vendor = "apple"), no_apple_accelerate)
 ))]
-mod sme_pack {
+pub(crate) mod sme_pack {
     #![allow(clippy::needless_range_loop)]
     use crate::scalar::{FloatScalar, Scalar};
     use core::cell::RefCell;
@@ -1589,6 +1629,21 @@ impl<'a, T: FloatScalar, S: MatrixBackend<T>, E: Scalar, const R: usize, const C
     #[inline]
     pub fn store_rm(self, out: &mut [E]) {
         self.backend.tile_store(self.inner, out, C, Layout::RowMajor);
+    }
+
+    /// Store while applying a fused element-wise epilogue `f` — scale (`α`), bias, clamp, or
+    /// activation folded into the writeback so accumulator values never leave registers for a
+    /// second pass. Position-independent like [`map`](Tile::map): `f` must not depend on `(row,
+    /// col)`.
+    #[inline]
+    pub fn store_ex(self, out: &mut [E], row_stride: usize, layout: Layout, f: impl Fn(E) -> E) {
+        self.map(f).store(out, row_stride, layout);
+    }
+
+    /// Row-major [`store_ex`](Tile::store_ex) (`row_stride = C`).
+    #[inline]
+    pub fn store_rm_ex(self, out: &mut [E], f: impl Fn(E) -> E) {
+        self.map(f).store_rm(out);
     }
 
     /// Apply a position-independent function to every element (activation / bias / scale). On the

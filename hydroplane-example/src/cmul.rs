@@ -1,7 +1,5 @@
-//! Elementwise complex multiply `(a+bi)·(c+di) = (ac−bd) + (ad+bc)i` over split real/imag columns.
-//! Four loads feed four products and two adds into two stores — memory-bound with a little arithmetic,
-//! and every lane is independent, so the deciding factor is whether the `&`/`&mut` columns carry
-//! `noalias` (the `#[kernel]` boundary default) so LLVM may cluster the four loads and two stores.
+//! Elementwise complex multiply over split real/imag columns: memory-bound, stresses `noalias`
+//! at the kernel boundary.
 
 use hydroplane::{Gang, kernel};
 use wide::f32x8;
@@ -12,8 +10,8 @@ pub fn inputs(n: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     (ramp(n, 1.0, 2.0), ramp(n, 5.0, 2.0), ramp(n, 9.0, 2.0), ramp(n, 13.0, 2.0))
 }
 
-// Four input columns (a's real/imag, b's real/imag) into two outputs — the asymmetric `map_cols`
-// drives the full-register pass, masked tail, and ILP; the closure is just the complex product.
+// Four input columns into two outputs; `map_cols` drives the full-register pass, masked tail, and
+// ILP, the closure is just the complex product.
 #[kernel]
 pub fn cmul_hp<'a>(
     ctx: Gang,

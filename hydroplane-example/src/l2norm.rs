@@ -1,8 +1,4 @@
-//! `Σ xᵢ²` — the squared L2 norm, a single-input reduction. The per-element body is one FMA and the
-//! whole cost is the accumulation dependency, so instruction-level parallelism (several independent
-//! accumulator chains feeding one final combine) is the only thing that matters. The `wide` baseline
-//! deliberately keeps a *single* chain; hydroplane's runtime unroll is what supplies the ILP the
-//! hand-written code omits, so this is the cleanest demonstration that the optimizer earns its keep.
+//! `Σ xᵢ²` reduction (squared L2 norm): pure accumulation dependency, ILP-dominated.
 
 use hydroplane::{Gang, kernel};
 use wide::f32x8;
@@ -18,7 +14,7 @@ pub fn l2norm_hp<'a>(ctx: Gang, x: &'a [f32]) -> f32 {
     ctx.sum(x, |acc, v| v.fma(v, acc))
 }
 
-/// One f32x8 accumulator (8 lanes/iter) plus a scalar tail — a single chain, no manual ILP.
+/// One f32x8 accumulator plus a scalar tail: a single chain, no manual ILP.
 pub fn l2norm_wide(x: &[f32]) -> f32 {
     let n = x.len();
     let mut acc = f32x8::splat(0.0);

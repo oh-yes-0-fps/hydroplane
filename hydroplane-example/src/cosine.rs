@@ -1,8 +1,5 @@
-//! Cosine similarity `cos = Σxᵢyᵢ / √(Σxᵢ²·Σyᵢ²)` — three dot products sharing one dispatch. The
-//! hydroplane side reuses a single `dotp` reduction kernel three times through its `_on` companion,
-//! so dispatch resolves once and each pass gets the optimizer's full ILP; the hand-rolled baseline
-//! fuses all three sums (xy, xx, yy) into one single-chain pass over the data. Reduction-heavy like
-//! [`dot`](crate::dot), but the interesting axis is dispatch reuse vs a fused hand pass.
+//! Cosine similarity `Σxᵢyᵢ / √(Σxᵢ²·Σyᵢ²)`: three dot products on one dispatch, stressing
+//! kernel reuse via `_on` companions.
 
 use hydroplane::{Gang, kernel};
 use wide::f32x8;
@@ -18,8 +15,8 @@ fn dotp<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     ctx.dot(a, b)
 }
 
-/// Three `dotp` passes on the *same* dispatched backend via the `dotp_on` companion — one dispatch,
-/// three fully-ILP'd reductions, then a scalar combine.
+/// Three `dotp` passes on the same dispatched backend via the `dotp_on` companion, then a scalar
+/// combine.
 #[kernel]
 pub fn cosine_hp<'a>(ctx: Gang, x: &'a [f32], y: &'a [f32]) -> f32 {
     let d = dotp_on(ctx, x, y);
@@ -28,7 +25,7 @@ pub fn cosine_hp<'a>(ctx: Gang, x: &'a [f32], y: &'a [f32]) -> f32 {
     d / (nx * ny).sqrt()
 }
 
-/// All three sums accumulated in a single fused pass, one chain each (full register + scalar tail).
+/// All three sums in a single fused pass, one chain each (full register + scalar tail).
 pub fn cosine_wide(x: &[f32], y: &[f32]) -> f32 {
     let n = x.len();
     let mut sxy = f32x8::splat(0.0);

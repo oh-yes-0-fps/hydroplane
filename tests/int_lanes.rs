@@ -3,8 +3,8 @@
 
 use hydroplane::{Gang, kernel};
 
-/// Index of the first minimum — the canonical companion workload: a `u32` lane ramp `select`ed
-/// by the same mask the float compare produces.
+/// Index of the first minimum: a `u32` lane ramp `select`ed by the same mask the float compare
+/// produces.
 #[kernel]
 fn argmin<'a>(ctx: Gang, xs: &'a [f32]) -> u32 {
     let n = ctx.lanes::<f32>();
@@ -38,8 +38,7 @@ fn argmin<'a>(ctx: Gang, xs: &'a [f32]) -> u32 {
     ans
 }
 
-/// `floor(log2 x)` for positive normal floats, straight off the exponent field — the bit-trick
-/// shape `to_bits` exists for.
+/// `floor(log2 x)` for positive normal floats, straight off the exponent field via `to_bits`.
 #[kernel]
 fn exponents<'a>(ctx: Gang, xs: &'a [f32], out: &'a mut [i32]) {
     let n = ctx.lanes::<f32>();
@@ -135,7 +134,7 @@ fn signed_view() {
 mod hidden {
     use hydroplane::{Backend, BackendAll, Gang, VaryingU32};
 
-    /// Index-of-max via the integer companion — none of the element names appear at the caller's
+    /// Index-of-max via the integer companion. None of the element names appear at the caller's
     /// kernel site, so the token scan can't see the integer usage.
     pub fn argmax_hidden<S: BackendAll + Backend<f32>>(g: Gang<S>, xs: &[f32]) -> u32 {
         let n = g.lanes::<f32>();
@@ -164,8 +163,7 @@ mod hidden {
     }
 }
 
-/// The `u32` in this kernel's combo comes only from the attribute — the body's tokens never name
-/// it (the companion work lives in `hidden::argmax_hidden`).
+/// The `u32` in this kernel's combo comes only from the attribute; the body's tokens never name it.
 #[kernel(u32)]
 fn argmax_attr<'a>(ctx: Gang, xs: &'a [f32]) -> u32 {
     hidden::argmax_hidden(ctx, xs)

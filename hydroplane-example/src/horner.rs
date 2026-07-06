@@ -1,6 +1,4 @@
-//! Degree-8 polynomial evaluation by Horner's method — eight serial FMAs per element with only one
-//! load and one store. High arithmetic intensity, so this is where wide SIMD pays off most against
-//! scalar, and the cleanest test that the hydroplane kernel matches a hand-rolled FMA chain.
+//! Degree-8 Horner polynomial per element: compute-bound, high arithmetic intensity.
 
 use hydroplane::{Gang, kernel};
 use wide::f32x8;

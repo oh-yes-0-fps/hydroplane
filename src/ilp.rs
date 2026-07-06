@@ -1,41 +1,32 @@
-//! Runtime unroll-factor (K) cache — the count of independent FP accumulator chains that saturates
-//! this core's FMA pipes. Resolved once (a startup sweep, see [`Gang::detect_unroll`]), a relaxed
-//! atomic load thereafter. The dispatch adapter reads it to pick the `Unroll<_, K>` backend wrapper,
-//! so the chosen `K` reaches each reduction as a compile-time constant. See
-//! ../future/ILP_SUPERSCALAR.md.
-//!
-//! Building with `--cfg no_ilp` (and always on the SPIR-V target, whose lanes are the GPU's, not a
-//! CPU's FMA pipes) compiles the whole multi-accumulator path out: this cache, the startup sweep,
-//! and the `K`-unrolled reduction loops all collapse to the single-chain fold. `cached()` then folds
-//! to the constant `1` so the rest of the crate keeps one code shape.
+//! Runtime cache of the unroll factor K: the count of independent FP accumulator chains that
+//! saturates this core's FMA pipes, resolved once by [`Gang::detect_unroll`] and read by the
+//! dispatch adapter to pick the `Unroll<_, K>` wrapper. `--cfg hp_no_ilp` (and SPIR-V) folds it to `1`.
 //!
 //! [`Gang::detect_unroll`]: crate::Gang::detect_unroll
 
-#[cfg(not(any(no_ilp, target_arch = "spirv")))]
+#[cfg(not(any(hp_no_ilp, target_arch = "spirv")))]
 mod imp {
     use core::sync::atomic::{AtomicU8, Ordering};
 
     static UNROLL: AtomicU8 = AtomicU8::new(0);
 
-    /// `0` means unresolved; once resolved it is one of the candidate factors `{1,2,4,8,12,16}` and
-    /// immutable for the life of the process.
+    /// `0` means unresolved; once resolved it is one of `{1,2,4,8,12,16}` and immutable for the
+    /// life of the process.
     #[inline]
     pub(crate) fn cached() -> u8 {
         UNROLL.load(Ordering::Relaxed)
     }
 
-    /// Idempotent: a racing thread that re-measures the same machine and stores the same factor again
-    /// is harmless, since the saturation point is a property of the core, not of the call.
+    /// Idempotent: racing threads re-measure the same machine and store the same factor.
     #[inline]
     pub(crate) fn store(k: u8) {
         UNROLL.store(k, Ordering::Relaxed);
     }
 }
 
-#[cfg(any(no_ilp, target_arch = "spirv"))]
+#[cfg(any(hp_no_ilp, target_arch = "spirv"))]
 mod imp {
-    /// ILP compiled out: no atomic, no sweep. The single resolved factor is `1`, so every reduction
-    /// runs the one-chain fold and nothing ever needs to be stored.
+    /// ILP compiled out: no atomic, no sweep, the factor is always `1`.
     #[inline(always)]
     pub(crate) fn cached() -> u8 {
         1
@@ -43,5 +34,5 @@ mod imp {
 }
 
 pub(crate) use imp::cached;
-#[cfg(not(any(no_ilp, target_arch = "spirv")))]
+#[cfg(not(any(hp_no_ilp, target_arch = "spirv")))]
 pub(crate) use imp::store;

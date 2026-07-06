@@ -1,18 +1,5 @@
-//! A deliberately complex multi-stage pipeline that exercises every optimizer decision at once.
-//!
-//! An orchestrator kernel runs three stages through their `_on` companions (one dispatch, shared
-//! backend) and finishes with a scalar helper:
-//!
-//! 1. [`scale_bias_hp`] — elementwise, one FMA/element (memory-bound) → should route to the scalar
-//!    backend (the auto-vectorizer wins).
-//! 2. [`activate_hp`] — elementwise, an eight-FMA polynomial/element (compute-bound) → stays SIMD but
-//!    at a low unroll factor.
-//! 3. [`energy_hp`] — a sum-of-squares reduction → stays SIMD at a high unroll factor (the compiler
-//!    can't auto-vectorize an FP reduction, so hydroplane's ILP is the only path).
-//!
-//! Along the way the kernels call several **non-kernel** functions (`gains`, `activation_coeffs`,
-//! `activate_poly`, `finalize`) — these must be ignored as cross-kernel edges, and the orchestrator's
-//! unroll cap must compose down to satisfy the tightest stage it runs.
+//! Three-stage orchestrator kernel (scale/bias, activation, energy reduction) run through `_on`
+//! companions: stresses cross-kernel edges and unroll-cap composition.
 
 use crate::ramp;
 use hydroplane::{Backend, Gang, Varying, kernel};
@@ -31,8 +18,8 @@ fn activation_coeffs() -> [f32; 9] {
     [0.0, 1.0, -0.16, 8.0e-3, -1.9e-4, 2.5e-6, -1.7e-8, 5.5e-11, -6.6e-14]
 }
 
-/// Non-kernel generic **Varying** helper: the activation evaluated per lane. Called from inside
-/// `activate_hp`'s map closure — a non-kernel call, so not a cross-kernel edge.
+/// Non-kernel generic `Varying` helper: the activation evaluated per lane. Called from inside
+/// `activate_hp`'s map closure, so not a cross-kernel edge.
 #[inline]
 fn activate_poly<S: Backend<f32>>(ctx: Gang<S>, v: Varying<f32, S>) -> Varying<f32, S> {
     let c = activation_coeffs();
@@ -48,29 +35,27 @@ fn finalize(energy: f32, n: usize) -> f32 {
     (energy / n.max(1) as f32).sqrt()
 }
 
-/// Stage 1 — elementwise, one FMA/element (memory-bound), so it uses the streaming (auto-vectorized)
-/// combinator rather than SIMD `map`. Calls the non-kernel `gains`.
+/// Stage 1: one FMA/element, memory-bound, so it uses the streaming (auto-vectorized) combinator
+/// rather than SIMD `map`.
 #[kernel]
 pub fn scale_bias_hp<'a>(ctx: Gang, x: &'a [f32], out: &'a mut [f32]) {
     let (g, b) = gains();
     ctx.stream_map(x, out, |xi| g * xi + b);
 }
 
-/// Stage 2 — elementwise, eight FMAs/element (compute-bound). Calls the non-kernel `activate_poly`.
+/// Stage 2: eight FMAs/element, compute-bound.
 #[kernel]
 pub fn activate_hp<'a>(ctx: Gang, x: &'a [f32], out: &'a mut [f32]) {
     ctx.map(x, out, 0.0, |v| activate_poly(ctx, v));
 }
 
-/// Stage 3 — a reduction (sum of squares).
+/// Stage 3: sum-of-squares reduction.
 #[kernel]
 pub fn energy_hp<'a>(ctx: Gang, x: &'a [f32]) -> f32 {
     ctx.sum(x, |acc, v| v.fma(v, acc))
 }
 
-/// The orchestrator: pre-scale → activate → energy → RMS, each stage run through its `_on` companion
-/// and a scalar helper at the end. Calls two elementwise stages and one reduction stage plus two
-/// non-kernel functions; its unroll cap must compose to satisfy every stage.
+/// Orchestrator: pre-scale, activate, energy, RMS, each stage run through its `_on` companion.
 #[kernel]
 pub fn feature_score_hp<'a>(
     ctx: Gang,

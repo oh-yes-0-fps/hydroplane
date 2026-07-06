@@ -1,12 +1,11 @@
-//! `#[kernel]` attribute: the generated kernels must behave exactly like the hand-written
-//! struct+impl form, for both the element-wise and matrix flavours, including lifetimes, const
-//! generics, ordinary `<…>` generics, multiple bounds, where-clauses, a renamed/overridden
-//! scalar, and several type parameters.
+//! `#[kernel]` attribute: generated kernels must behave exactly like the hand-written
+//! struct+impl form, for element-wise and matrix flavours, across lifetimes, const generics,
+//! ordinary generics, multiple bounds, where-clauses, and a renamed/overridden scalar.
 
 use hydroplane::{FloatScalar, Gang, kernel};
 
 #[kernel]
-/// Sum of `xs` scaled by `k`, reduced across lanes — exercises load/operators/reduce.
+/// Sum of `xs` scaled by `k`; exercises load, operators, and reduce.
 pub fn scaled_sum<'a, T: FloatScalar>(ctx: Gang, xs: &'a [T], k: T) -> f64 {
     let mut acc = ctx.splat(T::ZERO);
     ctx.for_each_chunk::<T>(xs.len(), |off, cnt| {
@@ -16,8 +15,8 @@ pub fn scaled_sum<'a, T: FloatScalar>(ctx: Gang, xs: &'a [T], k: T) -> f64 {
     acc.reduce_sum().into_f64()
 }
 
-// Multiple bounds on the scalar + an extra non-scalar type parameter used only in the return type:
-// `T` is still picked as the scalar (it carries the `Scalar` bound), `R` rides along via PhantomData.
+// Multiple bounds plus an extra non-scalar type parameter: `T` carries the `Scalar` bound so it is
+// picked as the scalar; `R` rides along via PhantomData.
 #[kernel]
 pub fn scaled_sum_into<'a, T: FloatScalar + Copy, R: From<f64>>(ctx: Gang, xs: &'a [T], k: T) -> R {
     let mut acc = ctx.splat(T::ZERO);
@@ -42,8 +41,7 @@ where
     acc.reduce_sum().into_f64()
 }
 
-// The scalar parameter need not be named `T` — it's found by its `Scalar` bound (the `macro_rules!`
-// fallback hard-requires the name `T`).
+// Scalar parameter not named `T`; it's found by its `Scalar` bound.
 #[kernel]
 pub fn renamed_scalar<'a, Elem: FloatScalar>(ctx: Gang, xs: &'a [Elem]) -> f64 {
     let mut acc = ctx.splat(Elem::ZERO);
@@ -63,9 +61,8 @@ pub fn vector_sum<'a, T: FloatScalar>(ctx: Gang, xs: &'a [T]) -> f64 {
     acc.reduce_sum().into_f64()
 }
 
-// A concrete-`f32` micro-kernel (scalar inferred from the context type) — like a joint-limit check.
-// The full-register pass short-circuits with plain loads; only the remainder stages sentinels so
-// inactive lanes never produce a false hit.
+// Concrete-`f32` kernel, scalar inferred from the context type. The remainder stages inf sentinels
+// so inactive lanes never produce a false hit.
 #[kernel]
 pub fn any_gt<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> bool {
     let n = ctx.lanes::<f32>();
@@ -95,8 +92,8 @@ pub fn gemm<'a, T: FloatScalar, const M: usize, const N: usize, const K: usize>(
     tl.mma::<M, N, K>(at, bt, tl.zero_acc::<M, N>()).store_rm(out);
 }
 
-// A matrix context is also a `Backend`, so one `ctx` drives both the tile matmul (`out = A·B`) and a
-// vector reduction (the lane-sum of `a`) in the same kernel.
+// A matrix context is also a `Backend`, so one `ctx` drives both the tile matmul and a vector
+// reduction in the same kernel.
 #[kernel(matrix)]
 pub fn gemm_and_sum_a<'a, T: FloatScalar, const M: usize, const N: usize, const K: usize>(
     ctx: Gang,
@@ -149,9 +146,8 @@ fn scalar_param_need_not_be_named_t() {
     assert!((got - want).abs() <= 1e-3 * (1.0 + want.abs()), "got {got}, want {want}");
 }
 
-// Kernel-calls-kernel: `scaled` is a normal kernel, but `scaled_then_sum` calls its `scaled_on`
-// companion with its *own* dispatched context, so dispatch runs once (at `scaled_then_sum`'s entry)
-// rather than again per inner call.
+// Kernel-calls-kernel: `scaled_then_sum` calls the `scaled_on` companion with its own dispatched
+// context, so dispatch runs once at its entry.
 #[kernel]
 pub fn scaled<'a, T: FloatScalar>(ctx: Gang, xs: &'a [T], k: T) -> f64 {
     let mut acc = ctx.splat(T::ZERO);
@@ -185,8 +181,7 @@ fn kernel_calls_kernel_via_on() {
 
 #[test]
 fn concrete_scalar_kernel_matches_oracle() {
-    // Match the brute-force `any(a > b)` across odd lengths (so the partial tail is exercised) and
-    // both outcomes; calling repeatedly also exercises the warm cached-backend path.
+    // Odd lengths exercise the partial tail; repeated calls exercise the warm cached-backend path.
     for n in [1usize, 6, 7, 8, 9, 31, 64] {
         let a: Vec<f32> = (0..n).map(|i| (i as f32 % 5.0) - 2.0).collect();
         for shift in [-1.0f32, 0.0, 1.0] {
@@ -197,9 +192,8 @@ fn concrete_scalar_kernel_matches_oracle() {
     }
 }
 
-// Splat-constant scalars arrive as separate fields, so kernels routinely exceed clippy's argument
-// limit; the generated wrapper and `_on` fn carry their own opt-out (the author can't annotate them),
-// so `cargo clippy` over this file stays clean.
+// Kernels routinely exceed clippy's argument limit; the generated wrapper and `_on` fn must carry
+// their own opt-out since the author can't annotate them.
 #[kernel]
 pub fn scale7<'a>(
     ctx: Gang,

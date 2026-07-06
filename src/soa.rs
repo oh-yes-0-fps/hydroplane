@@ -1,13 +1,5 @@
-//! Generic columnar (structure-of-arrays) storage with SIMD-friendly padding.
-//!
-//! Replaces the hand-rolled `Vec<f32>` + `pad(16)` + `NaN`-fill pattern found in SoA
-//! collision code (e.g. `wreck`'s `SpheresSoA`) with one type generic over the scalar `T`
-//! and the column count. Each column is padded to a multiple of [`MAX_LANES`] so any
-//! backend (up to AVX-512's 16-wide f32) loads only full registers — no remainder path —
-//! and the inactive tail lanes are filled with a caller-chosen value per column (e.g. a
-//! radius of `NaN`, so distance comparisons on padding always fail).
-//!
-//! Requires the `alloc` feature.
+//! Columnar (SoA) storage padded to [`MAX_LANES`] so kernels never need a remainder path;
+//! tail lanes take a caller-chosen fill (e.g. `NaN` radius). Requires `alloc`.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -117,8 +109,8 @@ impl<T: Scalar> Soa<T> {
         unsafe { self.buf.get_unchecked(c * p..(c + 1) * p) }
     }
 
-    /// Active prefix of column `c` (length [`len`](Soa::len), no padding) — the slice the kernels
-    /// actually iterate, as opposed to the padded [`column`](Soa::column).
+    /// Active prefix of column `c` (length [`len`](Soa::len), no padding), as opposed to the
+    /// padded [`column`](Soa::column).
     #[inline]
     pub fn column_active(&self, c: usize) -> &[T] {
         assert!(c < self.cols);
@@ -135,17 +127,16 @@ impl<T: Scalar> Soa<T> {
         unsafe { self.buf.get_unchecked_mut(c * p..(c + 1) * p) }
     }
 
-    /// The active prefixes of all `N` columns, mutable and simultaneous — what an in-place transform
-    /// (`(xs, ys, zs)` rotated together) needs and [`column_mut`](Soa::column_mut) can't give, since
-    /// it borrows one column at a time. `N` must equal [`cols()`](Soa::cols).
+    /// The active prefixes of all `N` columns, mutable and simultaneous — what an in-place
+    /// transform (`(xs, ys, zs)` rotated together) needs and [`column_mut`](Soa::column_mut),
+    /// borrowing one column at a time, can't give. `N` must equal [`cols()`](Soa::cols).
     #[inline]
     pub fn columns_active_mut<const N: usize>(&mut self) -> [&mut [T]; N] {
         assert_eq!(N, self.cols, "Soa::columns_active_mut: N must equal cols()");
         let p = self.padded;
         let len = self.len;
         let base = self.buf.as_mut_ptr();
-        // Column `c` occupies `[c*p .. c*p + p)`; the active prefixes `[c*p .. c*p + len)` (with
-        // `len <= p`) are therefore pairwise disjoint, so the raw slices alias no memory.
+        // SAFETY: the active prefixes `[c*p .. c*p + len)` with `len <= p` are pairwise disjoint.
         core::array::from_fn(|c| unsafe { core::slice::from_raw_parts_mut(base.add(c * p), len) })
     }
 
@@ -155,8 +146,8 @@ impl<T: Scalar> Soa<T> {
         &self.pad_fill
     }
 
-    /// Copy row `i`'s value from every column into `out` (`out.len() == cols`) — the columnar
-    /// row reconstruction (`out[c] = column(c)[i]`).
+    /// Copy row `i`'s value from every column into `out` (`out.len() == cols`):
+    /// `out[c] = column(c)[i]`.
     pub fn copy_row(&self, i: usize, out: &mut [T]) {
         debug_assert!(i < self.len, "Soa::copy_row: index out of bounds");
         debug_assert_eq!(out.len(), self.cols, "Soa::copy_row: out arity mismatch");
@@ -267,16 +258,14 @@ mod tests {
 
     #[test]
     fn padding_and_layout() {
-        // two columns; column 1 pads with NaN
         let mut s = Soa::<f32>::with_pad_fills(&[0.0, f32::NAN]);
         for i in 0..5 {
             s.push_row(&[i as f32, (i as f32) + 0.5]);
         }
         assert_eq!(s.len(), 5);
-        assert_eq!(s.padded(), MAX_LANES); // 5 -> 16
+        assert_eq!(s.padded(), MAX_LANES);
         assert_eq!(&s.column(0)[..5], &[0.0, 1.0, 2.0, 3.0, 4.0]);
         assert_eq!(&s.column(1)[..5], &[0.5, 1.5, 2.5, 3.5, 4.5]);
-        // active col-0 padding is 0, col-1 padding is NaN
         assert_eq!(s.column(0)[5], 0.0);
         assert!(s.column(1)[5].is_nan());
     }
@@ -315,7 +304,7 @@ mod tests {
             assert_eq!(s.column(0)[i], i as f64);
         }
         for i in 20..32 {
-            assert_eq!(s.column(0)[i], 0.0); // pad fill
+            assert_eq!(s.column(0)[i], 0.0);
         }
     }
 

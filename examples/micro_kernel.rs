@@ -1,24 +1,11 @@
-//! Micro-kernels: tiny SIMD functions over a handful of elements, the kind you call in a hot loop.
-//!
-//! A robot joint-limit check — "is any joint below its lower bound or above its upper bound?" — over
-//! a 6-DOF configuration. Each check is only six `f32`s, so the *dispatch* (picking a backend) must
-//! be near-free or it dwarfs the work. `dispatch` caches the resolved backend in a process-global
-//! atomic, so a planner calling this millions of times pays CPU detection only once.
-//!
-//! `out_of_limits` composes the two sub-kernels with their `_on` companions, so the whole check is a
-//! single dispatch even though it runs three kernel bodies. `dist_sq` is a plain sum reduction
-//! written with no awareness of instruction-level parallelism — `zip_sum` runs as many independent
-//! accumulator chains as this core's FP pipes want (a factor detected and cached like the backend),
-//! so the obvious kernel saturates the machine for free.
-//!
-//! Run with `cargo run --example micro_kernel --release` (add `-C target-cpu=native` via RUSTFLAGS
-//! to fold the chosen backend in and inline across the kernels entirely).
+//! Micro-kernels: tiny SIMD functions called in a hot loop, here a robot joint-limit check over
+//! a 6-DOF configuration. `out_of_limits` composes the two sub-kernels via their `_on`
+//! companions, so the whole check is one dispatch.
 
 use hydroplane::{Gang, kernel};
 
-/// Any `a[i] > b[i]`? The full-register pass short-circuits on plain loads; only the remainder
-/// stages sentinels — `-inf` (lhs) / `+inf` (rhs), so `-inf > +inf` is false and padding never
-/// trips the reduction.
+/// Any `a[i] > b[i]`? The remainder pads with `-inf` (lhs) / `+inf` (rhs): `-inf > +inf` is false,
+/// so padding never trips the reduction.
 #[kernel(tiny)]
 fn any_gt<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> bool {
     let n = ctx.lanes::<f32>();
@@ -35,7 +22,7 @@ fn any_gt<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> bool {
     false
 }
 
-/// Any `a[i] < b[i]`? Remainder sentinels are swapped: `+inf < -inf` is false.
+/// Any `a[i] < b[i]`? Sentinels swapped: `+inf < -inf` is false.
 #[kernel(tiny)]
 fn any_lt<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> bool {
     let n = ctx.lanes::<f32>();
@@ -52,16 +39,15 @@ fn any_lt<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> bool {
     false
 }
 
-/// Below `lo` anywhere, or above `hi` anywhere? One dispatch (at this kernel's entry); the two
-/// sub-kernels run on the same already-chosen backend via their `_on` companions.
+/// Below `lo` or above `hi` anywhere? One dispatch at entry; the sub-kernels reuse the chosen
+/// backend via their `_on` companions.
 #[kernel(tiny)]
 fn out_of_limits<'a>(ctx: Gang, q: &'a [f32], lo: &'a [f32], hi: &'a [f32]) -> bool {
     any_lt_on(ctx, q, lo) || any_gt_on(ctx, q, hi)
 }
 
-/// Squared distance between two joint configs: `Σ (q[i] - p[i])²`. A plain sum reduction — `zip_sum`
-/// supplies the `0` identity, the masked tail, the chain combine, and the per-core unroll factor, so
-/// nothing here mentions accumulators-per-pipe yet the loop runs them all.
+/// Squared distance between two joint configs: `Σ (q[i] - p[i])²`. `zip_sum` supplies the zero
+/// identity, masked tail, chain combine, and per-core unroll factor.
 #[kernel(tiny)]
 fn dist_sq<'a>(ctx: Gang, q: &'a [f32], p: &'a [f32]) -> f32 {
     ctx.zip_sum(q, p, |acc, a, b| {

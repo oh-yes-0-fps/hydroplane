@@ -1,10 +1,5 @@
-//! Every workload, benched three ways — hydroplane `#[kernel]` vs hand-rolled `wide` vs scalar
-//! (autovectorized) — across sizes that cross the register boundary. Correctness is asserted against
-//! the scalar oracle before timing, so a broken kernel fails the bench rather than reporting a fast
-//! wrong answer.
-//!
-//!   cargo bench --bench workloads
-//!   RUSTFLAGS="-C target-cpu=native" cargo bench --bench workloads
+//! Every workload benched three ways (hp / wide / scalar), asserted against the scalar oracle
+//! before timing. Run: `cargo bench --bench workloads` (optionally with `-C target-cpu=native`).
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hydroplane_example::{

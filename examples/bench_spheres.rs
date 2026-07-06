@@ -1,9 +1,6 @@
-//! Lightweight throughput check for the ported sphere kernel: scalar backend vs the
-//! dispatched SIMD backend, for f32 and f64. Run with:
+//! Throughput sanity check for the SoA sphere-overlap kernel: scalar backend vs the dispatched
+//! SIMD backend, for f32 and f64. Not a statistical benchmark. Run with:
 //!   RUSTFLAGS="-C target-cpu=native" cargo run --release --example bench_spheres
-//!
-//! (Not a statistical benchmark — for that, wire criterion as in `wreck/benches`. This is
-//! a sanity check that the SIMD path is actually faster and that dispatch picks it up.)
 
 use std::time::Instant;
 
@@ -46,7 +43,7 @@ fn any_overlap<T: Scalar, S: Backend<T>>(ctx: Gang<S>, soa: &Soa<T>, q: [T; 4]) 
 }
 
 fn bench<T: hydroplane::SimdDispatch>(label: &str, to: impl Fn(f64) -> T) {
-    // A batch the query (mostly) misses, so the kernel scans the whole SoA — worst case.
+    // A batch the queries mostly miss, so the kernel scans the whole SoA.
     let n = 4096;
     let rows: Vec<[T; 4]> = (0..n)
         .map(|i| {

@@ -1,13 +1,5 @@
-//! Zero-cost check for the new fixed-`N` column combinators: each is pitted against a hand-written
-//! `wide` SIMD kernel (f32x8 and width-matched f32x4) using the same buffer-staged masked tail, plus
-//! a scalar baseline. The abstraction should land on top of the lane-matched `wide` code, not behind.
-//!
-//!   cargo bench --bench combinators_vs_wide
-//!   RUSTFLAGS="-C target-cpu=native" cargo bench --bench combinators_vs_wide
-//!
-//! Workload is bounding-sphere broadphase over an SoA: `count_n` (tally overlaps),
-//! `for_each_hit_n` (mark every overlap), and `masked_chunks` + `gather_n` (two-phase any-overlap
-//! from an AoS slice).
+//! Fixed-`N` column combinators (`count_n`, `for_each_hit_n`, `masked_chunks` + `gather_n`) vs
+//! hand-written `wide` kernels and a scalar baseline, over an SoA bounding-sphere broadphase.
 
 #![allow(deprecated)]
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -79,8 +71,8 @@ macro_rules! count_wide {
 count_wide!(count_wide8, f32x8, 8);
 count_wide!(count_wide4, f32x4, 4);
 
-// Hand-written ILP reference: four independent f32x4 count chains (16 lanes/iter), the same
-// superscalar shape `count_n` engages — so a fair "did the abstraction get the ILP win" baseline.
+// ILP reference: four independent f32x4 count chains (16 lanes/iter), the same superscalar shape
+// `count_n` engages.
 fn count_wide_ilp(xs: &[f32], ys: &[f32], zs: &[f32], rs: &[f32], q: [f32; 4]) -> usize {
     let len = xs.len();
     let (cx, cy, cz, sr) = (f32x4::splat(q[0]), f32x4::splat(q[1]), f32x4::splat(q[2]), f32x4::splat(q[3]));
@@ -127,8 +119,8 @@ fn count_scalar(xs: &[f32], ys: &[f32], zs: &[f32], rs: &[f32], q: [f32; 4]) -> 
         .count()
 }
 
-// Full-scan count over an AoS `&[[f32; 4]]` via `gather_n` — deterministic throughput (no early
-// exit). Masked variant: `masked_chunks` active mask `&`-ed into the predicate (always correct).
+// Full-scan count over an AoS `&[[f32; 4]]` via `gather_n`, with the `masked_chunks` active mask
+// `&`-ed into the predicate.
 #[kernel]
 fn gather_count_hp<'a>(ctx: Gang, pts: &'a [[f32; 4]], q: [f32; 4]) -> usize {
     let [cx, cy, cz, sr] = ctx.splat_n(q);
@@ -143,8 +135,7 @@ fn gather_count_hp<'a>(ctx: Gang, pts: &'a [[f32; 4]], q: [f32; 4]) -> usize {
     acc.reduce_sum() as usize
 }
 
-// Sentinel variant: NaN-fill the radius lane so inactive tail lanes self-reject — no active mask,
-// matching the hand-written `wide` strategy exactly.
+// Sentinel variant: NaN-fill the radius lane so inactive tail lanes self-reject, no active mask.
 #[kernel]
 fn gather_count_sentinel_hp<'a>(ctx: Gang, pts: &'a [[f32; 4]], q: [f32; 4]) -> usize {
     let [cx, cy, cz, sr] = ctx.splat_n(q);

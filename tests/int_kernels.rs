@@ -1,9 +1,9 @@
-//! Tier 2: integer *elements* as first-class kernel scalars — `Gang<u32>`/`Gang<i32>` through
-//! `#[kernel]` and `dispatch`, with the full combinator machinery (chunks, tails, reductions).
+//! Integer elements as first-class kernel scalars: `Gang<u32>`/`Gang<i32>` through `#[kernel]`
+//! and `dispatch`, with the full combinator machinery.
 
 use hydroplane::{Gang, IntScalar, kernel};
 
-/// SWAR popcount per lane, summed — exercises shifts, bitwise ops, wrapping mul, and reduce_sum
+/// SWAR popcount per lane, summed: exercises shifts, bitwise ops, wrapping mul, and reduce_sum
 /// on a `u32` gang.
 #[kernel]
 fn popcount_sum<'a>(ctx: Gang, xs: &'a [u32]) -> u32 {
@@ -25,8 +25,8 @@ fn popcount_sum<'a>(ctx: Gang, xs: &'a [u32]) -> u32 {
     lanes[..n].iter().sum()
 }
 
-/// Min/max/abs over a signed gang, with a masked count of negatives — `Ord` semantics and the
-/// same `Mask` machinery the float kernels use.
+/// Min/max/abs over a signed gang with a masked count of negatives: `Ord` semantics and the same
+/// `Mask` machinery the float kernels use.
 #[kernel]
 fn signed_stats<'a>(ctx: Gang, xs: &'a [i32]) -> (i32, i32, u32) {
     let n = ctx.lanes::<i32>();
@@ -51,8 +51,7 @@ fn signed_stats<'a>(ctx: Gang, xs: &'a [i32]) -> (i32, i32, u32) {
     (lo.reduce_min(), hi.reduce_max(), neg)
 }
 
-/// Generic over the integer family — the macro finds the scalar through the `IntScalar` bound
-/// exactly as it does for `FloatScalar`.
+/// Generic over the integer family; the macro finds the scalar through the `IntScalar` bound.
 #[kernel]
 fn wrapping_sum<'a, T: IntScalar>(ctx: Gang, xs: &'a [T]) -> T {
     let mut acc = ctx.splat(T::ZERO);

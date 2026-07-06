@@ -1,9 +1,6 @@
-//! Scalable SVE backend tokens, one per vector byte-width `C` (`Sve<16>` = 128-bit, `Sve<32>` =
-//! 256-bit, …). SVE registers are *sizeless* (see `SVE.md`), so the [`Backend::Vector`] is the
-//! memory image [`SveVec<C>`] and every op is a [`crate::arch::sve1`] primitive. The byte-width is a
-//! const generic because the trait's `Vector` must be `Sized`; dispatch monomorphizes the kernel for
-//! the detected VL and runs the matching token. Base SVE doesn't exist on Apple (streaming-only via
-//! SME), so these are constructed only on non-Apple hosts — the dispatch enforces that.
+//! Scalable SVE backend tokens, one per vector byte-width `C` (`Sve<16>` = 128-bit, …).
+//! SVE registers are sizeless, so [`Backend::Vector`] is the fixed-size memory image
+//! [`SveVec<C>`]; dispatch monomorphizes the kernel for the detected VL.
 #![cfg(target_arch = "aarch64")]
 // On Apple the dispatch never constructs an `Sve` token (NEON-only policy), so it reads as dead
 // code there; it is live on non-Apple aarch64.
@@ -199,7 +196,7 @@ impl_sve_backend!(
     sqrt_f16, min_f16, max_f16, le_f16, lt_f16, ge_f16, gt_f16, select_f16, reduce_sum_f16,
     reduce_min_f16, reduce_max_f16
 );
-// bf16: 16-bit storage, f32 compute image (C/4 lanes) — arithmetic/compare/select are the `*_f32`
+// bf16: 16-bit storage, f32 compute image (C/4 lanes). Arithmetic/compare/select are the `*_f32`
 // ops over the image; only the memory boundary (`*_bf16`) and reductions differ.
 impl_sve_backend!(
     bf16, 4, splat_bf16, load_bf16, store_bf16, add_f32, sub_f32, mul_f32, div_f32, neg_f32, fma_f32,
@@ -207,7 +204,7 @@ impl_sve_backend!(
     reduce_min_bf16, reduce_max_bf16
 );
 
-// Integer elements: no SVE integer asm primitives yet — correctness-only emulation for
+// Integer elements: no SVE integer asm primitives yet, so correctness-only emulation for
 // `BackendAll`; the integer dispatch ladders never pick SVE.
 crate::backend::emulated_int_element!([const C: usize] Sve<C>, u32, C / 4);
 crate::backend::emulated_int_element!([const C: usize] Sve<C>, i32, C / 4);

@@ -1,25 +1,13 @@
-//! GPU subgroup support for the rust-gpu / SPIR-V target — the ISPC→SIMT mapping.
-//!
-//! When `hydroplane` is compiled to SPIR-V (`target_arch = "spirv"`), the SPMD "gang" is a GPU
-//! **subgroup** (warp). This module has two halves:
-//!
-//! * **Portable scheduling policy** (always compiled, unit-tested below): the [`choose`]
-//!   policy that decides, from the item count and the subgroup size, whether to run a single
-//!   invocation **sequentially** or fan the work across the **subgroup**. It runs (and is
-//!   tested) on the CPU like any other code.
-//! * **The SPIR-V [`Subgroup`] backend** (`#[cfg(target_arch = "spirv")]`): `Vector = T`,
-//!   `Mask = bool` (one lane *per invocation*), with the cross-lane ops lowering to subgroup
-//!   collectives (`OpGroupNonUniformAny`/`All`/`FAdd`/…). The warp width is read straight
-//!   from the hardware `SubgroupSize` builtin — no host plumbing, no atomics, no entry-point
-//!   parameter to wire. It compiles only under the rust-gpu toolchain (see `GPU.md`); it is
-//!   not built in a normal host `cargo build`.
+//! GPU subgroup backend for the rust-gpu / SPIR-V target: the SPMD gang is a subgroup, one
+//! lane per invocation. The `choose` scheduling policy is always compiled; the `Subgroup`
+//! backend itself compiles only under the rust-gpu toolchain, not a normal host `cargo build`.
 
 /// How a batch should be executed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Execution {
-    /// Too little work to fill a warp — one invocation loops over the items.
+    /// Too little work to fill a warp: one invocation loops over the items.
     Sequential,
-    /// Enough work — distribute the items across the subgroup's lanes.
+    /// Enough work to distribute the items across the subgroup's lanes.
     Subgroup,
 }
 
@@ -34,9 +22,8 @@ pub fn choose(item_count: usize, subgroup_size: u32, fill_factor: u32) -> Execut
     if subgroup_size <= 1 {
         return Execution::Sequential;
     }
-    // Plain `usize` (32-bit on SPIR-V) multiply: `subgroup_size * fill_factor` is always small
-    // (warp width ≤ ~128), so it can't overflow — and a plain `*` avoids the `saturating_mul`
-    // intrinsic, which rust-gpu can't lower.
+    // Plain multiply: `subgroup_size * fill_factor` is always small (warp width ≤ ~128), so it
+    // can't overflow, and a plain `*` avoids the `saturating_mul` intrinsic rust-gpu can't lower.
     let threshold = subgroup_size as usize * fill_factor.max(1) as usize;
     if item_count < threshold {
         Execution::Sequential
@@ -45,11 +32,8 @@ pub fn choose(item_count: usize, subgroup_size: u32, fill_factor: u32) -> Execut
     }
 }
 
-// ─────────────────────────── SPIR-V backend (device-only) ───────────────────────────
-//
-// Compiled only under rust-gpu. `Vector = T` / `Mask = bool` (one lane per invocation);
-// cross-lane ops are subgroup collectives. The intrinsic names below target spirv-std's
-// `arch` subgroup ops; pin them to the rust-gpu rev used by the shader crate (cf. GPU.md).
+// The intrinsic names below target spirv-std's `arch` subgroup ops; pin them to the rust-gpu
+// rev used by the shader crate.
 #[cfg(target_arch = "spirv")]
 pub use device::{Subgroup, dispatch_subgroup};
 
@@ -62,19 +46,17 @@ mod device {
     use crate::varying::Gang;
     use half::{bf16, f16};
 
-    /// Device entry point — the GPU analogue of the host [`dispatch`](crate::dispatch).
+    /// Device entry point, the GPU analogue of the host [`dispatch`](crate::dispatch).
     ///
-    /// The host picks a backend by *which ISA the CPU has*; here the runtime axis is *how much
-    /// work there is*. With at least `subgroup_size * fill_factor` items the batch is spread
-    /// across the warp and the kernel's cross-lane ops become subgroup collectives
-    /// ([`Subgroup`]); below that threshold the collectives don't pay for themselves, so a
-    /// single invocation loops over the items on the scalar backend. Either way the kernel body
-    /// is the one written against [`Gang`].
+    /// With at least `subgroup_size * fill_factor` items the batch is spread across the warp
+    /// and the kernel's cross-lane ops become subgroup collectives (`Subgroup`); below that
+    /// threshold the collectives don't pay for themselves, so a single invocation loops over
+    /// the items on the scalar backend. Either way the kernel body is the one written against
+    /// [`Gang`].
     ///
-    /// `item_count` is the batch size the calling subgroup is responsible for (from the buffer
-    /// length / push constant the entry point already knows); `fill_factor` is the occupancy
-    /// threshold (`4` is a sane default). The warp width is read from the `SubgroupSize`
-    /// builtin, so there is nothing else to pass in.
+    /// `item_count` is the batch size the calling subgroup is responsible for; `fill_factor` is
+    /// the occupancy threshold (`4` is a sane default). The warp width is read from the
+    /// `SubgroupSize` builtin, so there is nothing else to pass in.
     #[inline]
     pub fn dispatch_subgroup<T, K>(kernel: K, item_count: usize, fill_factor: u32) -> K::Output
     where
@@ -88,11 +70,10 @@ mod device {
         }
     }
 
-    /// Read the hardware `SubgroupSize` builtin — the warp width the running invocation
-    /// belongs to. This is the per-invocation ground truth (correct even on hardware whose
-    /// subgroup size is variable) and lowers to a single builtin load, so it is effectively
-    /// free to call. The `Input` variable and its decoration are hoisted to module scope by
-    /// rust-gpu's inline-asm lowering; pin to the rust-gpu rev (cf. GPU.md).
+    /// Read the hardware `SubgroupSize` builtin: per-invocation ground truth (correct even
+    /// where the subgroup size is variable), lowering to a single builtin load. The `Input`
+    /// variable and its decoration are hoisted to module scope by rust-gpu's inline-asm
+    /// lowering; pin to the rust-gpu rev.
     #[inline]
     fn subgroup_size() -> u32 {
         let mut size: u32;
@@ -111,8 +92,8 @@ mod device {
         size
     }
 
-    /// Hardware square root — GLSL.std.450 `Sqrt` (opcode 31), generic over the float width
-    /// (`f32`/`f64`). Replaces the portable Babylonian fallback in [`Scalar::sqrt`] on-device.
+    /// Hardware square root, GLSL.std.450 `Sqrt` (opcode 31), generic over the float width.
+    /// Replaces the portable Babylonian fallback in [`Scalar::sqrt`] on-device.
     #[inline]
     fn gpu_sqrt<T: Copy + Default>(x: T) -> T {
         let mut result = T::default();
@@ -129,7 +110,7 @@ mod device {
         result
     }
 
-    /// Hardware fused multiply-add `a * b + c` — GLSL.std.450 `Fma` (opcode 50), generic over
+    /// Hardware fused multiply-add `a * b + c`, GLSL.std.450 `Fma` (opcode 50), generic over
     /// the float width. Replaces the unfused `mul`+`add` of the default [`Scalar::fma`].
     #[inline]
     fn gpu_fma<T: Copy + Default>(a: T, b: T, c: T) -> T {
@@ -151,13 +132,11 @@ mod device {
         result
     }
 
-    // Each backend op declares the SPIR-V capabilities it needs via `OpCapability` (which
-    // rust-gpu hoists to the module header). Because the call sits inside the op, a capability
-    // is emitted *only* when that op for that scalar is monomorphized into the module — so a
-    // compiled shader requires exactly the capabilities of the backends it actually uses, with
-    // no host-side `--capabilities` flag. Capability dependencies are implicit: declaring
-    // `GroupNonUniformArithmetic` also pulls in the base `GroupNonUniform` (which the
-    // `SubgroupSize` builtin read needs).
+    // Each backend op declares the SPIR-V capabilities it needs via `OpCapability` (hoisted to
+    // the module header by rust-gpu). The call sits inside the op, so a capability is emitted
+    // only when that op is monomorphized into the module: a compiled shader requires exactly
+    // what it uses. Declaring `GroupNonUniformArithmetic` also pulls in the base
+    // `GroupNonUniform` that the `SubgroupSize` read needs.
     #[inline]
     fn cap_none() {}
     #[inline]
@@ -502,10 +481,9 @@ mod device {
         bf16::from_f32(c)
     }
 
-    // Half precision on the GPU: storage is 16-bit, compute is `f32`. The lane widens to `f32`
-    // on `load`/`splat` and narrows on `store`, so all arithmetic and the subgroup collectives
-    // run in native `f32` — conversions hit only the memory boundary, never per op. `Vector` is
-    // therefore `f32` here (as on the AVX2 F16C path), not the 16-bit storage type.
+    // Half precision on the GPU: 16-bit storage, f32 compute. Widen on `load`/`splat`, narrow
+    // on `store`; conversions hit only the memory boundary, so `Vector` is `f32`, not the
+    // 16-bit storage type.
     macro_rules! subgroup_widen_backend {
         ($ty:ty, $widen:path, $narrow:path) => {
             impl Backend<$ty> for Subgroup {

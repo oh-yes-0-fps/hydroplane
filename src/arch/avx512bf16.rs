@@ -1,10 +1,5 @@
-//! AVX-512-BF16 (x86_64): hardware `bf16`↔`f32` conversion and the `vdpbf16ps` dot-product.
-//!
-//! All **stable** intrinsics — the `__m*bh` carrier types and these ops stabilized in 1.89, so
-//! nothing here needs nightly. `bf16` has no native ALU (the ISA has only convert + dot), so
-//! element-wise compute still happens in `f32`; these calls remove the *software* `bf16`↔`f32`
-//! round-trip at the load/store boundary, and [`dp`] is the packed multiply-accumulate the matmul
-//! fast path builds on. Reached only where the CPU implements `avx512bf16` (Cooper Lake+, Zen 4+).
+//! AVX-512-BF16 (x86_64): hardware `bf16`↔`f32` conversion and the `vdpbf16ps` dot product.
+//! `bf16` has no native ALU (convert + dot only), so element-wise compute still happens in `f32`.
 #![allow(unsafe_op_in_unsafe_fn, clippy::missing_safety_doc)]
 
 #[cfg(target_arch = "x86")]
@@ -30,8 +25,8 @@ pub unsafe fn narrow(v: __m512, p: *mut bf16) {
 }
 
 /// VNNI-pack two K-rows of a 16-wide column block: result lane `n` holds `lo[n]` in its low 16
-/// bits and `hi[n]` in its high 16 bits. Built from `vpmovzxwd` (a defined element→lane mapping,
-/// so the layout is correct by construction — no cross-lane shuffle to get wrong).
+/// bits and `hi[n]` in its high 16 bits. Built from `vpmovzxwd`, whose element-to-lane mapping is
+/// defined, so the layout is correct by construction.
 #[target_feature(enable = "avx512bf16,avx512f,avx512bw")]
 #[inline]
 pub unsafe fn pack_pair(lo: *const bf16, hi: *const bf16) -> __m512i {

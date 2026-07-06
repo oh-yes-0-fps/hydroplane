@@ -27,9 +27,8 @@ fn sum_reduce<T: FloatScalar, S: Backend<T>>(g: Gang<S>, a: &[T]) -> f64 {
         .into_f64()
 }
 
-// The unroll factor K is now chosen automatically (dispatch wraps the backend in `Unroll<S, K>`),
-// so a kernel can't pin K from the outside; both `zip_reduce` and `reduce` exercise whichever K this
-// core resolved. The size sweep below crosses the K*lanes() window and tail boundaries either way.
+// The unroll factor K is chosen by dispatch (`Unroll<S, K>`), so a kernel can't pin it; the size
+// sweep crosses the K*lanes() window and tail boundaries for whichever K this core resolved.
 struct Variants<'a, T: FloatScalar> {
     a: &'a [T],
     b: &'a [T],

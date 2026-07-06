@@ -1,6 +1,5 @@
-//! Disassembly harness for the `map_cols` kernels: `cargo build --release --example asm_cols`
-//! (optionally `--target x86_64-apple-darwin`) then `otool -tV` the binary and read
-//! `_probe_cmul` / `_probe_transform` and the `cmul_hp_on` / `transform_hp_on` bodies they call.
+//! Disassembly harness for the `map_cols` kernels: `cargo build --release --example asm_cols`,
+//! then `otool -tV` the binary and read `_probe_cmul` / `_probe_transform`.
 
 use hydroplane_example::{cmul, transform};
 use std::hint::black_box;

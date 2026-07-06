@@ -1,17 +1,6 @@
-//! Hand-written AVX2 (+FMA) backend for `x86_64`.
-//!
-//! `Backend<f32>` uses `__m256` (8 lanes); `Backend<f64>` uses `__m256d` (4 lanes). Every
-//! op is a `#[target_feature(enable = "avx2,fma")]` body, so the unsafety is confined here
-//! and justified by the single invariant: an [`Avx2`] token only exists when the running
-//! CPU has AVX2 + FMA (enforced by [`Avx2::detect`] / [`Avx2::new_unchecked`]).
-//!
-//! `f16` rides the F16C widen path (`__m256` f32 compute, hardware `vcvtph2ps`/`vcvtps2ph` at the
-//! load/store boundary); `bf16` widens to `__m256` in software. The wider native f16 arithmetic is
-//! the separate AVX-512-FP16 backend ([`super::avx512fp16`]).
-//!
-//! Every free fn below is an `unsafe fn` whose body is wholly composed of `#[target_feature]`
-//! intrinsics; we opt out of the edition-2024 `unsafe_op_in_unsafe_fn` requirement for the
-//! whole module rather than wrapping each one-line body in its own `unsafe {}`.
+//! Hand-written AVX2 (+FMA) backend for `x86_64` (8-wide f32, 4-wide f64).
+//! `f16` uses the F16C widen path (f32 compute, hardware convert at load/store); `bf16` widens
+//! to f32 in software.
 #![allow(unsafe_op_in_unsafe_fn)]
 
 #[cfg(target_arch = "x86")]
@@ -28,15 +17,15 @@ pub struct Avx2(());
 
 impl Avx2 {
     /// Returns an [`Avx2`] token iff the current CPU supports AVX2 + FMA.
-    // Unused once the build's baseline statically guarantees avx2 (x86-64-v3+): dispatch then
-    // takes the backend branchlessly via `new_unchecked` instead of detecting it.
+    // Dead when the build baseline statically guarantees avx2 (x86-64-v3+); dispatch then uses
+    // `new_unchecked`.
     #[cfg(feature = "std")]
     #[allow(dead_code)]
     #[inline]
     pub fn detect() -> Option<Self> {
         let ok = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
-        // The `half` widen path also uses F16C; require it so an `Avx2` token always
-        // implies a sound `Backend<f16>` as well. (F16C is present on every AVX2 CPU.)
+        // The f16 widen path uses F16C; require it so an `Avx2` token also implies a sound
+        // `Backend<f16>`. F16C is present on every AVX2 CPU.
         let ok = ok && is_x86_feature_detected!("f16c");
         if ok { Some(Self(())) } else { None }
     }
@@ -44,17 +33,13 @@ impl Avx2 {
     /// # Safety
     /// The caller guarantees the running CPU supports `avx2` and `fma`. Calling any
     /// [`Backend`] method on a token built this way on an unsupported CPU is UB.
-    // Used by the no-std path and by any std build whose baseline already guarantees avx2
-    // (the branchless floor); unused only on a std build with no avx2 guarantee, where the
-    // backend is reached through runtime `detect`.
+    // Dead only on a std build with no static avx2 guarantee, which goes through runtime `detect`.
     #[allow(dead_code)]
     #[inline]
     pub const unsafe fn new_unchecked() -> Self {
         Self(())
     }
 }
-
-// ───────────────────────────── f32 × __m256 (8 lanes) ─────────────────────────────
 
 impl Backend<f32> for Avx2 {
     type Vector = __m256;
@@ -304,7 +289,7 @@ unsafe fn f32_div(a: __m256, b: __m256) -> __m256 {
 unsafe fn f32_neg(a: __m256) -> __m256 {
     _mm256_xor_ps(a, _mm256_set1_ps(-0.0))
 }
-/// Clear the sign bit — a single `andps`, cheaper than `max(a, -a)`.
+/// Clear the sign bit: one `andps`, cheaper than `max(a, -a)`.
 #[target_feature(enable = "avx2,fma")]
 #[inline]
 unsafe fn f32_abs(a: __m256) -> __m256 {
@@ -323,8 +308,7 @@ unsafe fn f32_sqrt(a: __m256) -> __m256 {
 #[target_feature(enable = "avx2,fma")]
 #[inline]
 unsafe fn f32_min(a: __m256, b: __m256) -> __m256 {
-    // IEEE minimumNumber: `vminps` already yields `b` when `a` is NaN; blend patches the
-    // b-is-NaN case (bare `vminps` would return the NaN).
+    // IEEE minimumNumber: `vminps` yields `b` when `a` is NaN; the blend patches the b-is-NaN case.
     let m = _mm256_min_ps(a, b);
     _mm256_blendv_ps(m, a, _mm256_cmp_ps::<_CMP_UNORD_Q>(b, b))
 }
@@ -392,8 +376,6 @@ unsafe fn f32_reduce<const OP: i32>(v: __m256) -> f32 {
     let r = combine::<OP>(d, shuf2);
     _mm_cvtss_f32(r)
 }
-
-// ───────────────────────────── f64 × __m256d (4 lanes) ────────────────────────────
 
 macro_rules! yi_binop {
     ($name:ident, $intr:ident) => {
@@ -867,7 +849,7 @@ unsafe fn f64_div(a: __m256d, b: __m256d) -> __m256d {
 unsafe fn f64_neg(a: __m256d) -> __m256d {
     _mm256_xor_pd(a, _mm256_set1_pd(-0.0))
 }
-/// Clear the sign bit — a single `andpd`, cheaper than `max(a, -a)`.
+/// Clear the sign bit: one `andpd`, cheaper than `max(a, -a)`.
 #[target_feature(enable = "avx2,fma")]
 #[inline]
 unsafe fn f64_abs(a: __m256d) -> __m256d {
@@ -952,13 +934,9 @@ unsafe fn f64_reduce<const OP: i32>(v: __m256d) -> f64 {
     _mm_cvtsd_f64(r)
 }
 
-// ───────────── f16 × __m256 (8 lanes, F16C widen-to-f32 compute path) ─────────────
-//
-// Storage is 16-bit `half::f16` (half the memory/bandwidth); compute is f32x8. `load`
-// widens 8 f16 → f32x8 via F16C, every arithmetic op reuses the f32 helpers above, and
-// `store` narrows back. The Scalar oracle for `f16` widens identically, so single ops
-// match exactly; multi-op kernels are *more* accurate here (no intermediate narrowing).
-
+// f16 storage, f32x8 compute: `load` widens via F16C, `store` narrows back. The scalar oracle
+// widens identically, so single ops match exactly; multi-op kernels skip the intermediate
+// narrowing and come out more accurate.
 mod f16_impl {
     use super::*;
     use crate::backend::Backend;
@@ -1115,9 +1093,8 @@ mod f16_impl {
     }
 }
 
-// `bf16` on AVX2: same `f32x8` widen-compute-narrow as `f16`, but bf16 has no F16C path, so the
-// boundary conversions are scalar (cheap — bf16 is just the high 16 bits of an f32). This is the
-// element-wise substrate the AVX2/AVX-512 bf16 matmul and the AMX/AVX512-VNNI fast paths build on.
+// bf16: same widen-compute-narrow as f16, but with no F16C equivalent the boundary conversions
+// are scalar (cheap: bf16 is the high 16 bits of an f32).
 mod bf16_impl {
     use super::*;
     use crate::backend::Backend;

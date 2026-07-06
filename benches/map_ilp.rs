@@ -1,8 +1,6 @@
-//! Does the `K`-chain unroll in `Gang::map`/`map_n` pay off? Build twice and compare:
+//! `K`-chain unroll in `Gang::map`/`map_n`. Build twice and compare:
 //!   cargo bench --bench map_ilp                       # unrolled (K = backend UNROLL)
-//!   RUSTFLAGS="--cfg no_ilp" cargo bench --bench map_ilp   # forced single chain (K = 1)
-//! A latency-bound `f` (dependent sqrt chain) is where cross-iteration ILP helps most; the cheap
-//! add `f` is memory-bound and should be a wash either way. `wide`/`scalar` are the references.
+//!   RUSTFLAGS="--cfg hp_no_ilp" cargo bench --bench map_ilp   # forced single chain (K = 1)
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hydroplane::{Gang, kernel};
@@ -14,7 +12,7 @@ fn input(n: usize) -> Vec<f32> {
 
 #[inline(always)]
 fn heavy_scalar(x: f32) -> f32 {
-    // dependent chain: each sqrt waits on the previous — latency-bound per element.
+    // Each sqrt waits on the previous: latency-bound per element.
     let a = (x + 1.0).sqrt();
     let b = (a + 1.0).sqrt();
     let c = (b + 1.0).sqrt();

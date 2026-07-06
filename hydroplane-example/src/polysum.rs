@@ -1,8 +1,4 @@
-//! `Σ P(xᵢ)` for a degree-8 polynomial `P` — a reduction with a heavy per-element body: eight serial
-//! FMAs (a full Horner evaluation) feed a single running sum. Unlike [`dot`](crate::dot), where the
-//! per-element work is one FMA, here the accumulator step drags a long chain of varying temporaries,
-//! so the reduction is register-heavier and the optimizer must cap its independent-chain count lower
-//! than it would for a lean norm/dot to stay off the spill cliff.
+//! `Σ P(xᵢ)` for degree-8 `P`: a register-heavy reduction, stressing the unroll/spill trade-off.
 
 use hydroplane::{Gang, kernel};
 use wide::f32x8;
@@ -17,9 +13,8 @@ pub fn inputs(n: usize) -> Vec<f32> {
 
 #[kernel]
 pub fn polysum_hp<'a>(ctx: Gang, c: [f32; 9], x: &'a [f32]) -> f32 {
-    // `sum` zero-fills the inactive tail lanes, and `P(0) = c[0] ≠ 0`, so accumulating `P` directly
-    // would let each padding lane leak a `c[0]` into the total. Summing `P(x) − c[0]` (which vanishes
-    // at the fill value) keeps the tail clean; the dropped constant returns as `c[0]·n` at the end.
+    // `sum` zero-fills tail lanes and `P(0) = c[0] ≠ 0`, so each padding lane would leak a `c[0]`.
+    // Sum `P(x) − c[0]` instead and add back `c[0]·n` at the end.
     let bias = c[0];
     ctx.sum(x, |acc, v| {
         let mut p = ctx.splat(c[8]);
@@ -30,8 +25,8 @@ pub fn polysum_hp<'a>(ctx: Gang, c: [f32; 9], x: &'a [f32]) -> f32 {
     }) + bias * x.len() as f32
 }
 
-/// One f32x8 accumulator, a full Horner chain evaluated per lane-vector before the add — a single
-/// dependency chain, so hydroplane's runtime unroll is what has to supply the ILP this omits.
+/// One f32x8 accumulator, a full Horner chain per lane-vector before the add: a single dependency
+/// chain, omitting the ILP hydroplane's runtime unroll supplies.
 pub fn polysum_wide(c: &[f32; 9], x: &[f32]) -> f32 {
     let n = x.len();
     let cv: [f32x8; 9] = std::array::from_fn(|k| f32x8::splat(c[k]));

@@ -1,13 +1,6 @@
-//! AVX-512-FP16 (x86_64): true 32-wide half-precision arithmetic via raw `asm!`.
-//!
-//! The AVX-512-FP16 *intrinsics* (`stdarch_x86_avx512_f16`) and the `f16` primitive type are still
-//! unstable, so this module emits the `v*ph` instructions directly with `core::arch::asm!` — the
-//! same stable-on-x86 path the SME module ([`super::sme1`]) uses on aarch64. Inline asm and the
-//! `zmm_reg`/`kreg` register classes are stable on x86; only the *intrinsic wrappers* needed nightly.
-//!
-//! Data rides in [`__m512i`] (a stable 512-bit carrier holding the 32×`f16` bit pattern of
-//! `half::f16`), so nothing here needs nightly. The mnemonics only *execute* where the CPU
-//! implements `avx512fp16` (Sapphire Rapids+, Zen 5); dispatch guards that with runtime detection.
+//! AVX-512-FP16 (x86_64): 32-wide half-precision arithmetic via raw `asm!`, since the intrinsics
+//! and the `f16` primitive are still unstable. Data rides in [`__m512i`], a stable 512-bit
+//! carrier holding the 32x`half::f16` bit pattern.
 #![allow(unsafe_op_in_unsafe_fn, clippy::missing_safety_doc)]
 
 use core::arch::asm;
@@ -44,7 +37,7 @@ pub unsafe fn splat(v: f16) -> __m512i {
     _mm512_set1_epi16(v.to_bits() as i16)
 }
 
-/// Negate every lane by flipping its sign bit (exact, including `±0`/NaN — unlike `0 - x`).
+/// Negate every lane by flipping its sign bit (exact for `±0`/NaN, unlike `0 - x`).
 #[target_feature(enable = "avx512fp16,avx512f,avx512bw")]
 #[inline]
 pub unsafe fn neg(a: __m512i) -> __m512i {

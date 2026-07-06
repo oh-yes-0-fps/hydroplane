@@ -1,11 +1,5 @@
-//! AVX-512-BF16 element-wise backend for `x86_64`.
-//!
-//! `bf16` has no native ALU, so this still computes in `f32x16` (16 lanes) exactly like the plain
-//! [`Avx512`](super::avx512::Avx512) `bf16` path — but the load/store boundary uses the hardware
-//! `vcvtneps2bf16`/widen conversions ([`crate::arch::avx512bf16`]) instead of a scalar
-//! `bf16`↔`f32` loop. Every arithmetic/compare/reduce op delegates to `Avx512`'s `f32` backend, so
-//! there is exactly one implementation of the math. Reached only through runtime `avx512bf16`
-//! detection; without it, `bf16` falls back to the software-converting `Avx512`/`Avx2` paths.
+//! AVX-512-BF16 element-wise backend for `x86_64`: compute stays `f32x16`, with hardware
+//! bf16 conversions at the load/store boundary.
 #![allow(unsafe_op_in_unsafe_fn)]
 
 #[cfg(target_arch = "x86")]
@@ -25,7 +19,7 @@ pub struct Avx512Bf16(());
 impl Avx512Bf16 {
     #[cfg(feature = "std")]
     #[inline]
-    // Unused when the build statically pins `avx512bf16` (dispatch takes the `new_unchecked` branch).
+    // Dead when the build statically pins `avx512bf16`; dispatch then uses `new_unchecked`.
     #[allow(dead_code)]
     pub fn detect() -> Option<Self> {
         if is_x86_feature_detected!("avx512bf16")
@@ -45,9 +39,9 @@ impl Avx512Bf16 {
         Self(())
     }
 
-    /// The shared `f32x16` math: `avx512bf16` implies `avx512f`, so this token is always valid here.
-    /// Returned as `impl Backend<f32, …>` so op resolution picks `Avx512`'s `f32` impl (it also
-    /// implements `Backend<f64>`/`Backend<bf16>`, which would otherwise be ambiguous).
+    /// The shared `f32x16` math: `avx512bf16` implies `avx512f`, so the token is always valid.
+    /// Returned as `impl Backend<f32, …>` so op resolution pins `Avx512`'s `f32` impl rather
+    /// than its ambiguous `Backend<f64>`/`Backend<bf16>` impls.
     #[inline(always)]
     fn f32(self) -> impl Backend<f32, Vector = __m512, Mask = __mmask16> {
         unsafe { Avx512::new_unchecked() }

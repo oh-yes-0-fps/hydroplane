@@ -63,7 +63,7 @@ fn collect_k<'a>(
 }
 
 /// Two-phase loop over `masked_chunks` + `gather_n` from an AoS `&[(x,y,z,r)]`, mirroring the
-/// broadphase-reject-then-narrowphase shape — must match the scalar any-overlap.
+/// broadphase-reject-then-narrowphase shape.
 #[kernel]
 fn gather_any_k<'a>(ctx: Gang, pts: &'a [(f32, f32, f32, f32)], q: [f32; 4]) -> bool {
     let [cx, cy, cz, sr] = ctx.splat_n(q);

@@ -1,14 +1,6 @@
-//! SME2 = SME(v1) + multi-vector instructions (2-/4-vector `LD1`/`ST1`/`MOVA` groupings and the
-//! predicate-as-counter) that raise matrix/streaming throughput.
-//!
-//! The single-tile ZA engine lives in [`super::sme1`] and is re-exported, so an SME2 host runs the
-//! same correct `mma_f32`/`_f64`/`_f16`/`_bf16`. On top, [`mma_f32_wide`] is the SME2 multi-vector
-//! path: it tiles a **svl/2 × svl/2** output across the four `za0`–`za3` `.s` tiles (a 2×2 grid),
-//! so one `SMSTART`/`SMSTOP` session covers **4× the area** of a single tile. Each `k`-step loads
-//! the A-column and B-row with one **multi-vector** `LD1W {z0.s-z1.s}` apiece — a predicate-as
-//! -counter (`whilelt pn.s, …, vlx2`) spans the pair and the svl/4 split between the low/high tiles
-//! falls out of the hardware. C is preloaded and stored a whole row at a time with multi-vector
-//! `LD1W`/`ST1W`. `M, N ≤ svl/2`.
+//! SME2 = SME(v1) + multi-vector instructions and the predicate-as-counter; the single-tile ZA
+//! engine is re-exported from [`super::sme1`], and [`mma_f32_wide`] tiles a `svl/2 × svl/2`
+//! output across all four `.s` ZA tiles in one streaming session.
 #![allow(
     dead_code,
     unsafe_op_in_unsafe_fn,
@@ -24,10 +16,9 @@ pub use super::sme1::*;
 /// 2×2 ZA-tile-grid GEMM `D = C + A·B` for one full-width element type (f32/f64). The four tiles
 /// hold the quadrants split at `q = svl/E` (`E` = element bytes): `za0` = rows `[0,q)`×cols `[0,q)`,
 /// `za1` = `[0,q)`×`[q,N)`, `za2` = `[q,M)`×`[0,q)`, `za3` = `[q,M)`×`[q,N)`. A-columns/B-rows/C-rows
-/// move via **multi-vector** `LD1`/`ST1` (a predicate-as-counter spans the vector pair, the svl/E
-/// split is automatic); per-tile `FMOPA`s and `MOVA`s use single-vector low/high predicates. `M,N`
-/// up to `2*q`. Below `q` it still works but idles three tiles — dispatch picks it only when `M` or
-/// `N` exceeds one tile width.
+/// move via multi-vector `LD1`/`ST1`; per-tile `FMOPA`s and `MOVA`s use single-vector low/high
+/// predicates. `M,N` up to `2*q`. Below `q` it works but idles three tiles, so dispatch picks it
+/// only when `M` or `N` exceeds one tile width.
 macro_rules! mma_wide_2x2 {
     ($name:ident, $t:ty, $zero:expr, $sz:expr, $e:literal, $ld:literal, $st:literal,
      $cnt:literal, $open:literal) => {
@@ -158,18 +149,17 @@ mma_wide_2x2!(
     ".arch_extension sme2\n.arch_extension sme-f64f64"
 );
 
-/// **Single-session packed GEMM** `D = C + Aᵀ·B`, the feeding-optimized core of the blocked SME2
-/// GEMM. The entire `pm × pn` tile grid runs inside **one** `smstart`/`smstop`: streaming mode
-/// forbids NEON and most non-streaming SVE, so the tile loop, the C load/store, and all addressing
-/// live here in the streaming-legal subset (scalar GPR + SME multi-vector). `A` and `B` arrive
-/// **pre-packed** into contiguous `K×BLK` panels (`ap` = `pm` column panels, `bp` = `pn` row panels,
-/// `BLK = 2·VL = svl/E·2` computed at runtime), so each `k`-step streams them with a plain contiguous
-/// multi-vector load and a pointer bump — no per-step `madd`, no strided `B`, no per-tile A re-pack —
-/// keeping the four `FMOPA`s fed near the engine's rank-1 rate. An A row panel is reused across all
-/// `pn` column tiles (BLIS reuse). Full tiles only (caller gates `M,N` as multiples of `BLK`). `c`/
-/// `ldc_b` (row stride in **bytes**) is the strided `M×N` output. `$shift = log2(2·VL_bytes / cnt)`
-/// — 3 for f32 (.s), 4 for f64 (.d). On Apple M5 the single session is perf-neutral vs re-entering
-/// per tile (streaming-mode entry is cheap there); it's kept for SME hosts where it isn't.
+/// Single-session packed GEMM `D = C + Aᵀ·B`, the core of the blocked SME2 GEMM. The entire
+/// `pm × pn` tile grid runs inside one `smstart`/`smstop`: streaming mode forbids NEON and most
+/// non-streaming SVE, so the tile loop, C load/store, and all addressing live here in the
+/// streaming-legal subset (scalar GPR + SME multi-vector). `A` and `B` arrive pre-packed into
+/// contiguous `K×BLK` panels (`ap` = `pm` column panels, `bp` = `pn` row panels, `BLK = 2·VL`),
+/// so each `k`-step is one contiguous multi-vector load plus a pointer bump, keeping the four
+/// `FMOPA`s fed. An A row panel is reused across all `pn` column tiles (BLIS reuse). Full tiles
+/// only: the caller gates `M,N` as multiples of `BLK`. `c`/`ldc_b` (row stride in bytes) is the
+/// strided `M×N` output. `$shift = log2(2·VL_bytes / cnt)`: 3 for f32 (.s), 4 for f64 (.d).
+/// On Apple M5 the single session is perf-neutral vs re-entering per tile (streaming-mode entry
+/// is cheap there); it's kept for SME hosts where it isn't.
 macro_rules! mma_grid_2x2_packed {
     ($name:ident, $e:literal, $ld:literal, $st:literal, $cnt:literal, $shift:literal, $open:literal,
      $t:ty) => {
@@ -232,9 +222,8 @@ macro_rules! mma_grid_2x2_packed {
                 "b 120b",
                 "121:",
                 // K reduction over the packed panels, four independent-tile FMOPAs. Bottom-tested
-                // countdown loop (`subs`/`b.ne`), matching Apple's libBLAS kernel: one taken branch
-                // and the decrement fused, vs a top `cmp`/`b.hs` + unconditional back-edge. `K ≥ 1`
-                // always (the caller gates on `SME_MIN_DIM`), so the body runs at least once.
+                // countdown loop (`subs`/`b.ne`): the body must run at least once, which holds
+                // because the caller gates on `SME_MIN_DIM` so `K ≥ 1`.
                 "mov {kc}, {kk}",
                 "mov {aw}, {apw}",
                 "mov {bw}, {bpw}",
@@ -325,17 +314,16 @@ mma_grid_2x2_packed!(
     ".arch_extension sme2\n.arch_extension sme-f64f64", f64
 );
 
-/// **Single-session blocked widening GEMM** `D = C + A·B` for a 16-bit input type (`bf16`/`f16`)
-/// accumulating in **f32** — the half-precision counterpart of [`mma_f32_grid_packed`]. `BFMOPA` /
-/// the FP16-widening `FMOPA` fold a *pair* of `k` per instruction into the `.s` (f32) ZA tiles, so a
-/// `K`-reduction is `⌈K/2⌉` matrix ops over a `svl/2 × svl/2` (`q = svl/4`) output — half the f32
-/// op count for the same tile, at f32 accuracy (the inputs are already 16-bit, so this *matches* the
-/// f32-accumulate reference, unlike the native f16f16 [`mma_f16_wide`]). The C load/store, ctile
-/// addressing, grid loops and byte strides are identical to the f32 grid (C is f32 either way); only
-/// the K-loop differs — `ap`/`bp` are **pair-packed** 16-bit panels (`BLK×2` per pair-row,
-/// contiguous, so each pair-step is one 2-vector `LD1H` + a pointer bump) and the four MOPAs run on
-/// `.h` operands with all-true predicates (full tiles only; the caller gates `M,N` as multiples of
-/// `BLK = svl/2`). `c`/`ldc_b` is the strided f32 `M×N` output; `pairs = ⌈K/2⌉`.
+/// Single-session blocked widening GEMM `D = C + A·B` for a 16-bit input type (`bf16`/`f16`)
+/// accumulating in f32, the half-precision counterpart of [`mma_f32_grid_packed`]. `BFMOPA` / the
+/// FP16-widening `FMOPA` fold a pair of `k` per instruction into the `.s` ZA tiles, so a
+/// `K`-reduction is `⌈K/2⌉` matrix ops over a `svl/2 × svl/2` (`q = svl/4`) output at f32 accuracy
+/// (matches the f32-accumulate reference, unlike the native f16f16 [`mma_f16_wide`]). C handling
+/// is identical to the f32 grid; only the K-loop differs: `ap`/`bp` are pair-packed 16-bit panels
+/// (`BLK×2` per pair-row, contiguous, one 2-vector `LD1H` + pointer bump per pair-step) and the
+/// four MOPAs run on `.h` operands with all-true predicates. Full tiles only: the caller gates
+/// `M,N` as multiples of `BLK = svl/2`. `c`/`ldc_b` is the strided f32 `M×N` output;
+/// `pairs = ⌈K/2⌉`.
 macro_rules! mma_grid_2x2_widen {
     ($name:ident, $t:ty, $mopa:literal, $open:literal) => {
         #[inline]
@@ -394,9 +382,9 @@ macro_rules! mma_grid_2x2_widen {
                 "add {i}, {i}, #1",
                 "b 220b",
                 "221:",
-                // K reduction over ⌈K/2⌉ pair-rows: one 2-vector .h load each for A and B (z0/z1 =
-                // low/high rows, z2/z3 = low/high cols — the svl/4 split falls out of the pair load),
-                // four widening MOPAs into the f32 tiles. Countdown loop like the f32 grid.
+                // K reduction over ⌈K/2⌉ pair-rows: one 2-vector .h load each for A (z0/z1 =
+                // low/high rows) and B (z2/z3 = low/high cols), four widening MOPAs into the
+                // f32 tiles. Countdown loop like the f32 grid.
                 "mov {kc}, {pairs}",
                 "mov {aw}, {apw}",
                 "mov {bw}, {bpw}",
@@ -481,16 +469,14 @@ macro_rules! mma_grid_2x2_widen {
     };
 }
 
-// bf16 → f32: BFMOPA is base SME2. f16 → f32: the FP16-widening FMOPA (`.h` operands, `.s`
-// accumulator) — distinct from the native f16f16 `mma_f16_wide`; this one keeps f32 accuracy.
+// bf16 -> f32: BFMOPA is base SME2. f16 -> f32: the FP16-widening FMOPA needs sme-f16f16.
 mma_grid_2x2_widen!(mma_bf16_grid_packed, bf16, "bfmopa", ".arch_extension sme2");
 mma_grid_2x2_widen!(mma_f16_grid_packed, f16, "fmopa", ".arch_extension sme2\n.arch_extension sme-f16f16");
 
-/// SME2 multi-vector **f16** GEMM `D = C + A·B` with native f16 accumulation (FEAT_SME_F16F16), over
-/// a **1×2** `.h`-tile grid — `.h` has only two ZA tiles, so the widening is in `N`: `za0.h` =
-/// cols `[0,q)`, `za1.h` = cols `[q,N)`, split at `q = svl/2 = cnth`. `M ≤ svl/2`, `N ≤ svl`. The
-/// A-column (≤ one vector) loads single; the B-row and C-row use multi-vector `LD1H`/`ST1H`. Speed
-/// over parity: f16 accumulate, so results don't match the f32-accumulate backends. `c: *mut f16`.
+/// SME2 multi-vector f16 GEMM `D = C + A·B` with native f16 accumulation (FEAT_SME_F16F16), over a
+/// 1×2 `.h`-tile grid. `.h` has only two ZA tiles, so the widening is in `N`: `za0.h` = cols
+/// `[0,q)`, `za1.h` = cols `[q,N)`, split at `q = svl/2`. `M ≤ svl/2`, `N ≤ svl`. f16 accumulate,
+/// so results don't match the f32-accumulate backends. `c: *mut f16`.
 #[inline]
 pub unsafe fn mma_f16_wide<const M: usize, const N: usize, const K: usize>(
     a: *const f16,
@@ -584,11 +570,11 @@ pub unsafe fn mma_f16_wide<const M: usize, const N: usize, const K: usize>(
     );
 }
 
-/// SME2 multi-vector **bf16** GEMM `D = C + A·B` with an `f32` accumulator, over a **2×2** `.s`-tile
-/// grid (bf16 `BFMOPA` accumulates into `.s`, which has four tiles). Combines the wide-tile win with
-/// native `BFMOPA`: each instruction folds a *pair* of `k`, so ⌈K/2⌉ ops, and the quadrants span a
-/// `svl/2 × svl/2` (`q = svl/4`) f32 output. A/B are pair-packed and loaded with multi-vector `LD1H`
-/// (`.h` counter over `2M`/`2N`); C is f32 and moves exactly as in [`mma_f32_wide`]. `M, N ≤ svl/2`.
+/// SME2 multi-vector bf16 GEMM `D = C + A·B` with an `f32` accumulator, over a 2×2 `.s`-tile grid
+/// (bf16 `BFMOPA` accumulates into `.s`, which has four tiles). Each instruction folds a pair of
+/// `k`, so ⌈K/2⌉ ops over a `svl/2 × svl/2` (`q = svl/4`) f32 output. A/B are pair-packed and
+/// loaded with multi-vector `LD1H` (`.h` counter over `2M`/`2N`); C moves as in [`mma_f32_wide`].
+/// `M, N ≤ svl/2`.
 #[inline]
 pub unsafe fn mma_bf16_wide<const M: usize, const N: usize, const K: usize>(
     a: *const bf16,
@@ -722,9 +708,9 @@ pub unsafe fn mma_bf16_wide<const M: usize, const N: usize, const K: usize>(
     );
 }
 
-/// Whether the running CPU implements SME2 (the multi-vector SME extension). Linux reads
-/// `HWCAP2_SME2` from the ELF aux vector; macOS/Apple reads the `hw.optional.arm.FEAT_SME2` sysctl;
-/// other OSes return `false` (see [`super::sme1::is_supported`] for why stable detection is OS-specific).
+/// Whether the running CPU implements SME2. Linux reads `HWCAP2_SME2` from the ELF aux vector;
+/// Apple reads the `hw.optional.arm.FEAT_SME2` sysctl; other OSes return `false`
+/// (see [`super::sme1::is_supported`]).
 #[cfg(feature = "std")]
 pub fn is_supported() -> bool {
     // Cached (see `super::sme1::is_supported`): the Apple probe is a syscall, called per `mma`.

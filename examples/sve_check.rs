@@ -1,7 +1,5 @@
-//! Run the SVE `asm!` primitives (f32, f64, f16, bf16) and check
-//! them against a scalar reference. Built static for aarch64-linux-musl and run under
-//! `qemu-system-aarch64 -cpu max`, which provides base SVE (Apple silicon has SVE only via SME
-//! streaming, so these can't run natively there). See `tools/qemu-sve.sh`.
+//! Runs the SVE `asm!` primitives (f32, f64, f16, bf16) against a scalar reference. Build static
+//! for aarch64-linux-musl and run under `qemu-system-aarch64 -cpu max`: see `tools/qemu-sve.sh`.
 #![allow(clippy::needless_range_loop)]
 
 #[cfg(target_arch = "aarch64")]
@@ -55,7 +53,7 @@ fn main() {
         if !any_mask::<C>(&le_f32::<C>(&va, &vb)) { println!("FAIL f32 any"); fails += 1; }
     }
 
-    // f64 (C/8 = 2 lanes — fits the 128-bit VL floor; wider VLs use a larger `C`)
+    // f64 (C/8 = 2 lanes, the 128-bit VL floor)
     unsafe {
         const C: usize = 16;
         const L: usize = 2;
@@ -138,9 +136,8 @@ fn main() {
         }
     }
 
-    // End-to-end dispatch: `hydroplane::dispatch` must pick an `Sve<C>` token here (non-Apple aarch64),
-    // not NEON. Proof: the chosen f32 backend reports `C/4` lanes = VL/4 (8 at 256-bit, 16 at
-    // 512-bit), whereas NEON is always 4. Also check the dispatched result against a scalar sum.
+    // End-to-end dispatch must pick an `Sve<C>` token here, not NEON: the chosen f32 backend
+    // reports VL/4 lanes, whereas NEON is always 4. Also check the result against a scalar sum.
     {
         use hydroplane::{BackendAll, Backend, Kernel, Gang, dispatch};
 

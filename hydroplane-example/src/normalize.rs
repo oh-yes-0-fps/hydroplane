@@ -1,6 +1,4 @@
-//! Batched vector normalization `v / ‖v‖` over an SoA of 3-component vectors — a rsqrt plus three
-//! scales. Moderate arithmetic intensity across three lanes of storage; the natural fit for
-//! hydroplane's `Vec3Wide`, mirrored by a hand-rolled three-register `wide` kernel and `glam`.
+//! Batched `v / ‖v‖` over SoA vec3 columns: moderate arithmetic intensity, multi-component.
 
 use glam::Vec3;
 use hydroplane::{Gang, GangGlamExt, kernel};

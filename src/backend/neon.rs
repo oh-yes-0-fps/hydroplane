@@ -1,8 +1,5 @@
 //! Hand-written AArch64 NEON backend (4-wide f32, 2-wide f64).
-//!
 //! NEON is baseline on AArch64, so the [`Neon`] token is always constructible there.
-//! Masks are integer vectors (`uint32x4_t`/`uint64x2_t`); `select` is `vbslq` (bit-select);
-//! cross-lane ops use the `v*vq` horizontal reductions. FMA is hardware (`vfmaq`).
 #![allow(unsafe_op_in_unsafe_fn)]
 #![cfg(target_arch = "aarch64")]
 
@@ -69,7 +66,7 @@ impl Backend<f32> for Neon {
     }
     #[inline(always)]
     fn fma(self, a: float32x4_t, b: float32x4_t, c: float32x4_t) -> float32x4_t {
-        // vfmaq_f32(acc, x, y) = acc + x*y  ⇒  a*b + c
+        // vfmaq_f32(acc, x, y) = acc + x*y, so this computes a*b + c
         unsafe { vfmaq_f32(c, a, b) }
     }
     #[inline(always)]
@@ -370,10 +367,8 @@ impl Backend<f64> for Neon {
     }
 }
 
-// `bf16` on NEON: storage is 16-bit, compute is `f32x4` (NEON has no native bf16 ALU). Widen on
-// load/splat, narrow on store/reduce — conversions at the memory boundary only, so all arithmetic
-// is native `f32` SIMD. `Vector = float32x4_t` (as on the AVX2 F16C f16 path). This is also the
-// element-wise substrate the bf16 matmul (and the AMX/AVX512-VNNI fast paths) build on.
+// bf16: 16-bit storage, f32x4 compute (NEON has no native bf16 ALU). Widen on load/splat,
+// narrow on store/reduce; conversions live at the memory boundary only.
 mod bf16_impl {
     use super::*;
     use half::bf16;
@@ -530,16 +525,11 @@ mod bf16_impl {
     }
 }
 
-// ───────────────────── f16 × float16x8_t (8 lanes, native FEAT_FP16) ─────────────────────
-//
-// Native half-precision NEON: 8 `f16` lanes in one `float16x8_t` with the full `.h` ALU
-// (`vaddq_f16`/`vfmaq_f16`/`vsqrtq_f16`/…) — 8× the throughput of the `ScalarBackend` fallback that
-// aarch64 `f16` took before. The arithmetic, FMA, compares, and bit-select are stable intrinsics;
-// the three that are not — the `f16` memory load/store (`vld1q_f16`/`vst1q_f16`/`vdupq_n_f16`) and
-// the `f16` horizontal reductions (`vmaxvq_f16`/`vminvq_f16`) — are sidestepped: load/store/splat go
-// through `uint16x8_t` + `vreinterpretq_f16_u16` (a free reinterpret), and the once-per-call
-// reductions widen each half to `float32x4_t` and use the `f32` horizontal ops. Reached only when
-// FEAT_FP16 is detected, so the `fp16` target-feature bodies always run on a CPU that has it.
+// Native FEAT_FP16: 8 f16 lanes with the full `.h` ALU. Arithmetic, FMA, compares, and
+// bit-select are stable intrinsics; the unstable ones are sidestepped: load/store/splat go
+// through `uint16x8_t` plus a free `vreinterpretq_f16_u16`, and reductions widen each half to
+// `float32x4_t` and use the f32 horizontal ops. Reached only when FEAT_FP16 is detected, so
+// the `fp16` target-feature bodies always run on a CPU that has it.
 mod f16_impl {
     use super::*;
     use half::f16;
@@ -616,8 +606,8 @@ mod f16_impl {
     unsafe fn select(m: uint16x8_t, a: float16x8_t, b: float16x8_t) -> float16x8_t {
         vbslq_f16(m, a, b)
     }
-    // The two `f16` horizontal reductions are unstable, so widen each half to `f32` (`vcvt`s are the
-    // stable conversion path) and reduce there — once per call, off the hot loop.
+    // The f16 horizontal reductions are unstable; widen each half via the stable `vcvt`s and
+    // reduce in f32.
     #[target_feature(enable = "fp16")]
     unsafe fn widen(v: float16x8_t) -> (float32x4_t, float32x4_t) {
         (vcvt_f32_f16(vget_low_f16(v)), vcvt_high_f32_f16(v))
@@ -770,9 +760,8 @@ mod f16_impl {
     }
 }
 
-/// The 32-bit integer element backends: same 4-lane geometry and `uint32x4_t` mask convention as
-/// the `f32` impl, so float- and integer-element kernels share dispatch and mask machinery.
-/// Arithmetic is wrapping (NEON integer semantics).
+/// The 32-bit integer element backends: same 4-lane geometry and `uint32x4_t` mask convention
+/// as the `f32` impl, so float and integer kernels share mask machinery. Arithmetic is wrapping.
 macro_rules! neon_int_backend {
     ($t:ty, $vec:ty, $ld:ident, $st:ident, $dup:ident, $add:ident, $sub:ident, $mul:ident,
      $neg:expr, $abs:expr, $min:ident, $max:ident,

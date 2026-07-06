@@ -1,12 +1,6 @@
-//! `glam`-aware wide-vector helpers (opt-in `glam` feature).
-//!
-//! A glam [`Vec3`] spread across the lanes is three [`Varying`]s — one register per component. This
-//! module wraps that triple in [`Vec3Wide`] (with `dot`/`length_squared`/operators), adds a
-//! [`Mat3Wide`] for the rotate/transform kernels, and a [`GangGlamExt`] bridge that builds them from
-//! glam values (`splat_vec3`, `gather_vec3`, …). Every method is a thin `#[inline]` wrapper over the
-//! existing [`Gang`]/[`Varying`] primitives, so after monomorphization it lowers to exactly the
-//! hand-rolled per-component code — the geometry layer is a pure ergonomic veneer, and it stays out
-//! of the core (this whole module is behind the `glam` feature, off by default).
+//! `glam`-aware wide-vector helpers (opt-in `glam` feature): [`Vec3Wide`]/[`Mat3Wide`] hold one
+//! [`Varying`] per component, built from glam values via the [`GangGlamExt`] bridge
+//! (`splat_vec3`, `gather_vec3`, …).
 
 use core::ops::{Add, Mul, Sub};
 
@@ -15,9 +9,9 @@ use glam::{Mat3, Vec3};
 use crate::backend::Backend;
 use crate::varying::{Gang, Mask, Varying};
 
-/// A `Vec3` whose three components are each a full register of lanes — the SIMD-wide form of a glam
-/// [`Vec3`]. The public `.0` is the `[Varying; 3]` the [`Gang`] combinators (`gather_n`, `any_n`, …)
-/// speak in, so it destructures freely.
+/// A `Vec3` whose three components are each a full register of lanes: the SIMD-wide form of a
+/// glam [`Vec3`]. The public `.0` is the `[Varying; 3]` the [`Gang`] combinators (`gather_n`,
+/// `any_n`, …) speak in, so it destructures freely.
 #[derive(Clone, Copy)]
 pub struct Vec3Wide<S: Backend<f32>>(pub [Varying<f32, S>; 3]);
 
@@ -37,7 +31,7 @@ impl<S: Backend<f32>> Vec3Wide<S> {
         a * x + b * y + c * z
     }
 
-    /// Per-lane squared length (`self · self`) — the form distance tests want (no `sqrt`).
+    /// Per-lane squared length (`self · self`), the no-`sqrt` form distance tests want.
     #[inline(always)]
     pub fn length_squared(self) -> Varying<f32, S> {
         self.dot(self)
@@ -49,8 +43,8 @@ impl<S: Backend<f32>> Vec3Wide<S> {
         self.length_squared().sqrt()
     }
 
-    /// `self + dir * t` — point-plus-scaled-direction. Kept as a separate multiply then add (not a
-    /// fused [`Varying::fma`]) so results match the hand-rolled kernels bit-for-bit.
+    /// `self + dir * t`. Kept as a separate multiply then add (not [`Varying::fma`]) so results
+    /// match the hand-rolled kernels bit-for-bit.
     #[inline(always)]
     pub fn add_scaled(self, dir: Self, t: Varying<f32, S>) -> Self {
         self + dir * t
@@ -126,7 +120,7 @@ impl<S: Backend<f32>> Mul<f32> for Vec3Wide<S> {
     }
 }
 
-/// A `Mat3` splatted across the lanes (column-major, matching glam's [`Mat3`] layout) — for the
+/// A `Mat3` splatted across the lanes (column-major, matching glam's [`Mat3`] layout), for the
 /// rotate / affine-transform kernels.
 #[derive(Clone, Copy)]
 pub struct Mat3Wide<S: Backend<f32>>([Varying<f32, S>; 9]);
@@ -144,14 +138,14 @@ impl<S: Backend<f32>> Mat3Wide<S> {
         ])
     }
 
-    /// `self * v + t` per lane — an affine transform (rotate/scale then translate).
+    /// `self * v + t` per lane: an affine transform (rotate/scale then translate).
     #[inline(always)]
     pub fn mul_add(self, v: Vec3Wide<S>, t: Vec3Wide<S>) -> Vec3Wide<S> {
         self.mul_vec3(v) + t
     }
 
-    /// The nine column-major components as `[Varying; 9]` (the form the [`Gang`] column
-    /// primitives speak in) — destructures freely.
+    /// The nine column-major components as `[Varying; 9]`, the form the [`Gang`] column
+    /// primitives speak in.
     #[inline(always)]
     pub fn cols(self) -> [Varying<f32, S>; 9] {
         self.0
@@ -216,12 +210,12 @@ impl<S: Backend<f32>> From<[Varying<f32, S>; 9]> for Mat3Wide<S> {
     }
 }
 
-/// A batched `R×C` matrix held one-per-lane over SoA planes: each `[i][j]` entry is a full register
-/// whose lanes are that entry across a register's worth of independent matrices. This is the
-/// [`Mat3Wide`] idea generalized — FEM's real shape is thousands of small independent products
-/// (`3×3`/`6×6`/`12×12` element matrices), the regime where the gang machinery wins and the
-/// big-matrix packing/streaming path in [`dense`](crate::dense) can't. Row-major nested storage
-/// (`[[_; C]; R]`) so the size stays expressible on stable without `generic_const_exprs`.
+/// A batched `R×C` matrix held one-per-lane over SoA planes: each `[i][j]` entry is a full
+/// register whose lanes are that entry across a register's worth of independent matrices —
+/// [`Mat3Wide`] generalized to the batched-small-product regime (`3×3`/`6×6`/`12×12` FEM element
+/// matrices) where the gang machinery wins and the packing/streaming path in
+/// [`dense`](crate::dense) can't. Row-major nested storage (`[[_; C]; R]`) keeps the size
+/// expressible on stable without `generic_const_exprs`.
 #[derive(Clone, Copy)]
 pub struct MatWide<S: Backend<f32>, const R: usize, const C: usize>(pub [[Varying<f32, S>; C]; R]);
 
@@ -285,7 +279,7 @@ impl<S: Backend<f32>, const R: usize, const C: usize> MatWide<S, R, C> {
     }
 }
 
-/// Builds [`Vec3Wide`]/[`Mat3Wide`] from glam values — the conversion bridge over the [`Gang`]
+/// Builds [`Vec3Wide`]/[`Mat3Wide`] from glam values: the conversion bridge over the [`Gang`]
 /// primitives (`splat_n`/`gather_n`/`load_n`/`load_partial_n`).
 pub trait GangGlamExt<S: Backend<f32>> {
     /// Broadcast a uniform [`Vec3`] to a lane-vector (every lane the same).

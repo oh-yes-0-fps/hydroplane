@@ -1,14 +1,6 @@
-//! `hydro-analyze` — a `RUSTC_WORKSPACE_WRAPPER` that measures each `#[kernel]`'s MIR.
-//!
-//! Invoked by the example's `build.rs` as the wrapper for a marker-gated nested `cargo +nightly
-//! build`. Cargo hands it the full, correct `rustc` command for every crate; for the example crate
-//! it runs that compile *in process* (adding `-Zalways-encode-mir`) with a StableMIR pass that walks
-//! the body of every function tagged `#[hydro_analyze::metrics(kernel = "…")]` and writes one line of
-//! metrics per kernel to `$HYDRO_ANALYSIS_OUT`. For every other crate (the dependencies) it just execs
-//! the real `rustc`. The pass returns `Continue`, so the crate still compiles and cargo succeeds.
-//!
-//! All the `rustc_private` code lives in this final binary on purpose: a crate that does
-//! `extern crate rustc_driver` can't be imported without hitting "std only shows up once".
+//! `hydro-analyze` — a `RUSTC_WORKSPACE_WRAPPER` that compiles the target crate in process with a
+//! StableMIR pass, writing one metrics line per `#[hp_analyze::metrics(kernel = "…")]` function
+//! to `$HYDRO_ANALYSIS_OUT`; every other crate is passed straight through to the real `rustc`.
 #![feature(rustc_private)]
 
 extern crate rustc_driver;
@@ -31,8 +23,7 @@ fn main() -> ExitCode {
     }
     let real_rustc = args.remove(0);
 
-    // The crate to analyze is named by the build helper (`HYDRO_ANALYZE_CRATE`); every other crate in
-    // the nested build (the dependencies) is passed straight through to the real compiler.
+    // Only the crate named by `HYDRO_ANALYZE_CRATE` is analyzed; everything else passes through.
     let want = std::env::var("HYDRO_ANALYZE_CRATE").ok();
     let is_target = want.is_some()
         && crate_name(&args) == want
@@ -43,7 +34,6 @@ fn main() -> ExitCode {
     if is_target {
         analyze(&args)
     } else {
-        // Passthrough: run the real compiler untouched (dependencies, print requests, …).
         let status = Command::new(&real_rustc).args(&args).status();
         match status {
             Ok(s) => ExitCode::from(s.code().unwrap_or(1) as u8),
@@ -104,10 +94,9 @@ impl rustc_driver::Callbacks for Analyzer {
     }
 }
 
-/// One `name k=v …` line per tagged kernel. `compute` folds in the statements of the kernel's
-/// closures (the bodies of the `|acc,v| …` steps handed to `sum`/`reduce`/`map`), which live in
-/// separate MIR items named `…::<kernel>_on::{closure#N}` — invisible to the `_on` body itself but
-/// where a combinator kernel's real arithmetic intensity lives.
+/// One `name k=v …` line per tagged kernel. `compute` folds in the kernel's closures (the
+/// `|acc,v| …` step bodies), which live in separate MIR items named `…::<kernel>_on::{closure#N}`
+/// and hold a combinator kernel's real arithmetic intensity.
 fn collect() -> Vec<String> {
     use std::collections::HashMap;
     let items = rustc_public::all_local_items();
@@ -128,13 +117,11 @@ fn collect() -> Vec<String> {
         }
     }
 
-    // Compute intensity = statements reachable from the kernel's `_on` body: the body, its combinator
-    // closures (the `|acc,v| …` steps, separate items named `…_on::{closure#N}`), and the non-kernel
-    // helper functions those transitively call — stopping at other kernels' `_on` boundaries (folded
-    // separately by composition). This is what stops a kernel that delegates its arithmetic to a plain
-    // helper (`activate_poly`) from measuring as an empty map body. (Register pressure — `varying_locals`
-    // — is NOT folded this way: peak pressure isn't a reachable-set property, and folding it regressed
-    // the light reductions; a register-heavy combinator kernel uses the explicit `unroll` cap instead.)
+    // Compute intensity counts statements reachable from `_on` (body, combinator closures, and the
+    // non-kernel helpers they transitively call), so a kernel that delegates its arithmetic to a
+    // plain helper doesn't measure as an empty map body. Register pressure (`varying_locals`) is
+    // NOT folded this way: peak pressure isn't a reachable-set property, and folding it regressed
+    // the light reductions.
     let stmts_of: HashMap<String, u64> = items.iter().map(|it| (it.name(), stmt_count(it))).collect();
     let calls_of: HashMap<String, Vec<String>> = items
         .iter()
@@ -152,10 +139,9 @@ fn collect() -> Vec<String> {
         k.m.types = folded_type_bits(&k.on_full, &types_of, &calls_of);
     }
 
-    // Cross-kernel cost composition: when kernel A calls B via `B_on`, B's reduction runs under A's
-    // chosen unroll factor, so A's cap must satisfy B too. Fold the transitive callees' register and
-    // compute pressure into each kernel by `max` (the tightest sub-kernel wins). Since every kernel
-    // exports the composed value, a chain resolves the whole call tree.
+    // When kernel A calls B via `B_on`, B runs under A's chosen unroll factor, so A's cap must
+    // satisfy B too: fold transitive callees' register and compute pressure into each kernel by
+    // `max`.
     let idx: HashMap<&str, usize> =
         kernels.iter().enumerate().map(|(i, k)| (k.on_full.as_str(), i)).collect();
     let own: Vec<(u64, u64)> = kernels.iter().map(|k| (k.m.varying_locals, k.m.compute)).collect();
@@ -219,8 +205,8 @@ fn all_call_targets(body: &rustc_public::mir::Body) -> Vec<String> {
     out
 }
 
-/// Statements reachable from a kernel's `_on` body — the body, its closures (reached by the external
-/// combinator, so seeded by name), and the non-kernel local functions they transitively call —
+/// Statements reachable from a kernel's `_on` body: the body, its closures (reached by the external
+/// combinator, so seeded by name), and the non-kernel local functions they transitively call,
 /// stopping at other kernels' `_on` boundaries (folded separately by cross-kernel composition).
 fn compute_intensity(
     on_full: &str,
@@ -261,9 +247,9 @@ fn stmt_count(item: &CrateItem) -> u64 {
     }
 }
 
-/// The `kernel = "…"` value if the item carries `#[hydro_analyze::metrics(..)]`.
+/// The `kernel = "…"` value if the item carries `#[hp_analyze::metrics(..)]`.
 fn kernel_name(item: &CrateItem) -> Option<String> {
-    let path = ["hydro_analyze".to_string(), "metrics".to_string()];
+    let path = ["hp_analyze".to_string(), "metrics".to_string()];
     let attr = item.tool_attrs(&path).into_iter().next()?;
     attr.as_str().split('"').nth(1).map(str::to_string)
 }
@@ -282,13 +268,12 @@ struct Metrics {
 
 /// Element-type bits (`Scalar::TYPE_BITS` values) appearing in hydroplane value positions of a
 /// stringified MIR type: `Varying<f32, …>`, `Backend<u32>`, the `VaryingU32<T, S>` companions
-/// (which imply 32-bit integer lanes regardless of the gang element), … This sees through
-/// generics, inference, and helper indirection that the macro's token scan cannot.
+/// (which imply 32-bit integer lanes regardless of the gang element). Sees through generics,
+/// inference, and helper indirection that the macro's token scan cannot.
 fn type_bits_in(s: &str) -> u64 {
     // StableMIR debug renders elements structurally: `RigidTy(Float(F32))`, `Uint(U32)`,
-    // `Int(I32)`, and the half types as `AdtDef(… name: "half::f16" …)`. Find each hydroplane
-    // value-type context and take the first concrete element rendered in its generic args
-    // (a `Param` — a still-generic scalar — matches nothing, correctly).
+    // `Int(I32)`, half types as `AdtDef(… name: "half::f16" …)`. Take the first concrete element
+    // rendered in each context's generic args; a still-generic `Param` matches nothing, correctly.
     const ELEMS: [(&str, u64); 8] = [
         ("Float(F32)", 1),
         ("Float(F64)", 2),
@@ -348,9 +333,8 @@ fn body_type_bits(item: &CrateItem) -> u64 {
     bits
 }
 
-/// Element bits reachable from a kernel's `_on` body — the body, its closures, and everything
-/// they transitively call, *including* other kernels' `_on` bodies (an over-approximation only
-/// widens the combo, which costs pruning, never correctness).
+/// Element bits reachable from a kernel's `_on` body, including other kernels' `_on` bodies: an
+/// over-approximation only widens the combo, which costs pruning, never correctness.
 fn folded_type_bits(
     on_full: &str,
     types_of: &std::collections::HashMap<String, u64>,
@@ -422,11 +406,10 @@ fn mem_ops_in(stmt: &Statement) -> u64 {
     0
 }
 
-/// Best-effort concrete frame size of the `ScalarBackend` monomorphization. Returns `None` when the
-/// instance can't be resolved (generic const params, external-type resolution) — no decision depends
-/// on this, so callers fall back to `0`.
+/// Best-effort concrete frame size of the `ScalarBackend` monomorphization. `None` when the
+/// instance can't be resolved; no decision depends on this, so callers fall back to `0`.
 fn mono_stack_bytes(_item: &CrateItem) -> Option<u64> {
-    // Monomorphized resolution (Instance::resolve with a constructed `[f32, ScalarBackend]`) is the
-    // nightly-fragile part; deferred. Generic-MIR counts drive every current decision.
+    // Instance::resolve with a constructed `[f32, ScalarBackend]` is the nightly-fragile part;
+    // deferred. Generic-MIR counts drive every current decision.
     None
 }

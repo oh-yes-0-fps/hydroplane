@@ -114,9 +114,9 @@ fn gemm_f16() {
     assert_close(&got64, &want64, 1e-3);
 }
 
-// Large tiles (≥ ACCEL_MIN_DIM) take the Accelerate (AMX/SME) path on Apple by default, and the
-// register-blocked `simd_gemm` under `--cfg no_apple_accelerate`. Either way must match the
-// reference (tolerance: Accelerate's accumulation order/fusion differs).
+// Large tiles (≥ ACCEL_MIN_DIM) take Accelerate on Apple by default, or the register-blocked
+// `simd_gemm` under `--cfg hp_no_apple_accelerate`. Tolerance covers Accelerate's different
+// accumulation order.
 #[test]
 fn gemm_f32_large() {
     const M: usize = 64;
@@ -131,9 +131,8 @@ fn gemm_f32_large() {
     assert_close(&got, &want, 1e-3);
 }
 
-// Large 16-bit tiles (multiple of the SME grid width) take the native SME widening grid (BFMOPA /
-// FP16-widening FMOPA) under `no_apple_accelerate`, and Accelerate (via f32 widen) by default. Both
-// accumulate in f32, so both must match the f32-accumulate reference.
+// Large 16-bit tiles take the native SME widening grid under `hp_no_apple_accelerate`, or Accelerate
+// by default. Both accumulate in f32, so both must match the f32-accumulate reference.
 #[test]
 fn gemm_bf16_large() {
     use half::bf16;

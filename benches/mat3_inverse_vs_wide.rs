@@ -1,13 +1,6 @@
-//! Batched 3x3 inverse — the FEM "invert the Jacobian at every quadrature point" kernel. The
-//! `Mat3Wide::inverse` combinator is pitted against a hand-written `wide` SIMD kernel (f32x8 and
-//! width-matched f32x4) computing the same cofactor/adjugate form, plus a scalar `glam` baseline.
-//! The abstraction should land on top of the lane-matched `wide` code, not behind.
-//!
+//! Batched 3x3 inverse: `Mat3Wide::inverse` vs hand-written `wide` kernels vs a scalar `glam`
+//! baseline, over an SoA of the nine column-major components.
 //!   cargo bench --features glam --bench mat3_inverse_vs_wide
-//!   RUSTFLAGS="-C target-cpu=native" cargo bench --features glam --bench mat3_inverse_vs_wide
-//!
-//! Storage is a struct-of-arrays of the nine column-major components across `n` matrices; the matrices
-//! are diagonally dominant, so every one is non-singular.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use glam::Mat3;

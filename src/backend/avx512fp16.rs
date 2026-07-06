@@ -1,12 +1,6 @@
-//! Native AVX-512-FP16 backend for `x86_64` — true 32-wide hardware `f16` arithmetic.
-//!
-//! Unlike the AVX2 F16C path (which widens to f32 to compute), this computes directly in 32×`f16`
-//! lanes, so it is both wider and avoids the widen/narrow round-trip.
-//!
-//! **Stable.** The arithmetic is emitted as raw `asm!` by [`crate::arch::avx512fp16`], so this needs
-//! neither the unstable `f16` primitive nor the `stdarch_x86_avx512_f16` intrinsics — the element
-//! type stays `half::f16` and the register is a plain [`__m512i`] carrier. Reached only through
-//! runtime `avx512fp16` detection (the stable default otherwise keeps the AVX2 widen path).
+//! Native AVX-512-FP16 backend for `x86_64`: 32-wide hardware `f16` arithmetic.
+//! Works on stable: ops are raw `asm!` ([`crate::arch::avx512fp16`]) with `half::f16` elements
+//! in a plain [`__m512i`] carrier.
 #![allow(unsafe_op_in_unsafe_fn)]
 
 #[cfg(target_arch = "x86")]
@@ -25,11 +19,11 @@ pub struct Avx512Fp16(());
 impl Avx512Fp16 {
     #[cfg(feature = "std")]
     #[inline]
-    // Unused when the build statically pins `avx512fp16` (dispatch takes the `new_unchecked` branch).
+    // Dead when the build statically pins `avx512fp16`; dispatch then uses `new_unchecked`.
     #[allow(dead_code)]
     pub fn detect() -> Option<Self> {
-        // `vpblendmw`/`vcmpph`+`kmovd` ride on AVX-512-BW; every `avx512fp16` part has BW, but the
-        // check keeps the primitives' `target_feature` set honest.
+        // `vpblendmw`/`vcmpph`+`kmovd` ride on AVX-512-BW; every `avx512fp16` part has BW, but
+        // the check keeps the primitives' `target_feature` set honest.
         if is_x86_feature_detected!("avx512fp16")
             && is_x86_feature_detected!("avx512f")
             && is_x86_feature_detected!("avx512bw")
@@ -181,7 +175,7 @@ impl Backend<Half> for Avx512Fp16 {
 }
 
 impl Avx512Fp16 {
-    /// Horizontal fold via a 32-element spill (reductions are rare; correctness over cleverness).
+    /// Horizontal fold via a 32-element spill; reductions are rare enough for this to be fine.
     #[inline(always)]
     fn fold(self, v: __m512i, f: impl Fn(f32, f32) -> f32, init: f32) -> f32 {
         let mut tmp = [Half::ZERO; 32];

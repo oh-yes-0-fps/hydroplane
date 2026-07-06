@@ -1,18 +1,14 @@
-//! `hydroplane` — float-agnostic, ISPC-style SPMD/SIMD infrastructure.
+//! `hydroplane`: float-agnostic, ISPC-style SPMD/SIMD infrastructure.
 //!
 //! Write one kernel generic over the scalar element ([`Scalar`]: `f32`, `f64`, `f16`, `bf16`);
-//! [`dispatch()`] runs it on the backend it selects by
-//! runtime CPU detection (the widest of AVX-512/AVX2/SSE4/NEON the host supports, else the
-//! portable [`ScalarBackend`], which is also the rust-gpu/SPIR-V lowering target). The
-//! concrete SIMD backends are an implementation detail — you never name one.
-//!
-//! The whole crate is **stable Rust** with no SIMD-crate dependency. `f16`/`bf16` come from the
-//! `half` crate, re-exported here as [`f16`]/[`bf16`].
+//! [`dispatch()`] runs it on the widest backend runtime CPU detection finds, else the portable
+//! [`ScalarBackend`] (also the rust-gpu/SPIR-V lowering target). Kernels never name a backend.
+//! Stable Rust, `no_std`-compatible, no SIMD-crate dependency; `f16`/`bf16` come from the
+//! `half` crate, re-exported as [`struct@f16`]/[`bf16`].
 #![cfg_attr(not(feature = "std"), no_std)]
-// The SubgroupSize-builtin reader in the subgroup backend uses inline SPIR-V assembly, which
-// is behind the still-unstable `asm_experimental_arch` gate on the rust-gpu target. This is the
-// crate's only nightly requirement, and it applies solely to the rust-gpu/SPIR-V build — every
-// CPU target (including native AVX-512-FP16 f16) compiles on stable.
+// The subgroup backend's SubgroupSize reader uses inline SPIR-V assembly, gated behind
+// `asm_experimental_arch`. This is the crate's only nightly requirement and applies solely to
+// the rust-gpu/SPIR-V build; every CPU target compiles on stable.
 #![cfg_attr(target_arch = "spirv", feature(asm_experimental_arch))]
 
 #[cfg(feature = "alloc")]
@@ -52,8 +48,8 @@ pub mod glam_ext;
 pub use backend::{Backend, BackendAll, ScalarBackend};
 pub use dispatch::{Kernel, SimdDispatch, dispatch, run_scalar};
 
-/// The on-device entry point (rust-gpu / SPIR-V target): mirrors [`dispatch`], but branches
-/// on work size — subgroup-distributed vs. a single sequential invocation — instead of CPU ISA.
+/// The on-device entry point (rust-gpu / SPIR-V target): mirrors [`dispatch`], but branches on
+/// work size (subgroup-distributed vs. a single sequential invocation) instead of CPU ISA.
 #[cfg(target_arch = "spirv")]
 pub use backend::subgroup::dispatch_subgroup;
 pub use dense::{Diag, Mat, Side, Trans, Uplo, col_sums, fro_norm, gemv, row_sums};
@@ -67,10 +63,9 @@ pub use scalar::{FloatScalar, IntScalar, Scalar};
 pub use varying::{ChunksExact, Varying, VaryingI32, VaryingU32, Mask, Gang};
 
 /// The `#[kernel]` attribute: write a [`Kernel`]/[`MatrixKernel`] as a plain generic function.
-/// The full shape — contexts, tuning flags (`tiny`, `noalias`, `unroll = N`), the generated
-/// `<name>_on` companion for calling one kernel from another without re-dispatching, and the
-/// `matrix` form — is documented on [the attribute itself](macro@kernel) (the `hydroplane_macros`
-/// crate docs).
+/// Contexts, tuning flags (`tiny`, `noalias`, `unroll = N`), the generated `<name>_on` companion
+/// for calling one kernel from another without re-dispatching, and the `matrix` form are all
+/// documented on [the attribute itself](macro@kernel).
 pub use hydroplane_macros::kernel;
 
 /// `f16`/`bf16` element types (from the `half` crate), usable anywhere a [`Scalar`] is expected.
@@ -90,7 +85,7 @@ pub use soa::Soa;
 pub use glam_ext::{GangGlamExt, Mat3Wide, MatWide, Vec3Wide};
 
 /// The combo-dispatch tier tokens and codes, reachable by `#[kernel]`-generated wrappers.
-/// Implementation detail: application code never names a backend — the generated match does.
+/// Implementation detail: application code never names a backend, the generated match does.
 #[doc(hidden)]
 pub mod towers {
     pub use crate::dispatch::tier::*;

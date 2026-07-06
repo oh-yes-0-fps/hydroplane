@@ -1,6 +1,5 @@
-//! The ported sphere kernel must give identical hit/miss results to a brute-force reference
-//! — for f32 and f64, on whatever backend `dispatch` selects. This is the `hydroplane` analogue of
-//! `wreck`'s "0 mismatches vs CPU" methodology.
+//! The SoA sphere-overlap kernel must give identical hit/miss results to a brute-force
+//! reference, for f32 and f64, on whatever backend `dispatch` selects.
 
 use rand::Rng;
 use hydroplane::{BackendAll, FloatScalar, Backend, Kernel, Gang, SimdDispatch, Soa, dispatch};
@@ -52,8 +51,8 @@ impl<T: FloatScalar> Kernel<T> for AnyOverlap<'_, T> {
     }
 }
 
-/// Brute-force reference using the scalar ops directly — exact same arithmetic, so the
-/// SIMD path must agree bit-for-bit (the kernel uses no FMA).
+/// Brute-force reference with the exact same arithmetic, so the SIMD path must agree bit-for-bit
+/// (the kernel uses no FMA).
 fn naive<T: FloatScalar>(rows: &[[T; 4]], q: [T; 4]) -> bool {
     rows.iter().any(|s| {
         let dx = q[0] - s[0];

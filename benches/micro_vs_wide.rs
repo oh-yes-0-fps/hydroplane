@@ -1,22 +1,13 @@
-//! Micro-kernel (`#[kernel]`, cached dispatch) vs hand-written `wide` SIMD vs a scalar loop, for a
-//! small `f32` dot product across sizes. The interesting regime is small `N`: there the per-call
-//! dispatch + `#[target_feature]` call boundary competes with `wide`'s inlined portable SIMD.
-//!
-//!   cargo bench --bench micro_vs_wide
-//!   RUSTFLAGS="-C target-cpu=native" cargo bench --bench micro_vs_wide   # lets the backend inline
-//!
-//! On aarch64 the dispatched backend is NEON, which is baseline, so hydroplane's ops inline even
-//! without `target-cpu=native`; on x86 a generic build keeps them behind the call boundary (where
-//! `wide`, compiled at the SSE2 baseline, runs fully inlined) until you pass `target-cpu=native`.
+//! `#[kernel]` dispatch vs hand-written `wide` SIMD vs scalar, for a small-`N` f32 dot product.
+//! On x86 a generic build keeps hydroplane's ops behind the `#[target_feature]` call boundary;
+//! pass RUSTFLAGS="-C target-cpu=native" to inline them.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hydroplane::{Gang, kernel};
 use std::hint::black_box;
 use wide::{f32x4, f32x8};
 
-// The drop-in body-runner: `for_each_chunk` inlines the closure once into a branch-free
-// full-register loop (`cnt` constant there, so `load_partial` folds to `load`) and once for the
-// tail — should match `dot_exact`/`dot_opt` despite the uniform `(off, cnt)` body.
+// `for_each_chunk` with one uniform `(off, cnt)` body, inlined separately for full chunks and tail.
 #[kernel]
 fn dot<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     let mut acc = ctx.splat(0.0);
@@ -28,8 +19,7 @@ fn dot<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     acc.reduce_sum()
 }
 
-// `chunks_exact` + `remainder`: the branch-free iterator form of `dot_opt`'s hand-written loop —
-// should close the gap to it (and leave `chunks` behind).
+// `chunks_exact` + `remainder`: iterator form of `dot_opt`'s loop.
 #[kernel]
 fn dot_exact<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     let n = ctx.lanes::<f32>();
@@ -45,16 +35,15 @@ fn dot_exact<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     acc.reduce_sum()
 }
 
-// Naive-looking, but the loop shape is the library's: `zip_fold` does the fixed-stride full-register
-// pass + masked tail internally, so this one expression should compile like `dot_opt`.
+// `zip_fold` does the full-register pass + masked tail internally.
 #[kernel]
 fn dot_fold<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     ctx.zip_fold(a, b, 0.0, 0.0, ctx.splat(0.0), |acc, x, y| acc + x * y)
         .reduce_sum()
 }
 
-// Optimal hand-pattern: a fixed-stride full-register loop bounded by `min(len)` (so both slices are
-// provably in bounds — no per-iteration checks) plus a single masked tail.
+// Hand-written loop: full-register pass bounded by `min(len)` so both slices are provably in
+// bounds, plus a single masked tail.
 #[kernel]
 fn dot_opt<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     let n = ctx.lanes::<f32>();
@@ -73,8 +62,7 @@ fn dot_opt<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     acc.reduce_sum()
 }
 
-// Identical body to `dot_opt`, but `tiny` opts out of the default `noalias` (`#[inline(never)]` `_on`)
-// boundary — measures whether that per-invocation call taxes a tiny scalar-returning kernel.
+// Same body as `dot_opt`; `tiny` opts out of the `noalias` `_on` call boundary.
 #[kernel(tiny)]
 fn dot_opt_tiny<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     let n = ctx.lanes::<f32>();
@@ -93,8 +81,7 @@ fn dot_opt_tiny<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     acc.reduce_sum()
 }
 
-// `wide`, with a buffer-staged masked SIMD tail (`[0.0; 8]` padded, full-width multiply) — the same
-// partial-load strategy as hydroplane's `load_partial`, so both sides are on even ground.
+// `wide` with a buffer-staged masked tail, the same partial-load strategy as `load_partial`.
 fn dot_wide(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len().min(b.len());
     let chunks = len / 8;
@@ -117,8 +104,7 @@ fn dot_wide(a: &[f32], b: &[f32]) -> f32 {
     acc.reduce_add()
 }
 
-// Width-matched to hydroplane's NEON backend (4 lanes), to isolate abstraction overhead from the
-// 8-vs-4 lane-count difference. Also a buffer-staged masked SIMD tail.
+// Width-matched to the NEON backend (4 lanes) to isolate abstraction overhead from lane count.
 fn dot_wide4(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len().min(b.len());
     let chunks = len / 4;
@@ -141,9 +127,7 @@ fn dot_wide4(a: &[f32], b: &[f32]) -> f32 {
     acc.reduce_add()
 }
 
-// "f32x16": 16 lanes per step as four *independent* f32x4 accumulators, so four FMA chains run in
-// parallel — the point being to feed a CPU with several NEON pipelines (ILP a single accumulator
-// can't expose). Masked SIMD tail like the others.
+// 16 lanes per step as four independent f32x4 accumulators, so four FMA chains run in parallel.
 fn dot_wide16(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len().min(b.len());
     let mut acc = [f32x4::splat(0.0); 4];
@@ -175,9 +159,8 @@ fn dot_wide16(a: &[f32], b: &[f32]) -> f32 {
     acc.reduce_add()
 }
 
-// Multi-accumulator reduction with `K` chosen from the cached runtime saturation point — the warm
-// path is one atomic load + a match, then the K-unrolled FMA loop. The library equivalent of
-// `dot_wide16`, but with `K` measured per core instead of pinned at four.
+// Multi-accumulator reduction; the unroll factor K is measured per core and cached, rather than
+// pinned at four like `dot_wide16`.
 #[kernel]
 fn dot_zip_reduce<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     ctx.zip_reduce(
@@ -192,8 +175,7 @@ fn dot_zip_reduce<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     .reduce_sum()
 }
 
-// The transparent form: a plain sum kernel. No K, no combine, no fills, no init — `zip_sum` implies
-// all of them and dispatches the cached per-core unroll factor. Should match `dot_zip_reduce`.
+// `zip_sum` implies the init, fills, combine, and unroll factor of `dot_zip_reduce`.
 #[kernel]
 fn dot_sum<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     ctx.zip_sum(a, b, |acc, x, y| x.fma(y, acc))

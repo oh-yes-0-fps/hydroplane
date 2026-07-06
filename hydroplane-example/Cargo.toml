@@ -5,10 +5,10 @@ edition = "2024"
 publish = false
 description = "Paired hydroplane vs hand-rolled (wide / autovectorized) workloads of varying complexity, shared by benches and correctness tests."
 
-# `hydro_analyze` is set by the analysis driver's rustc pass (see build.rs); register it so the
+# `hp_analyze` is set by the analysis driver's rustc pass (see build.rs); register it so the
 # crate-root `register_tool` and the macro-emitted tool attribute don't trip the unexpected-cfg lint.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hydro_analyze)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hp_analyze)'] }
 
 [dependencies]
 hydroplane = { path = "..", features = ["glam", "std"] }
@@ -20,6 +20,11 @@ criterion = { version = "0.8.2", default-features = false, features = ["cargo_be
 
 [[bench]]
 name = "workloads"
+harness = false
+
+# The scalar -> wide -> hand-tuned NEON+ILP -> hydroplane progression from CASE_STUDY.md.
+[[bench]]
+name = "case_study"
 harness = false
 
 [build-dependencies]

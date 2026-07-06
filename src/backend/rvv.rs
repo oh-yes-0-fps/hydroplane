@@ -1,13 +1,9 @@
-//! Scalable RVV backend tokens, one per vector byte-width `C` (`Rvv<16>` = 128-bit, `Rvv<32>` =
-//! 256-bit, …). RVV registers are scalable, so the [`Backend::Vector`] is the memory image
-//! [`RvvVec<C>`] and every op is a [`crate::arch::rvv`] primitive — the same design as the SVE
-//! backend ([`crate::backend::sve`]). The byte-width is a const generic because the trait's `Vector`
-//! must be `Sized`; dispatch monomorphizes the kernel for the detected `VLENB` and runs the matching
-//! token. Base "V" has no FP16/bf16 vector ALU (those are the Zvfh/Zvfbfmin extensions), so only
-//! `f32`/`f64` are implemented; `f16`/`bf16` take the scalar path.
+//! Scalable RVV backend tokens, one per vector byte-width `C` (`Rvv<16>` = 128-bit, …).
+//! RVV registers are scalable, so [`Backend::Vector`] is the memory image [`RvvVec<C>`];
+//! `f32`/`f64` only (base "V" has no f16/bf16 vector ALU).
 #![cfg(target_arch = "riscv64")]
-// Constructed only where the "V" extension is present (the dispatch enforces that); on a host
-// without it the token is never built, so its constructors read as dead code there.
+// The constructors read as dead code on a host without the "V" extension; dispatch never builds
+// the token there.
 #![allow(dead_code)]
 
 use crate::arch::rvv::{self, RvvVec};

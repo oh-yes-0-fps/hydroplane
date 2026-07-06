@@ -46,7 +46,7 @@ impl<T: FloatScalar> Kernel<T> for Helpers<'_, T> {
             x.le(y)
         });
 
-        // N-column (3) any/all — active-masked tail, no sentinel fills.
+        // N-column any/all: active-masked tail, no sentinel fills.
         let ten = g.splat(T::from_f64(10.0));
         let any_n = g.any_n([a, b, c], |[x, y, z]| (x + y + z).gt(g.splat(three)));
         let all_n = g.all_n([a, b, c], |[x, y, z]| (x + y + z).lt(ten));

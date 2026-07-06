@@ -1,10 +1,6 @@
 //! Hand-written AVX-512F backend for `x86_64` (16-wide f32, 8-wide f64).
-//!
-//! Unlike the 128/256-bit backends, comparisons here produce `k`-mask registers
-//! (`__mmask16`/`__mmask8`, which are `u16`/`u8`), so mask ops are plain integer bit ops
-//! and `select` is `_mm512_mask_blend`. Horizontal reductions use the hardware
-//! `_mm512_reduce_*` sequences. AVX-512F includes FMA. The [`Avx512`] token must only
-//! exist on a CPU with `avx512f` (see [`Avx512::detect`]).
+//! Comparisons produce `k`-mask registers (`__mmask16`/`__mmask8`), so mask ops are plain
+//! integer bit ops.
 #![allow(unsafe_op_in_unsafe_fn)]
 
 #[cfg(target_arch = "x86")]
@@ -19,8 +15,8 @@ use crate::backend::Backend;
 pub struct Avx512(());
 
 impl Avx512 {
-    // Unused once the build's baseline statically guarantees avx512f (x86-64-v4 / native):
-    // dispatch then pins the backend branchlessly via `new_unchecked` with no runtime check.
+    // Dead when the build baseline statically guarantees avx512f (x86-64-v4 / native); dispatch
+    // then uses `new_unchecked`.
     #[cfg(feature = "std")]
     #[allow(dead_code)]
     #[inline]
@@ -33,8 +29,8 @@ impl Avx512 {
     }
     /// # Safety
     /// The CPU must support `avx512f`.
-    // Used only by the statically-pinned and no-std dispatch paths; on a std build the
-    // backend is always reached through runtime `detect`, leaving this constructor unused.
+    // Used only by the statically-pinned and no-std dispatch paths; std builds go through
+    // runtime `detect`.
     #[allow(dead_code)]
     #[inline]
     pub const unsafe fn new_unchecked() -> Self {
@@ -242,8 +238,8 @@ impl Backend<f32> for Avx512 {
     }
     #[inline(always)]
     fn reduce_min(self, v: __m512) -> f32 {
-        // minimumNumber fold: NaN lanes must not poison (or win) the reduction, so quiet them to
-        // the identity first; an all-NaN register still reduces to NaN.
+        // NaN lanes must not win the fold: quiet them to the identity first. All-NaN still
+        // reduces to NaN.
         unsafe {
             let nan = _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(v, v);
             if nan == 0xffff {
@@ -294,7 +290,6 @@ unsafe fn z_add(a: __m512, b: __m512) -> __m512 {
 unsafe fn z_sub(a: __m512, b: __m512) -> __m512 {
     _mm512_sub_ps(a, b)
 }
-/// Native `vandps`-class abs (`_mm512_abs_ps`), one op vs `max(a, -a)`.
 #[target_feature(enable = "avx512f")]
 #[inline]
 unsafe fn z_abs(a: __m512) -> __m512 {
@@ -323,8 +318,8 @@ unsafe fn z_sqrt(a: __m512) -> __m512 {
 #[target_feature(enable = "avx512f")]
 #[inline]
 unsafe fn z_min(a: __m512, b: __m512) -> __m512 {
-    // IEEE minimumNumber: `vminps` already yields `b` when `a` is NaN; the masked move patches
-    // the b-is-NaN case (bare `vminps` would return the NaN).
+    // IEEE minimumNumber: `vminps` yields `b` when `a` is NaN; the masked move patches the
+    // b-is-NaN case.
     let m = _mm512_min_ps(a, b);
     _mm512_mask_mov_ps(m, _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(b, b), a)
 }
@@ -806,7 +801,6 @@ unsafe fn zd_add(a: __m512d, b: __m512d) -> __m512d {
 unsafe fn zd_sub(a: __m512d, b: __m512d) -> __m512d {
     _mm512_sub_pd(a, b)
 }
-/// Native `_mm512_abs_pd`, one op vs `max(a, -a)`.
 #[target_feature(enable = "avx512f")]
 #[inline]
 unsafe fn zd_abs(a: __m512d) -> __m512d {
@@ -855,9 +849,8 @@ unsafe fn zd_blend(m: __mmask8, a: __m512d, b: __m512d) -> __m512d {
     _mm512_mask_blend_pd(m, a, b)
 }
 
-// `bf16` on AVX-512: `f32x16` widen-compute-narrow (scalar boundary conversions; bf16 has no
-// native ALU). `Mask = __mmask16` (k-register), as on the f32 path. This is the element-wise
-// substrate the AVX512-VNNI (`vdpbf16ps`) and AMX matmul fast paths build on.
+// bf16: f32x16 widen-compute-narrow with scalar boundary conversions (bf16 has no native ALU
+// here). Masks are k-registers, as on the f32 path.
 mod bf16_impl {
     use super::*;
     use crate::backend::Backend;
@@ -1017,10 +1010,8 @@ mod bf16_impl {
     }
 }
 
-// `f16` on AVX-512 (without AVX-512-FP16): `f32x16` widen-compute-narrow, but with hardware
-// `vcvtph2ps`/`vcvtps2ph` boundary conversion (zmm forms are AVX-512F, no F16C needed) instead of
-// bf16's scalar loop. 16 lanes — double the 8-wide AVX2 F16C path that AVX-512-without-FP16 hosts
-// (Cascade Lake / Ice Lake / Zen 4) otherwise fall back to. `Mask = __mmask16` as on f32.
+// f16 without AVX-512-FP16: f32x16 widen-compute-narrow with hardware `vcvtph2ps`/`vcvtps2ph`
+// at the boundary (the zmm forms are AVX-512F, no F16C needed).
 mod f16_impl {
     use super::*;
     use crate::backend::Backend;

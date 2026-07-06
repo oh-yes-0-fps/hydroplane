@@ -1,8 +1,4 @@
-//! `Σ |xᵢ|` — the L1 norm (BLAS `sasum`). A single-input reduction with one absolute value and one
-//! add per element, so it is memory-bound like [`dot`](crate::dot) but even lighter on arithmetic;
-//! the accumulation dependency again makes instruction-level parallelism the deciding factor. The
-//! hand-rolled `wide` baseline deliberately keeps a single accumulator chain, leaving the ILP for
-//! hydroplane's runtime unroll to supply.
+//! `Σ |xᵢ|` reduction (BLAS `sasum`): memory-bound, ILP-dominated.
 
 use hydroplane::{Gang, kernel};
 use wide::f32x8;
@@ -18,7 +14,7 @@ pub fn asum_hp<'a>(ctx: Gang, x: &'a [f32]) -> f32 {
     ctx.sum(x, |acc, v| acc + v.abs())
 }
 
-/// One f32x8 accumulator (8 lanes/iter) — a single chain, no manual ILP, plus a scalar tail.
+/// One f32x8 accumulator: a single chain, no manual ILP, plus a scalar tail.
 pub fn asum_wide(x: &[f32]) -> f32 {
     let n = x.len();
     let mut acc = f32x8::splat(0.0);

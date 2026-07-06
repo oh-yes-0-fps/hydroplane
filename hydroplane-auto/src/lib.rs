@@ -1,31 +1,18 @@
-//! Build-time MIR analysis for hydroplane `#[kernel]`s.
-//!
-//! Two halves, both here so the whole pipeline lives in one crate:
-//!
-//! * [`analysis`] — the decision logic the `#[kernel]` macro calls at expansion: it reads the metrics
-//!   file (via the `HYDRO_ANALYSIS` env var the build script sets) and turns a kernel's measured
-//!   metrics into codegen choices (`k_cap`, `noalias`). All the thresholds live there.
-//! * [`build_script`] — the orchestration a downstream crate's `build.rs` calls. It runs the nightly
-//!   StableMIR driver (embedded under `driver/`, written out and compiled on the pinned nightly) as a
-//!   `RUSTC_WORKSPACE_WRAPPER` over a marker-gated nested build, writes one line of metrics per kernel,
-//!   and points `HYDRO_ANALYSIS` at it.
-//!
-//! Downstream setup (see `hydroplane-example`): a `build.rs` of `fn main() {
-//! hydroplane_auto::build_script(); }`, a `[build-dependencies] hydroplane-auto` entry, the crate-root
-//! `#![cfg_attr(hydro_analyze, feature(register_tool), register_tool(hydro_analyze))]`, and a
-//! `'cfg(hydro_analyze)'` in the crate's `unexpected_cfgs` check-list.
+//! Build-time MIR analysis for hydroplane `#[kernel]`s. A downstream crate's `build.rs` calls
+//! [`build_script`], which runs the nightly StableMIR driver over a nested build, writes one
+//! metrics line per kernel, and points `HYDRO_ANALYSIS` at it for the macro's [`analysis`] lookups.
 
 pub mod analysis;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Pinned nightly for the driver: the one whose `rustc_public` (StableMIR) API the driver is written
-/// against. Bump deliberately, in lockstep with `driver/main.rs`.
+/// Pinned nightly whose `rustc_public` (StableMIR) API the driver is written against. Bump in
+/// lockstep with `driver/main.rs`.
 const TOOLCHAIN: &str = "nightly-2026-06-27";
 
-/// The driver ships as source and is compiled at build time (a crate doing `extern crate rustc_driver`
-/// must be the final linked artifact, so it can't be a library dependency).
+/// The driver ships as source and is compiled at build time: a crate doing `extern crate
+/// rustc_driver` must be the final linked artifact, so it can't be a library dependency.
 const DRIVER_MAIN: &str = include_str!("../driver/main.rs");
 const DRIVER_CARGO: &str = "\
 [package]
@@ -52,8 +39,8 @@ components = [\"rustc-dev\", \"llvm-tools\"]
 /// decisions. On a debug build, a non-Unix host, or with `KANALYZE_DISABLE` set, it no-ops and the
 /// macro keeps its defaults.
 pub fn build_script() {
-    // The nested analysis build re-enters this script; bail before doing anything (no recursion, and
-    // crucially no `HYDRO_ANALYSIS` env, so the nested compile uses macro defaults).
+    // The nested analysis build re-enters this script; bail so it neither recurses nor sets
+    // `HYDRO_ANALYSIS` (the nested compile must use macro defaults).
     if std::env::var_os("HYDRO_ANALYZE_INNER").is_some() {
         return;
     }
@@ -151,7 +138,7 @@ fn run_nested_analysis(manifest: &Path, out_dir: &Path, driver: &Path, metrics: 
         .env("HYDRO_ANALYZE_INNER", "1")
         .env("HYDRO_ANALYZE_CRATE", crate_name)
         .env("HYDRO_ANALYSIS_OUT", metrics)
-        .env("CARGO_ENCODED_RUSTFLAGS", "--cfg\u{1f}hydro_analyze")
+        .env("CARGO_ENCODED_RUSTFLAGS", "--cfg\u{1f}hp_analyze")
         .status()
         .expect("failed to run the nested analysis build");
     if !status.success() {
@@ -173,9 +160,9 @@ fn clean_cargo() -> Command {
     c
 }
 
-/// Whether the pinned nightly (with `rustc-dev`) is present. The analysis never installs it —
-/// a build script must not touch the network or mutate global rustup state — it only skips with
-/// a pointer to the install command.
+/// Whether the pinned nightly (with `rustc-dev`) is present. Never installs it: a build script
+/// must not touch the network or mutate rustup state, so the analysis only skips with a pointer
+/// to the install command.
 fn toolchain_installed() -> bool {
     Command::new("rustup")
         .args(["component", "list", "--toolchain", TOOLCHAIN, "--installed"])

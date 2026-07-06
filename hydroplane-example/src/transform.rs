@@ -1,6 +1,4 @@
-//! Batched matrix–vector transform `M·v`, one distinct 3×3 matrix and one vec3 per element. Nine
-//! matrix loads + three vector loads feed nine FMAs producing three outputs — denser arithmetic than
-//! normalize, the natural fit for hydroplane's `Mat3Wide`, mirrored by hand-rolled `wide` and `glam`.
+//! Batched 3×3 `M·v` transform, one matrix and vector per element: moderate, denser arithmetic.
 
 use glam::{Mat3, Vec3};
 use hydroplane::{Gang, kernel};
@@ -25,9 +23,8 @@ pub fn transform_hp<'a>(
     oy: &'a mut [f32],
     oz: &'a mut [f32],
 ) {
-    // Twelve input columns (nine column-major matrix components + the vector's x/y/z) into three
-    // outputs — `M·v` per lane, matching `Mat3Wide::mul_vec3`. `map_cols` drives the full-register
-    // pass, the masked tail, and the ILP; the closure is just the math.
+    // Twelve input columns into three outputs. `map_cols` drives the full-register pass, masked
+    // tail, and ILP; the closure is just the math.
     ctx.map_cols::<f32, 12, 3>(
         [m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], vx, vy, vz],
         [ox, oy, oz],

@@ -3,7 +3,7 @@
 # diff them. The backend is a compile-time choice, so each pass is a separate compilation:
 #
 #   1. default build              → Apple Accelerate (cblas → AMX/SME), saved as baseline "accelerate"
-#   2. `--cfg no_apple_accelerate` → hydroplane's hand-rolled SME2 grid kernel, compared vs that baseline
+#   2. `--cfg hp_no_apple_accelerate` → hydroplane's hand-rolled SME2 grid kernel, compared vs that baseline
 #
 # Criterion prints the per-size % change of the SME path against Accelerate (with p-values). Any extra
 # args are forwarded to criterion, e.g. a quick pass:
@@ -17,5 +17,5 @@ echo "==> [1/2] Apple Accelerate (default cfg) — saving baseline 'accelerate'"
 "${BENCH[@]}" "$@" --save-baseline accelerate
 
 echo
-echo "==> [2/2] hand-rolled SME (--cfg no_apple_accelerate) — comparing vs 'accelerate'"
-RUSTFLAGS="--cfg no_apple_accelerate" "${BENCH[@]}" "$@" --baseline accelerate
+echo "==> [2/2] hand-rolled SME (--cfg hp_no_apple_accelerate) — comparing vs 'accelerate'"
+RUSTFLAGS="--cfg hp_no_apple_accelerate" "${BENCH[@]}" "$@" --baseline accelerate

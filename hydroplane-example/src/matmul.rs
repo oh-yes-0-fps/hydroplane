@@ -1,12 +1,9 @@
-//! Example **matrix** kernels — `#[kernel(matrix)]` gives the context a `MatrixBackend`, so `ctx.tiles()`
-//! opens the tiled matrix-multiply surface (`load_a`/`load_b`/`mma`/`store`) on top of the ordinary
-//! vector ops. Everything is `f32` here (so `T::Compute` is just `f32`); the shapes are compile-time
-//! const generics, the natural fit for the fixed tile sizes GEMM microkernels are built from.
+//! `#[kernel(matrix)]` GEMM kernels: the tiled `ctx.tiles()` surface
+//! (`load_a`/`load_b`/`mma`/`store`) with const-generic shapes.
 
 use hydroplane::{Gang, Layout, kernel};
 
-/// Plain `C = A·B` for an `M×K` times `K×N` product, all contiguous row-major. The whole kernel is:
-/// load the two operands, multiply-accumulate into a zeroed accumulator, store the result.
+/// Plain `C = A·B` for an `M×K` times `K×N` product, all contiguous row-major.
 #[kernel(matrix)]
 pub fn gemm<'a, const M: usize, const N: usize, const K: usize>(
     ctx: Gang,
@@ -20,9 +17,8 @@ pub fn gemm<'a, const M: usize, const N: usize, const K: usize>(
     tl.mma::<M, N, K>(a, b, tl.zero_acc::<M, N>()).store_rm(out);
 }
 
-/// A neural-net **linear layer**: `Y = X·W + bias`, `X` is `M×K`, `W` is `K×N`, `bias` is `M×N`.
-/// The bias becomes the *accumulator* — `mma` computes `A·B + C` in one shot, so a fused bias-add is
-/// free (`load_acc_rm` instead of `zero_acc`).
+/// Linear layer: `Y = X·W + bias`. The bias becomes the accumulator (`load_acc_rm` instead of
+/// `zero_acc`), so the bias-add is fused into `mma`.
 #[kernel(matrix)]
 pub fn linear<'a, const M: usize, const N: usize, const K: usize>(
     ctx: Gang,
@@ -37,10 +33,9 @@ pub fn linear<'a, const M: usize, const N: usize, const K: usize>(
     tl.mma::<M, N, K>(x, w, tl.load_acc_rm::<M, N>(bias)).store_rm(out);
 }
 
-/// Tiled GEMM with a **K-accumulation loop** — the real microkernel shape. `A` is `M×k_total` and `B`
-/// is `k_total×N` (row-major); the product is summed over `k_total / KT` tiles of the contraction
-/// dimension, threading one accumulator across the `mma` calls. Each `A` sub-tile is a strided column
-/// slice (`row_stride = k_total`); each `B` sub-tile is a contiguous row block.
+/// Tiled GEMM with a K-accumulation loop. The product is summed over `k_total / KT` tiles of the
+/// contraction dimension, threading one accumulator across the `mma` calls. Each `A` sub-tile is a
+/// strided column slice (`row_stride = k_total`); each `B` sub-tile is a contiguous row block.
 #[kernel(matrix)]
 pub fn gemm_ktiled<'a, const M: usize, const N: usize, const KT: usize>(
     ctx: Gang,
@@ -61,9 +56,9 @@ pub fn gemm_ktiled<'a, const M: usize, const N: usize, const KT: usize>(
     acc.store_rm(out);
 }
 
-/// Matrix **and** vector surface on one context: compute `C = A·B`, store it, then reduce the result
-/// with an ordinary `sum` — all on the *same* `ctx`. Because `MatrixBackend<f32>: Backend<f32>`, the
-/// matrix context does vector ops too, which is why a separate `vector` handle is unnecessary.
+/// Matrix and vector surface on one context: compute `C = A·B`, store it, then reduce the result
+/// with an ordinary `sum`. `MatrixBackend<f32>: Backend<f32>`, so the matrix context does vector
+/// ops too.
 #[kernel(matrix)]
 pub fn gemm_sum<'a, const M: usize, const N: usize, const K: usize>(
     ctx: Gang,
@@ -78,7 +73,7 @@ pub fn gemm_sum<'a, const M: usize, const N: usize, const K: usize>(
     ctx.sum(out, |acc, v| acc + v)
 }
 
-/// Scalar reference for `C = A·B` (`M×K · K×N`, row-major) — the correctness oracle.
+/// Scalar reference for `C = A·B` (`M×K · K×N`, row-major).
 pub fn gemm_scalar<const M: usize, const N: usize, const K: usize>(a: &[f32], b: &[f32], out: &mut [f32]) {
     for i in 0..M {
         for j in 0..N {
@@ -111,7 +106,7 @@ mod tests {
         gemm::<M, N, K>(&a, &b, &mut got);
         assert!(crate::max_rel_err(&got, &want) < 1e-3, "gemm");
 
-        // K-tiled (KT=5 == K -> a single tile) must match too.
+        // K-tiled with KT == K, a single tile.
         let mut gk = vec![0.0f32; M * N];
         gemm_ktiled::<M, N, K>(&a, &b, K, &mut gk);
         assert!(crate::max_rel_err(&gk, &want) < 1e-3, "gemm_ktiled");

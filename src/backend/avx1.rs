@@ -1,20 +1,5 @@
-//! Hand-written AVX (AVX1) backend for `x86_64`.
-//!
-//! The tier between SSE4 and AVX2: 256-bit *float* SIMD on the first AVX cores (Sandy/Ivy Bridge,
-//! AMD Bulldozer) that have neither AVX2's 256-bit integer unit nor FMA. `Backend<f32>` uses
-//! `__m256` (8 lanes); `Backend<f64>` uses `__m256d` (4 lanes). Every op is a
-//! `#[target_feature(enable = "avx")]` body, so the unsafety is confined here and justified by the
-//! single invariant: an [`Avx1`] token only exists when the running CPU has AVX (enforced by
-//! [`Avx1::detect`] / [`Avx1::new_unchecked`]).
-//!
-//! Without the FMA extension, [`fma`](Backend::fma) is a separate multiply then add — the same
-//! unfused two-rounding form the scalar oracle uses by default, so the differential tests hold
-//! exactly rather than within the fused-op tolerance. `f16`/`bf16` ride the wider AVX2 backend
-//! ([`super::avx2`]); this tier serves only `f32`/`f64`.
-//!
-//! Every free fn below is an `unsafe fn` whose body is wholly composed of `#[target_feature]`
-//! intrinsics; we opt out of the edition-2024 `unsafe_op_in_unsafe_fn` requirement for the
-//! whole module rather than wrapping each one-line body in its own `unsafe {}`.
+//! Hand-written AVX (AVX1) backend for `x86_64` (8-wide f32, 4-wide f64), `f32`/`f64` only.
+//! No FMA at this tier: [`fma`](Backend::fma) is an unfused multiply then add.
 #![allow(unsafe_op_in_unsafe_fn)]
 
 #[cfg(target_arch = "x86")]
@@ -31,8 +16,7 @@ pub struct Avx1(());
 
 impl Avx1 {
     /// Returns an [`Avx1`] token iff the current CPU supports AVX.
-    // Unused once the build's baseline statically guarantees avx: dispatch then takes the backend
-    // branchlessly via `new_unchecked` instead of detecting it.
+    // Dead when the build baseline statically guarantees avx; dispatch then uses `new_unchecked`.
     #[cfg(feature = "std")]
     #[allow(dead_code)]
     #[inline]
@@ -47,9 +31,7 @@ impl Avx1 {
     /// # Safety
     /// The caller guarantees the running CPU supports `avx`. Calling any [`Backend`] method on a
     /// token built this way on an unsupported CPU is UB.
-    // Used by the no-std path and by any std build whose baseline already guarantees avx (the
-    // branchless floor); unused only on a std build with no avx guarantee, where the backend is
-    // reached through runtime `detect`.
+    // Dead only on a std build with no static avx guarantee, which goes through runtime `detect`.
     #[allow(dead_code)]
     #[inline]
     pub const unsafe fn new_unchecked() -> Self {
@@ -234,14 +216,13 @@ unsafe fn f32_div(a: __m256, b: __m256) -> __m256 {
 unsafe fn f32_neg(a: __m256) -> __m256 {
     _mm256_xor_ps(a, _mm256_set1_ps(-0.0))
 }
-/// Clear the sign bit — a single `andps`, cheaper than `max(a, -a)`.
+/// Clear the sign bit: one `andps`, cheaper than `max(a, -a)`.
 #[target_feature(enable = "avx")]
 #[inline]
 unsafe fn f32_abs(a: __m256) -> __m256 {
     _mm256_and_ps(a, _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF)))
 }
-/// No FMA extension at this tier: a plain multiply then add (two roundings), matching the scalar
-/// oracle's default unfused `fma`.
+/// No FMA at this tier: multiply then add (two roundings), matching the scalar oracle.
 #[target_feature(enable = "avx")]
 #[inline]
 unsafe fn f32_fma(a: __m256, b: __m256, c: __m256) -> __m256 {
@@ -255,8 +236,7 @@ unsafe fn f32_sqrt(a: __m256) -> __m256 {
 #[target_feature(enable = "avx")]
 #[inline]
 unsafe fn f32_min(a: __m256, b: __m256) -> __m256 {
-    // IEEE minimumNumber: `vminps` already yields `b` when `a` is NaN; blend patches the
-    // b-is-NaN case (bare `vminps` would return the NaN).
+    // IEEE minimumNumber: `vminps` yields `b` when `a` is NaN; the blend patches the b-is-NaN case.
     let m = _mm256_min_ps(a, b);
     _mm256_blendv_ps(m, a, _mm256_cmp_ps::<_CMP_UNORD_Q>(b, b))
 }
@@ -501,13 +481,13 @@ unsafe fn f64_div(a: __m256d, b: __m256d) -> __m256d {
 unsafe fn f64_neg(a: __m256d) -> __m256d {
     _mm256_xor_pd(a, _mm256_set1_pd(-0.0))
 }
-/// Clear the sign bit — a single `andpd`, cheaper than `max(a, -a)`.
+/// Clear the sign bit: one `andpd`, cheaper than `max(a, -a)`.
 #[target_feature(enable = "avx")]
 #[inline]
 unsafe fn f64_abs(a: __m256d) -> __m256d {
     _mm256_and_pd(a, _mm256_castsi256_pd(_mm256_set1_epi64x(0x7FFF_FFFF_FFFF_FFFF)))
 }
-/// No FMA extension at this tier: a plain multiply then add, matching the scalar oracle.
+/// No FMA at this tier: multiply then add, matching the scalar oracle.
 #[target_feature(enable = "avx")]
 #[inline]
 unsafe fn f64_fma(a: __m256d, b: __m256d, c: __m256d) -> __m256d {
@@ -587,9 +567,8 @@ unsafe fn f64_reduce<const OP: i32>(v: __m256d) -> f64 {
     _mm_cvtsd_f64(r)
 }
 
-// Elements AVX1 has no native lanes for (256-bit integer ops are AVX2; f16/bf16 have no AVX1
-// ALU): correctness-only emulation so the token satisfies `BackendAll` when a kernel mixes
-// these elements in. Their own dispatch ladders never pick Avx1.
+// Correctness-only emulation so the token satisfies `BackendAll`; the dispatch ladders for
+// these elements never pick Avx1.
 crate::backend::emulated_float_element!(Avx1, half::f16, 8);
 crate::backend::emulated_float_element!(Avx1, half::bf16, 8);
 crate::backend::emulated_int_element!(Avx1, u32, 8);

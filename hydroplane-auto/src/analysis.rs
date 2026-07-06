@@ -1,10 +1,6 @@
-//! Build-time analysis feed. When the analysis build script has run, it writes one line of MIR-derived
-//! metrics per kernel and points the `HYDRO_ANALYSIS` env var at the file (`<path>#<content-hash>`,
-//! the hash forcing re-expansion when the metrics change). At expansion the macro looks this kernel up
-//! by name and turns raw metrics into codegen decisions. When the env var is absent — an ordinary
-//! build, or the driver's own analysis compile — every lookup misses and the macro keeps its defaults.
-//!
-//! All the thresholds live here so the policy is tunable in one place; the driver only measures.
+//! Turns per-kernel MIR metrics into codegen choices at macro expansion, looking kernels up by
+//! name in the file `HYDRO_ANALYSIS` points at (absent on ordinary builds, so lookups miss and the
+//! macro keeps its defaults). All thresholds live here; the driver only measures.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -23,13 +19,13 @@ pub struct Metrics {
     pub calls: u64,
     /// Total MIR statements of the `_on` body — overall (non-closure) body size.
     pub stmts: u64,
-    /// Statement count including the kernel's combinator closures (the `|acc,v| …` step bodies) — an
-    /// arithmetic-intensity proxy. A compute-bound step already saturates the FP units on one chain,
-    /// so extra unrolled chains only add load/address overhead; high compute ⇒ cap K low.
+    /// Statement count including the kernel's combinator closures (the `|acc,v| …` step bodies), an
+    /// arithmetic-intensity proxy: a compute-bound step saturates the FP units on one chain, so
+    /// high compute caps K low.
     pub compute: u64,
-    /// Element-type bitmask (`Scalar::TYPE_BITS` values) the kernel's MIR actually touches —
-    /// `Varying`/`Backend` usages, seen through generics and helper calls, so it is tighter than
-    /// the macro's token scan. `0` when the driver predates this field or found nothing.
+    /// Element-type bitmask (`Scalar::TYPE_BITS` values) the kernel's MIR actually touches, seen
+    /// through generics and helper calls, so tighter than the macro's token scan. `0` when the
+    /// driver predates this field or found nothing.
     pub types: u64,
 }
 
@@ -39,18 +35,12 @@ const TINY_STMTS: u64 = 24;
 /// At or above this many memory ops the kernel is memory-bound and wants the `noalias` boundary so
 /// LLVM can cluster and reorder its loads/stores.
 const MEM_THRESH: u64 = 4;
-/// Vector registers available to hold `K` unrolled accumulator chains (of 32, holding some back for
-/// addresses/scratch). `K` is capped so `K × live-values` fits.
-/// The one knob for the unroll cap: `K ≈ BUDGET / compute-intensity`, where compute-intensity is the
-/// statements reachable from the kernel body (its `_on` body, its combinator closures, and the
-/// non-kernel helpers they call — folded by the driver). This single signal captures both effects
-/// that bound `K`: a heavy body is both register-hungrier (more live values per chain) and more
-/// throughput-bound (extra chains stop paying once the FP units saturate), so both push `K` down
-/// together. A lean reduction step (`l2norm`, ~12) keeps a high `K` to hide latency; a degree-8
-/// Horner (~66–103) drops to one or two chains; a dense map (`cmul`/`mat3`, ~300+) collapses to 1.
-/// Calibrated against the benchmark suite on aarch64. It replaces an earlier register-count proxy
-/// that was blind to varyings living in a combinator closure. Where it's off, `#[kernel(unroll = N)]`
-/// overrides it.
+/// The one knob for the unroll cap: `K ≈ BUDGET / compute-intensity`, where compute-intensity is
+/// the statements reachable from the kernel body (its `_on` body, combinator closures, and the
+/// non-kernel helpers they call, folded by the driver). One signal captures both effects that bound
+/// `K`: a heavy body is both register-hungrier and more throughput-bound, so both push `K` down
+/// together. Calibrated against the benchmark suite on aarch64; where it's off,
+/// `#[kernel(unroll = N)]` overrides it.
 const COMPUTE_BUDGET: u64 = 200;
 
 const K_CANDIDATES: [u64; 5] = [1, 2, 4, 8, 16];
@@ -128,7 +118,7 @@ fn parse_line(line: &str) -> Option<(String, Metrics)> {
 }
 
 /// The metrics recorded for `name`, or `None` when analysis is unavailable or this kernel was not
-/// measured (e.g. it failed to monomorphize) — in which case the caller keeps its defaults.
+/// measured; the caller then keeps its defaults.
 pub fn lookup(name: &str) -> Option<Metrics> {
     table()?.get(name).copied()
 }

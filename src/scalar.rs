@@ -1,17 +1,10 @@
-//! The "uniform" scalar element abstraction.
-//!
-//! A [`Scalar`] is the smallest float element a kernel operates on: `f32`, `f64`,
-//! and (with the `half` feature) `f16`/`bf16`. Each scalar declares a [`Scalar::Compute`]
-//! type — the precision its math is actually carried out in. For `f32`/`f64` that is the
-//! type itself; for `f16`/`bf16`, which have no useful native arithmetic on most targets,
-//! `Compute = f32` and the scalar ops widen-compute-narrow. Keeping that policy *here*
-//! (not in each backend) is what makes the scalar (1-lane) backend a faithful oracle for
-//! the widening SIMD path.
+//! The "uniform" scalar element abstraction: [`Scalar`] is the element a kernel operates on.
+//! Each float scalar declares [`FloatScalar::Compute`], the precision its math is carried out
+//! in — the type itself for `f32`/`f64`; `f32` for `f16`/`bf16`, which widen-compute-narrow.
 
-// The CPU's scalar square-root instruction, reached through `core::arch` so it works without `std`
-// (where `f32::sqrt` is unavailable). `sqrtss`/`sqrtsd` on x86-64 (SSE/SSE2 are baseline there);
-// `fsqrt` on aarch64 (mandatory in the base FP ISA). IEEE correctly-rounded — bit-identical to
-// `std`'s `x.sqrt()`, which lowers to the same instruction.
+// The CPU's scalar sqrt instruction, reached through `core::arch` so it works without `std`
+// (where `f32::sqrt` is unavailable). Bit-identical to `std`'s `x.sqrt()`, which lowers to the
+// same instruction.
 #[cfg(all(target_arch = "x86_64", any(test, not(feature = "std"))))]
 #[inline(always)]
 fn hw_sqrt_f32(x: f32) -> f32 {
@@ -50,9 +43,9 @@ fn hw_sqrt_f64(x: f64) -> f64 {
     r
 }
 
-/// Scalar `sqrt`. `std` lowers `x.sqrt()` to the hardware instruction; without `std` we reach that
-/// same instruction through [`hw_sqrt_f32`] on x86-64/aarch64. Only an exotic no-`std` target with no
-/// hardware sqrt falls back to `libm`, or — last resort — a software Newton loop.
+/// Scalar `sqrt`. `std` lowers `x.sqrt()` to the hardware instruction; without `std` we reach the
+/// same instruction through [`hw_sqrt_f32`] on x86-64/aarch64, then `libm`, then as a last resort
+/// a software Newton loop.
 #[inline(always)]
 fn sqrt_f32(x: f32) -> f32 {
     #[cfg(feature = "std")]
@@ -109,9 +102,8 @@ fn sqrt_f64(x: f64) -> f64 {
     }
 }
 
-// Portable Newton fallback — only for a no-`std`, no-`libm` build on a target without a hardware
-// sqrt (the SPIR-V backend lowers `sqrt` via spirv-std and never reaches here). `NaN` for negatives,
-// matching the hardware; `0`/`inf` pass straight through.
+// Newton fallback for no-`std`, no-`libm` targets without hardware sqrt (the SPIR-V backend
+// lowers `sqrt` via spirv-std and never reaches here). `NaN` for negatives; `0`/`inf` pass through.
 #[cfg(all(
     not(feature = "std"),
     not(any(target_arch = "x86_64", target_arch = "aarch64")),
@@ -156,12 +148,11 @@ fn software_sqrt_f64(x: f64) -> f64 {
     g
 }
 
-/// A scalar element a kernel can be generic over — the family-neutral core shared by the
-/// float elements (`f32`/`f64`/`f16`/`bf16`, see [`FloatScalar`]) and the integer elements
-/// (`u32`/`i32`, see [`IntScalar`]). It carries exactly what the generic gang machinery needs:
-/// wrapping-or-IEEE arithmetic via the operator bounds, ordering, identities, `f64` literal
-/// bridging, the 32-bit pattern bridge, and family-correct `min`/`max`/`abs`/`neg` (floats:
-/// IEEE 754-2019 minimumNumber and sign ops; integers: `Ord` and wrapping ops).
+/// A scalar element a kernel can be generic over: the family-neutral core shared by the float
+/// elements (`f32`/`f64`/`f16`/`bf16`, see [`FloatScalar`]) and the integer elements (`u32`/`i32`,
+/// see [`IntScalar`]). Carries what the generic gang machinery needs: wrapping-or-IEEE arithmetic
+/// via the operator bounds, ordering, identities, `f64` literal bridging, the 32-bit pattern
+/// bridge, and family-correct `min`/`max`/`abs`/`neg`.
 pub trait Scalar:
     Copy
     + PartialEq
@@ -176,9 +167,9 @@ pub trait Scalar:
     const ZERO: Self;
     const ONE: Self;
 
-    /// This element's bit in a kernel's *type-combo* bitmask — the set of elements a kernel
-    /// touches, which drives the combo-dispatch tier choice (see
-    /// [`dispatch::combo_tier`](crate::dispatch::combo_tier)).
+    /// This element's bit in a kernel's type-combo bitmask, the set of elements a kernel
+    /// touches, which drives the combo-dispatch tier choice
+    /// ([`dispatch::combo_tier`](crate::dispatch::combo_tier)).
     const TYPE_BITS: u8;
 
     /// Build from an `f64` literal (for in-kernel constants like `4.0`). Truncating for the
@@ -186,10 +177,10 @@ pub trait Scalar:
     fn from_f64(v: f64) -> Self;
     fn into_f64(self) -> f64;
 
-    /// The lane's bit pattern in the low bits of a `u32` — the scalar half of the 32-bit
+    /// The lane's bit pattern in the low bits of a `u32`: the scalar half of the 32-bit
     /// integer-companion bridge ([`Backend::to_bits`](crate::Backend::to_bits)). Exact for
     /// 32-bit elements; `f16`/`bf16` zero-extend their 16 bits; `f64` truncates to the low half
-    /// of its pattern (lossy — bit tricks are 32-bit-element territory).
+    /// of its pattern (lossy; bit tricks are 32-bit-element territory).
     fn to_bits32(self) -> u32;
     /// Inverse of [`to_bits32`](Scalar::to_bits32); for `f64` the high pattern half is zeroed.
     fn from_bits32(v: u32) -> Self;
@@ -501,9 +492,8 @@ mod half_impls {
                 }
             }
 
-            // Math happens in f32 — `half` provides no SIMD arithmetic, and most targets have
-            // no native f16/bf16 ALU. Storage stays 16-bit; the operator and `FloatCore` impls
-            // from `half` widen-compute-narrow the same way.
+            // Math happens in f32: most targets have no native f16/bf16 ALU. Storage stays
+            // 16-bit; `half`'s operator and `FloatCore` impls widen-compute-narrow the same way.
             impl FloatScalar for $ty {
                 type Compute = f32;
                 #[inline(always)]

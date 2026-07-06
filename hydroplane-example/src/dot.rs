@@ -1,6 +1,4 @@
-//! `Σ xᵢ·yᵢ` — a reduction. Memory-bound like saxpy, but the accumulation dependency makes
-//! instruction-level parallelism (multiple independent accumulator chains) the deciding factor,
-//! which is exactly what hydroplane's runtime unroll and the hand-rolled 4×-ILP baseline both target.
+//! `Σ xᵢyᵢ` reduction: memory-bound, ILP-dominated.
 
 use hydroplane::{Gang, kernel};
 use wide::f32x8;
@@ -16,7 +14,7 @@ pub fn dot_hp<'a>(ctx: Gang, x: &'a [f32], y: &'a [f32]) -> f32 {
     ctx.dot(x, y)
 }
 
-/// Four independent f32x8 FMA chains (32 lanes/iter) — the textbook superscalar reduction.
+/// Four independent f32x8 FMA chains (32 lanes/iter), the textbook superscalar reduction.
 pub fn dot_wide(x: &[f32], y: &[f32]) -> f32 {
     let n = x.len();
     let mut acc = [f32x8::splat(0.0); 4];

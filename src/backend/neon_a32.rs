@@ -1,28 +1,17 @@
-//! Hand-written A32 NEON backend for 32-bit ARM (`target_arch = "arm"`): 4-wide `f32` via raw `asm!`.
-//!
-//! Unlike aarch64 (whose `core::arch::aarch64` NEON intrinsics are stable, see
-//! [`crate::backend::neon`]), the 32-bit `core::arch::arm` NEON intrinsics are still unstable, so
-//! this emits A32 NEON instructions directly — each `asm!` opens with `.fpu neon` so the assembler
-//! accepts them on **stable**, the same raw-asm route SME/RVV take on their arches. A NEON register
-//! can't be named in Rust without the intrinsic carrier types, so the [`Backend::Vector`] is the
-//! 16-byte memory image [`F32x4`] and every op round-trips through it.
-//!
-//! **`f32` only.** armv7 NEON has no double-precision vector unit (`f64` is VFP-scalar) and no
-//! native `f16`/`bf16`, so those scalars take the [`ScalarBackend`](crate::ScalarBackend) path. NEON
-//! also lacks a vector divide and sqrt, so `div`/`sqrt` are the per-lane VFP-scalar ops; `fma` is
-//! `vmla.f32` (multiply-accumulate, not IEEE-fused — within the crate's `fma` tolerance). All are
-//! VFPv3-level, so this runs on every NEON armv7 core (Cortex-A8/A9+), not just VFPv4 ones.
+//! Hand-written A32 NEON backend for 32-bit ARM: 4-wide `f32` (only) via raw `asm!`, since the
+//! `core::arch::arm` NEON intrinsics are still unstable. [`Backend::Vector`] is the 16-byte
+//! memory image [`F32x4`].
 #![cfg(target_arch = "arm")]
-// Constructed only where NEON is present (dispatch enforces it via `detect`/`target_feature`); the
-// constructors read as dead code on a NEON-less arm build.
+// The constructors read as dead code on a NEON-less arm build; dispatch only constructs the
+// token where NEON is present.
 #![allow(dead_code, unsafe_op_in_unsafe_fn, clippy::missing_safety_doc)]
 
 use core::arch::asm;
 
 use crate::backend::Backend;
 
-/// The 16-byte memory image of one NEON `q` register: 4 `f32` lanes. Reused as the mask type, where
-/// each lane is `-1` (all-ones) or `0` — the NEON vector-mask convention.
+/// The 16-byte memory image of one NEON `q` register: 4 `f32` lanes. Reused as the mask type,
+/// where each lane is `-1` (all-ones) or `0`, the NEON vector-mask convention.
 #[derive(Clone, Copy)]
 #[repr(C, align(16))]
 pub struct F32x4(pub [f32; 4]);
@@ -47,9 +36,9 @@ impl Neon {
         Neon
     }
 
-    /// `Some(Neon)` if the CPU implements NEON, else `None`. Reads `HWCAP_NEON` (bit 12) from the ELF
-    /// aux vector on Linux (the stable `is_arm_feature_detected!` macro doesn't exist); `None` on
-    /// other OSes — mirrors [`crate::arch::sme1::is_supported`].
+    /// `Some(Neon)` if the CPU implements NEON, else `None`. Reads `HWCAP_NEON` (bit 12) from
+    /// the ELF aux vector on Linux (there is no stable `is_arm_feature_detected!`); `None` on
+    /// other OSes.
     #[cfg(feature = "std")]
     #[inline]
     pub fn detect() -> Option<Self> {
@@ -207,7 +196,6 @@ unsafe fn neg(a: &F32x4) -> F32x4 {
     o
 }
 
-/// Absolute value via `vabs.f32` — a single NEON op, cheaper than `max(a, -a)`.
 #[inline]
 unsafe fn abs(a: &F32x4) -> F32x4 {
     let mut o = F32x4::zeroed();
@@ -242,7 +230,7 @@ unsafe fn fma(a: &F32x4, b: &F32x4, c: &F32x4) -> F32x4 {
     o
 }
 
-/// Vector divide — NEON has none, so per-lane VFP-scalar `vdiv.f32` (`s0..3 / s4..7`).
+/// NEON has no vector divide, so per-lane VFP-scalar `vdiv.f32` (`s0..3 / s4..7`).
 #[inline]
 unsafe fn div(a: &F32x4, b: &F32x4) -> F32x4 {
     let mut o = F32x4::zeroed();
@@ -262,7 +250,7 @@ unsafe fn div(a: &F32x4, b: &F32x4) -> F32x4 {
     o
 }
 
-/// Vector sqrt — NEON has only the imprecise estimate, so per-lane VFP-scalar `vsqrt.f32`.
+/// NEON has only the imprecise sqrt estimate, so per-lane VFP-scalar `vsqrt.f32`.
 #[inline]
 unsafe fn sqrt(a: &F32x4) -> F32x4 {
     let mut o = F32x4::zeroed();
@@ -300,7 +288,7 @@ unsafe fn select(m: &F32x4, a: &F32x4, b: &F32x4) -> F32x4 {
 }
 
 /// Cross-lane unsigned reduction of the mask to lane 0, read out as a GPR. `$op` is `vpmax`
-/// (→ `any`: non-zero if any lane set) or `vpmin` (→ `all`: all-ones only if every lane set).
+/// (`any`: non-zero if any lane set) or `vpmin` (`all`: all-ones only if every lane set).
 macro_rules! mask_reduce {
     ($name:ident, $op:literal) => {
         #[inline]
@@ -324,7 +312,7 @@ macro_rules! mask_reduce {
 mask_reduce!(any_bits, "vpmax.u32");
 mask_reduce!(all_bits, "vpmin.u32");
 
-/// Horizontal float reduction to lane 0. `$pair` folds the two halves then within the half.
+/// Horizontal float reduction to lane 0: `$fold` combines the two halves, then within the half.
 macro_rules! freduce {
     ($name:ident, $fold:literal) => {
         #[inline]
@@ -472,7 +460,7 @@ impl Backend<f32> for Neon {
     }
     #[inline(always)]
     fn reduce_min(self, v: F32x4) -> f32 {
-        // Scalar minimumNumber fold — the pairwise `vpmin.f32` would propagate NaN.
+        // Scalar minimumNumber fold: the pairwise `vpmin.f32` would propagate NaN.
         v.0.iter().copied().fold(f32::NAN, f32::min)
     }
     #[inline(always)]

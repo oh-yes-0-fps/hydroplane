@@ -1,12 +1,6 @@
-//! Runtime-dimensioned dense linear algebra — the BLAS-lite companion to the compile-time tile
-//! surface in [`matrix`](crate::matrix). Where [`Tiles`](crate::matrix::Tiles) fixes `M`/`N`/`K` at
-//! compile time (right for GEMM microkernels and batched-small products), the operations here take
-//! their shapes at runtime, as an iterative solver's `y = A·x` or a mesh-sized factorization must.
-//!
-//! Every routine routes to Apple Accelerate where present and otherwise runs a fallback built
-//! entirely on the SIMD backend ([`Gang`]/[`Varying`](crate::Varying)) — so the non-Accelerate path
-//! vectorizes across whatever ISA the runtime detects (AVX-512/AVX2/NEON/SVE/RVV) rather than
-//! leaning on hand-written per-target code.
+//! Runtime-dimensioned dense linear algebra (the compile-time tile counterpart is
+//! [`matrix`](crate::matrix)). Every routine goes to Apple Accelerate where present, otherwise
+//! to a fallback built on the SIMD backend ([`Gang`]/[`Varying`](crate::Varying)).
 
 use crate::dispatch::{Kernel, SimdDispatch, dispatch};
 use crate::matrix::Layout;
@@ -56,8 +50,8 @@ pub struct Mat<'a, T> {
     layout: Layout,
 }
 
-/// The mutable counterpart of [`Mat`] — the read-modify-written output matrix of `gemm`/`syrk`/
-/// `trsm`/`potrf` (available with the `alloc` feature; the vector-output ops write plain `&mut [T]`).
+/// The mutable counterpart of [`Mat`]: the output matrix of `gemm`/`syrk`/`trsm`/`potrf`
+/// (available with the `alloc` feature; the vector-output ops write plain `&mut [T]`).
 #[cfg(feature = "alloc")]
 pub struct MatMut<'a, T> {
     data: &'a mut [T],
@@ -75,7 +69,7 @@ impl<'a, T> Mat<'a, T> {
         Mat { data, rows, cols, stride: cols, layout: Layout::RowMajor }
     }
 
-    /// A view with an explicit leading stride and layout — a sub-matrix of a larger buffer, or
+    /// A view with an explicit leading stride and layout: a sub-matrix of a larger buffer, or
     /// column-major data.
     #[inline]
     pub fn strided(data: &'a [T], rows: usize, cols: usize, stride: usize, layout: Layout) -> Self {
@@ -173,10 +167,9 @@ impl<'a, T: Copy> MatMut<'a, T> {
     }
 }
 
-/// General matrix–vector product `y := α·op(A)·x + β·y`, where `op(A)` is `A` (`Trans::N`) or `Aᵀ`
-/// (`Trans::T`). Memory-bound — no packing pass — so on Apple it routes to `cblas_*gemv` and
-/// otherwise to a fully-vectorized gang kernel that never gathers: whichever of the operated rows
-/// or columns is contiguous in memory drives the reduction.
+/// General matrix–vector product `y := α·op(A)·x + β·y`, where `op(A)` is `A` (`Trans::N`) or
+/// `Aᵀ` (`Trans::T`). Routes to `cblas_*gemv` on Apple, otherwise to a gang kernel that never
+/// gathers: whichever of the operated rows or columns is contiguous drives the reduction.
 pub fn gemv<T: FloatScalar + SimdDispatch>(
     trans: Trans,
     alpha: T,
@@ -195,7 +188,7 @@ pub fn gemv<T: FloatScalar + SimdDispatch>(
         return;
     }
 
-    #[cfg(all(target_vendor = "apple", not(no_apple_accelerate)))]
+    #[cfg(all(target_vendor = "apple", not(hp_no_apple_accelerate)))]
     if accel_gemv(trans, alpha, a, x, beta, y) {
         return;
     }
@@ -203,7 +196,7 @@ pub fn gemv<T: FloatScalar + SimdDispatch>(
     dispatch::<T, _>(GemvK { trans, alpha, a, x, beta, y });
 }
 
-#[cfg(all(target_vendor = "apple", not(no_apple_accelerate)))]
+#[cfg(all(target_vendor = "apple", not(hp_no_apple_accelerate)))]
 fn accel_gemv<T: FloatScalar>(
     trans: Trans,
     alpha: T,
@@ -266,9 +259,9 @@ impl<'a, T: FloatScalar> Kernel<T> for GemvK<'a, T> {
         let GemvK { trans, alpha, a, x, beta, y } = self;
         let op_t = trans == Trans::T;
         let col_major = a.layout == Layout::ColMajor;
-        // The operated rows are contiguous exactly when un-transposed row-major, or transposed
-        // column-major — reduce per output element. Otherwise the operated columns are contiguous
-        // and we accumulate them axpy-style.
+        // Operated rows are contiguous exactly when un-transposed row-major or transposed
+        // col-major: reduce per output element. Otherwise accumulate the contiguous columns
+        // axpy-style.
         let dot_form = op_t == col_major;
         let (op_rows, op_cols) = if op_t { (a.cols, a.rows) } else { (a.rows, a.cols) };
 
@@ -290,8 +283,8 @@ impl<'a, T: FloatScalar> Kernel<T> for GemvK<'a, T> {
     }
 }
 
-/// `α·d + β·y`, honoring the BLAS rule that `β = 0` means `y` is written, not read (so a `NaN` in an
-/// uninitialized `y` doesn't poison the result).
+/// `α·d + β·y`, honoring the BLAS rule that `β = 0` writes `y` without reading it (a `NaN` in an
+/// uninitialized `y` must not poison the result).
 #[inline]
 fn fma_scalar<T: FloatScalar>(alpha: T, d: T, beta: T, y: T) -> T {
     if beta.into_f64() == 0.0 {
@@ -319,8 +312,8 @@ fn scale<T: Scalar>(y: &mut [T], beta: T) {
     }
 }
 
-/// Frobenius norm `√Σ Aᵢⱼ²` — the convergence-check / preconditioner primitive. Sums squares along
-/// whichever axis is contiguous, so the walk is a plain gang reduction regardless of layout.
+/// Frobenius norm `√Σ Aᵢⱼ²`. Sums squares along whichever axis is contiguous, so the walk is a
+/// plain gang reduction regardless of layout.
 pub fn fro_norm<T: FloatScalar + SimdDispatch>(a: Mat<T>) -> T {
     T::sqrt(dispatch::<T, _>(FroK { a }))
 }
@@ -348,7 +341,7 @@ impl<'a, T: FloatScalar> Kernel<T> for FroK<'a, T> {
     }
 }
 
-/// Row sums `outᵣ = Σ_c Aᵣ_c` — the diagonal/Jacobi-preconditioner primitive.
+/// Row sums `outᵣ = Σ_c Aᵣ_c`.
 pub fn row_sums<T: FloatScalar + SimdDispatch>(a: Mat<T>, out: &mut [T]) {
     assert_eq!(out.len(), a.rows, "row_sums: out length mismatch");
     dispatch::<T, _>(AxisSumK { a, out, along_rows: true });
@@ -371,9 +364,8 @@ impl<'a, T: FloatScalar> Kernel<T> for AxisSumK<'a, T> {
 
     fn run<S: BackendAll + Backend<T>>(self, simd: Gang<S>) {
         let AxisSumK { a, out, along_rows } = self;
-        // Reducing along rows wants each row contiguous (row-major); along columns wants each column
-        // contiguous (col-major). When memory already lays the reduced axis out contiguously, each
-        // output is one gang reduction; otherwise we accumulate the strided lines vector-wise.
+        // When the reduced axis is contiguous in memory each output is one gang reduction;
+        // otherwise accumulate the strided lines vector-wise.
         let reduce_contiguous = along_rows == (a.layout == Layout::RowMajor);
         let (out_len, line_len) = if along_rows { (a.rows, a.cols) } else { (a.cols, a.rows) };
 
@@ -413,12 +405,11 @@ fn flip(t: Trans) -> Trans {
     }
 }
 
-/// General matrix–matrix product `C := α·op(A)·op(B) + β·C`, where each `op` is identity (`Trans::N`)
-/// or transpose (`Trans::T`) applied without materializing the transpose. Row-major `C` on Apple
-/// routes to `cblas_*gemm`; otherwise a register-blocked gang microkernel streams the contraction
-/// over a packed `B` panel. A column-major `C` is handled by computing the transposed product
-/// `Cᵀ = op(B)ᵀ·op(A)ᵀ` into the same buffer viewed row-major, so the kernel only ever writes
-/// contiguous rows.
+/// General matrix–matrix product `C := α·op(A)·op(B) + β·C`, each `op` identity (`Trans::N`) or
+/// transpose (`Trans::T`) applied without materializing it. Row-major `C` on Apple routes to
+/// `cblas_*gemm`; otherwise a register-blocked gang microkernel streams the contraction over a
+/// packed `B` panel. A column-major `C` computes `Cᵀ = op(B)ᵀ·op(A)ᵀ` into the same buffer viewed
+/// row-major, so the kernel only ever writes contiguous rows.
 #[cfg(feature = "alloc")]
 pub fn gemm<T: FloatScalar + SimdDispatch>(
     ta: Trans,
@@ -446,7 +437,7 @@ pub fn gemm<T: FloatScalar + SimdDispatch>(
         return;
     }
 
-    #[cfg(all(target_vendor = "apple", not(no_apple_accelerate)))]
+    #[cfg(all(target_vendor = "apple", not(hp_no_apple_accelerate)))]
     if accel_gemm(ta, tb, alpha, a, b, beta, &c, m, n, k) {
         return;
     }
@@ -455,15 +446,15 @@ pub fn gemm<T: FloatScalar + SimdDispatch>(
     #[cfg(all(
         target_arch = "aarch64",
         feature = "std",
-        not(no_sme),
-        any(not(target_vendor = "apple"), no_apple_accelerate)
+        not(hp_no_sme),
+        any(not(target_vendor = "apple"), hp_no_apple_accelerate)
     ))]
     let mut c = c;
     #[cfg(all(
         target_arch = "aarch64",
         feature = "std",
-        not(no_sme),
-        any(not(target_vendor = "apple"), no_apple_accelerate)
+        not(hp_no_sme),
+        any(not(target_vendor = "apple"), hp_no_apple_accelerate)
     ))]
     if gemm_sme(alpha, beta, ta, a, &bp, &mut c, m, n, k) {
         return;
@@ -471,7 +462,7 @@ pub fn gemm<T: FloatScalar + SimdDispatch>(
     dispatch::<T, _>(GemmK { ta, a, alpha, beta, bp: &bp, c, m, n, k });
 }
 
-#[cfg(all(target_vendor = "apple", not(no_apple_accelerate), feature = "alloc"))]
+#[cfg(all(target_vendor = "apple", not(hp_no_apple_accelerate), feature = "alloc"))]
 #[allow(clippy::too_many_arguments)]
 fn accel_gemm<T: FloatScalar>(
     ta: Trans,
@@ -522,8 +513,8 @@ fn accel_gemm<T: FloatScalar>(
     false
 }
 
-/// Pack `op(B)` into a contiguous `k×n` row-major panel so the microkernel loads each contraction
-/// row as one aligned gang vector regardless of `B`'s storage.
+/// Pack `op(B)` into a contiguous `k×n` row-major panel so the microkernel loads each
+/// contraction row as one gang vector regardless of `B`'s storage.
 #[cfg(feature = "alloc")]
 fn pack_b<T: FloatScalar>(tb: Trans, b: &Mat<T>, k: usize, n: usize) -> alloc::vec::Vec<T> {
     let mut bp = alloc::vec![T::ZERO; k * n];
@@ -539,8 +530,7 @@ fn pack_b<T: FloatScalar>(tb: Trans, b: &Mat<T>, k: usize, n: usize) -> alloc::v
     bp
 }
 
-/// Register-blocking factor: independent accumulator chains held across the contraction, matched to
-/// the FP pipes the way the vector kernels' ILP unroll is.
+/// Register-blocking factor: independent accumulator chains held across the contraction.
 #[cfg(feature = "alloc")]
 const MR: usize = 4;
 
@@ -608,22 +598,22 @@ impl<'a, T: FloatScalar> Kernel<T> for GemmK<'a, T> {
     }
 }
 
-/// The SME dispatch predicate: aarch64 with the streaming matrix engine, `std` (thread-local pack
-/// buffers), and Accelerate out of the way — the same gate `matrix`'s tile GEMM uses.
+/// The SME dispatch predicate: aarch64, `std` (thread-local pack buffers), and Accelerate out of
+/// the way. Same gate as `matrix`'s tile GEMM.
 macro_rules! sme_item {
     ($item:item) => {
         #[cfg(all(
             target_arch = "aarch64",
             feature = "std",
-            not(no_sme),
-            any(not(target_vendor = "apple"), no_apple_accelerate)
+            not(hp_no_sme),
+            any(not(target_vendor = "apple"), hp_no_apple_accelerate)
         ))]
         $item
     };
 }
 
 sme_item! {
-    /// The f32 ZA-grid tile width (`svl/2`, the 2×2 multi-vector reach) and the set it must land in.
+    /// The ZA-grid tile width (`svl/2` for f32, `svl/4` for f64) and the set it must land in.
     fn sme_blk<T: FloatScalar>(svl: usize) -> Option<usize> {
         use core::any::TypeId;
         let t = TypeId::of::<T>();
@@ -683,8 +673,8 @@ sme_item! {
 }
 
 sme_item! {
-    /// Materialize `α·op(A)` as a contiguous row-major `m×k` panel — the left operand the ZA packer
-    /// expects, with the scalar folded in so the grid's `C += A·B` yields `C += α·op(A)·B`.
+    /// Materialize `α·op(A)` as a contiguous row-major `m×k` panel, the scalar folded in so the
+    /// grid's `C += A·B` yields `C += α·op(A)·B`.
     fn pack_op_a_scaled<T: FloatScalar>(ta: Trans, a: &Mat<T>, alpha: T, m: usize, k: usize) -> alloc::vec::Vec<T> {
         let mut ac = alloc::vec![T::ZERO; m * k];
         for i in 0..m {
@@ -749,9 +739,9 @@ sme_item! {
 }
 
 sme_item! {
-    /// Route a large, `blk`-aligned SYRK to the ZA engine: form the full `α·op(A)·op(A)ᵀ` product in a
-    /// scratch panel, then fold only the `uplo` triangle back with `β`. Trades the dot-triangle's
-    /// half-flop saving for the matrix engine's throughput, which wins at scale.
+    /// Route a large, `blk`-aligned SYRK to the ZA engine: form the full `α·op(A)·op(A)ᵀ` product
+    /// in a scratch panel, then fold only the `uplo` triangle back with `β`. Trades the
+    /// dot-triangle's half-flop saving for the matrix engine's throughput.
     #[allow(clippy::too_many_arguments)]
     fn syrk_sme<T: FloatScalar>(uplo: Uplo, trans: Trans, alpha: T, a: Mat<T>, beta: T, c: &mut MatMut<T>, n: usize, k: usize) -> bool {
         if n < SME_MIN || k < SME_MIN || !crate::arch::sme1::is_supported() || !crate::arch::sme2::is_supported() {
@@ -794,21 +784,20 @@ sme_item! {
     }
 }
 
-/// Minimum dimension for the ZA matrix engine to amortize its streaming-mode entry — mirrors
+/// Minimum dimension for the ZA matrix engine to amortize its streaming-mode entry; mirrors
 /// `matrix`'s `SME_MIN_DIM`.
 #[cfg(all(
     target_arch = "aarch64",
     feature = "std",
-    not(no_sme),
-    any(not(target_vendor = "apple"), no_apple_accelerate)
+    not(hp_no_sme),
+    any(not(target_vendor = "apple"), hp_no_apple_accelerate)
 ))]
 const SME_MIN: usize = 16;
 
-/// Symmetric rank-`k` update `C := α·op(A)·op(A)ᵀ + β·C`, writing only the `uplo` triangle of the
-/// symmetric `n×n` result — half the flops of the equivalent `gemm`, which is what normal-equations
-/// and covariance assembly always want. `op(A)` is `A` (`Trans::N`, `A` is `n×k`) or `Aᵀ`
-/// (`Trans::T`, `A` is `k×n`). Apple routes to `cblas_*syrk`; the fallback packs `op(A)`'s rows
-/// contiguous and dots each referenced `(i, j)` pair.
+/// Symmetric rank-`k` update `C := α·op(A)·op(A)ᵀ + β·C`, writing only the `uplo` triangle of
+/// the symmetric `n×n` result: half the flops of the equivalent `gemm`. `op(A)` is `A`
+/// (`Trans::N`, `A` is `n×k`) or `Aᵀ` (`Trans::T`, `A` is `k×n`). Apple routes to `cblas_*syrk`;
+/// the fallback packs `op(A)`'s rows contiguous and dots each referenced `(i, j)` pair.
 #[cfg(feature = "alloc")]
 pub fn syrk<T: FloatScalar + SimdDispatch>(
     uplo: Uplo,
@@ -828,7 +817,7 @@ pub fn syrk<T: FloatScalar + SimdDispatch>(
         return;
     }
 
-    #[cfg(all(target_vendor = "apple", not(no_apple_accelerate)))]
+    #[cfg(all(target_vendor = "apple", not(hp_no_apple_accelerate)))]
     if accel_syrk(uplo, trans, alpha, a, beta, &c, n, k) {
         return;
     }
@@ -836,15 +825,15 @@ pub fn syrk<T: FloatScalar + SimdDispatch>(
     #[cfg(all(
         target_arch = "aarch64",
         feature = "std",
-        not(no_sme),
-        any(not(target_vendor = "apple"), no_apple_accelerate)
+        not(hp_no_sme),
+        any(not(target_vendor = "apple"), hp_no_apple_accelerate)
     ))]
     let mut c = c;
     #[cfg(all(
         target_arch = "aarch64",
         feature = "std",
-        not(no_sme),
-        any(not(target_vendor = "apple"), no_apple_accelerate)
+        not(hp_no_sme),
+        any(not(target_vendor = "apple"), hp_no_apple_accelerate)
     ))]
     if syrk_sme(uplo, trans, alpha, a, beta, &mut c, n, k) {
         return;
@@ -854,7 +843,7 @@ pub fn syrk<T: FloatScalar + SimdDispatch>(
     dispatch::<T, _>(SyrkK { uplo, alpha, beta, ap: &ap, c, n, k });
 }
 
-#[cfg(all(target_vendor = "apple", not(no_apple_accelerate), feature = "alloc"))]
+#[cfg(all(target_vendor = "apple", not(hp_no_apple_accelerate), feature = "alloc"))]
 #[allow(clippy::too_many_arguments)]
 fn accel_syrk<T: FloatScalar>(
     uplo: Uplo,
@@ -966,10 +955,10 @@ fn flip_layout(l: Layout) -> Layout {
 }
 
 /// Triangular solve `op(A)·X = α·B` (`Side::Left`) or `X·op(A) = α·B` (`Side::Right`), `X`
-/// overwriting `B`. `A` is triangular — `uplo` picks the stored triangle, `Diag::Unit` takes the
-/// diagonal as an implicit 1. Apple with matching operand layouts routes to `cblas_*trsm`; the
-/// fallback reduces a right-side solve to a left-side one on `Bᵀ`, packs the RHS row-major, and runs
-/// substitution whose per-step scale/axpy vectorize across the free dimension.
+/// overwriting `B`. `uplo` picks `A`'s stored triangle; `Diag::Unit` takes the diagonal as an
+/// implicit 1. Apple with matching operand layouts routes to `cblas_*trsm`; the fallback reduces
+/// a right-side solve to a left-side one on `Bᵀ`, packs the RHS row-major, and runs substitution
+/// whose per-step scale/axpy vectorize across the free dimension.
 #[cfg(feature = "alloc")]
 #[allow(clippy::too_many_arguments)]
 pub fn trsm<T: FloatScalar + SimdDispatch>(
@@ -991,9 +980,9 @@ pub fn trsm<T: FloatScalar + SimdDispatch>(
         return;
     }
 
-    #[cfg(all(target_vendor = "apple", not(no_apple_accelerate)))]
+    #[cfg(all(target_vendor = "apple", not(hp_no_apple_accelerate)))]
     let mut b = b;
-    #[cfg(all(target_vendor = "apple", not(no_apple_accelerate)))]
+    #[cfg(all(target_vendor = "apple", not(hp_no_apple_accelerate)))]
     if accel_trsm(side, uplo, trans, diag, alpha, a, &mut b) {
         return;
     }
@@ -1009,7 +998,7 @@ pub fn trsm<T: FloatScalar + SimdDispatch>(
     }
 }
 
-#[cfg(all(target_vendor = "apple", not(no_apple_accelerate), feature = "alloc"))]
+#[cfg(all(target_vendor = "apple", not(hp_no_apple_accelerate), feature = "alloc"))]
 #[allow(clippy::too_many_arguments)]
 fn accel_trsm<T: FloatScalar>(
     side: Side,
@@ -1024,8 +1013,8 @@ fn accel_trsm<T: FloatScalar>(
     use core::any::TypeId;
     use core::mem::transmute_copy;
 
-    // Folding a mismatched A layout into cblas would also flip its triangle; sidestep by taking the
-    // native path only when A and B share an order, and leaving the rest to the fallback.
+    // Folding a mismatched A layout into cblas would also flip its triangle, so take the native
+    // path only when A and B share an order.
     if a.layout != b.layout {
         return false;
     }
@@ -1083,7 +1072,7 @@ fn solve_left<T: FloatScalar + SimdDispatch>(
     mut b: MatMut<T>,
 ) {
     let (m, n) = (b.rows, b.cols);
-    // op(A) is lower-triangular for (Lower, N) and (Upper, T) — solved forward — and upper otherwise.
+    // op(A) is lower-triangular for (Lower, N) and (Upper, T), solved forward; upper otherwise.
     let op_lower = (uplo == Uplo::Lower) == (trans == Trans::N);
     let mut rp = alloc::vec![T::ZERO; m * n];
     for i in 0..m {
@@ -1607,9 +1596,8 @@ mod tests {
         assert!(potrf(Uplo::Lower, a).is_err());
     }
 
-    // Sizes with M,N multiples of 64 clear any valid ZA blk (16/32/64) and SME_MIN, so under
-    // `--cfg no_apple_accelerate` on an SME host these drive the ZA-grid kernel; elsewhere they
-    // exercise the gang kernel at scale. Correctness must hold either way.
+    // M,N multiples of 64 clear any valid ZA blk (16/32/64) and SME_MIN, so with Accelerate off
+    // on an SME host these drive the ZA-grid kernel; elsewhere the gang kernel at scale.
     #[cfg(feature = "alloc")]
     #[test]
     fn gemm_large_aligned() {

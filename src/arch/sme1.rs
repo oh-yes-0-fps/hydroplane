@@ -1,16 +1,6 @@
-//! SME (v1): the ZA matrix engine via raw `asm!`.
-//!
-//! SME instructions don't need the (still unstable) `sme` target_feature: each `asm!` block opens
-//! with `.arch_extension sme` so the integrated assembler accepts the SME mnemonics, then closes
-//! with `.arch_extension nosme` to restore state — so this whole module builds on **stable**, the
-//! same way [`super::sve1`] uses the stable `sve` feature. The mnemonics still only *execute* where
-//! SME is implemented (e.g. Apple M4+, some server ARM); on Apple, hydroplane prefers NEON + Accelerate
-//! (see [`super::select`]), so this path serves non-Apple SME hosts.
-//!
-//! The headline op is [`mma_f32`] (& `_f64`/`_f16`/`_bf16`): a register-tile GEMM `D = C + A·B`
-//! lowered to the `FMOPA` outer-product-accumulate engine. Each `k` contributes the rank-1 update
-//! `ZA += A[:,k] ⊗ B[k,:]`; after `K` of them the ZA tile holds `C + A·B`, which is read back out.
-//! One ZA `.S` tile is `svl/4 × svl/4`, so `M, N ≤ svl/4` (`svl/8` for `f64`).
+//! SME (v1): the ZA matrix engine (`FMOPA` outer-product GEMM) via raw `asm!`. Each block toggles
+//! `.arch_extension sme`, so it builds on stable with no `sme` target_feature (still unstable),
+//! and every op runs inside its own `SMSTART`/`SMSTOP` streaming-mode session.
 #![allow(
     dead_code,
     unsafe_op_in_unsafe_fn,
@@ -21,8 +11,8 @@
 use core::arch::asm;
 use half::{bf16, f16};
 
-/// Read the SME streaming vector length in bytes via `RDSVL` (valid whenever SME is implemented,
-/// regardless of the current streaming state — `RDSVL` is legal outside streaming mode).
+/// Read the SME streaming vector length in bytes via `RDSVL`, which is legal outside streaming
+/// mode.
 ///
 /// # Safety
 /// The CPU must implement SME — guard with [`is_supported`].
@@ -44,15 +34,14 @@ pub fn streaming_vl_bytes() -> usize {
     unsafe { streaming_vl_bytes_raw() }
 }
 
-/// Whether the running CPU implements SME. The std `is_aarch64_feature_detected!` macro doesn't
-/// cover SME on stable, so this probes the OS directly: `HWCAP2_SME` from the ELF aux vector on
-/// Linux, the `hw.optional.arm.FEAT_SME` sysctl on macOS/Apple; other OSes return `false`. Note this
-/// is just the capability query — [`super::select`] still routes Apple to NEON + Accelerate
-/// regardless, so this matters for callers that invoke the [`mma_f32`]-style primitives directly.
+/// Whether the running CPU implements SME. `is_aarch64_feature_detected!` doesn't cover SME on
+/// stable, so this probes the OS: `HWCAP2_SME` from the ELF aux vector on Linux, the
+/// `hw.optional.arm.FEAT_SME` sysctl on Apple; other OSes return `false`. Capability only:
+/// [`super::select`] still routes Apple to NEON + Accelerate.
 #[cfg(feature = "std")]
 pub fn is_supported() -> bool {
-    // Cached: the probe is a `sysctlbyname` syscall on Apple, and this runs on every matrix `mma`.
-    // The race is benign — every thread computes the same constant — so `Relaxed` is enough.
+    // Cached: the Apple probe is a syscall and this runs on every matrix `mma`. The race is
+    // benign (every thread computes the same constant), so Relaxed is enough.
     static CACHE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     match CACHE.load(core::sync::atomic::Ordering::Relaxed) {
         0 => {
@@ -84,11 +73,10 @@ fn is_supported_uncached() -> bool {
     }
 }
 
-/// FMOPA GEMM core for one element type. `at` is `K×M` **column-major** (row `k` of `at` is column
-/// `k` of A, contiguous `M` lanes) so each `k`-step loads an A-column with one contiguous `ld1`;
-/// `b` is `K×N` row-major (row stride `ldb`); `c` is the `M×N` in/out accumulator (row stride
-/// `ldc`). The active region is preloaded from `c`, accumulated over `K` `FMOPA`s, and stored back —
-/// untouched ZA lanes (outside `M×N`) are never read, so no `zero za` is needed.
+/// FMOPA GEMM core for one element type. `at` is `K×M` column-major (row `k` of `at` is column `k`
+/// of A) so each `k`-step loads an A-column with one contiguous `ld1`; `b` is `K×N` row-major
+/// (row stride `ldb`); `c` is the `M×N` in/out accumulator (row stride `ldc`). ZA lanes outside
+/// `M×N` are never read, so no `zero za` is needed.
 macro_rules! fmopa_core {
     ($core:ident, $t:ty, $sz:expr, $e:literal, $ld:literal, $st:literal, $open:literal) => {
         #[inline]
@@ -156,7 +144,7 @@ macro_rules! fmopa_core {
                 k = out(reg) _,
                 addr = out(reg) _,
                 out("x12") _,
-                // SMSTART/SMSTOP zero the entire SVE register file (Z0–Z31, P0–P15), so every
+                // SMSTART/SMSTOP zero the entire SVE register file (Z0-Z31, P0-P15), so every
                 // SVE/NEON register the compiler might hold live across this block is clobbered.
                 out("z0") _, out("z1") _, out("z2") _, out("z3") _, out("z4") _, out("z5") _,
                 out("z6") _, out("z7") _, out("z8") _, out("z9") _, out("z10") _, out("z11") _,
@@ -219,10 +207,9 @@ pub unsafe fn mma_f64<const M: usize, const N: usize, const K: usize>(
     fmopa_f64::<M, N, K>(at.as_ptr().cast(), b, ldb, c, ldc);
 }
 
-/// `D = C + A·B` for `f16` tiles with **native f16 accumulation** (FEAT_SME_F16F16) via the `za.h`
-/// engine. Speed over parity: A/B load directly (no widen) and the accumulator is `f16`, so this
-/// runs at the full svl/2 lane width and intermediates round at f16 precision (results do NOT match
-/// the f32-accumulate backends). `M, N ≤ svl/2`. For an f32 accumulator, widen and call [`mma_f32`].
+/// `D = C + A·B` for `f16` tiles with native f16 accumulation (FEAT_SME_F16F16) via the `za.h`
+/// engine. Intermediates round at f16 precision, so results do not match the f32-accumulate
+/// backends. `M, N ≤ svl/2`. For an f32 accumulator, widen and call [`mma_f32`].
 #[inline]
 pub unsafe fn mma_f16<const M: usize, const N: usize, const K: usize>(
     a: *const f16,
@@ -242,12 +229,11 @@ pub unsafe fn mma_f16<const M: usize, const N: usize, const K: usize>(
     fmopa_f16::<M, N, K>(at.as_ptr().cast(), b, ldb, c, ldc);
 }
 
-/// `D = C + A·B` for `bf16` tiles with an `f32` accumulator, via the **native `BFMOPA`** widening
-/// outer product (bf16 inputs, f32 accumulate). Each instruction folds a *pair* of `k`-steps —
-/// `ZA[i,j] += Zn[2i]·Zm[2j] + Zn[2i+1]·Zm[2j+1]` in f32 — so it issues `⌈K/2⌉` matrix ops (half
-/// the f32 `FMOPA` count) and skips the f32 widen pre-pass entirely. A/B are packed into the
-/// `BFMOPA` pair layout (row `i`'s two `k`-neighbours adjacent; an odd `K` zero-pads the last pair).
-/// `M, N ≤ svl/4`.
+/// `D = C + A·B` for `bf16` tiles with an `f32` accumulator, via the native `BFMOPA` widening
+/// outer product. Each instruction folds a pair of `k`-steps
+/// (`ZA[i,j] += Zn[2i]·Zm[2j] + Zn[2i+1]·Zm[2j+1]` in f32), so `⌈K/2⌉` matrix ops. A/B are packed
+/// into the `BFMOPA` pair layout (row `i`'s two `k`-neighbours adjacent; odd `K` zero-pads the
+/// last pair). `M, N ≤ svl/4`.
 #[inline]
 pub unsafe fn mma_bf16<const M: usize, const N: usize, const K: usize>(
     a: *const bf16,
@@ -258,8 +244,8 @@ pub unsafe fn mma_bf16<const M: usize, const N: usize, const K: usize>(
     ldc: usize,
 ) {
     let pairs = K.div_ceil(2);
-    // apack[p][i] = [A[i][2p], A[i][2p+1]] → row i's k-pair adjacent, rows sequential = Zn layout.
-    // bpack[p][j] = [B[2p][j], B[2p+1][j]] → col j's k-pair adjacent = Zm layout.
+    // apack[p][i] = [A[i][2p], A[i][2p+1]]: row i's k-pair adjacent = Zn layout.
+    // bpack[p][j] = [B[2p][j], B[2p+1][j]]: col j's k-pair adjacent = Zm layout.
     let mut apack = [[[bf16::ZERO; 2]; M]; K];
     let mut bpack = [[[bf16::ZERO; 2]; N]; K];
     for p in 0..pairs {
@@ -276,9 +262,9 @@ pub unsafe fn mma_bf16<const M: usize, const N: usize, const K: usize>(
     asm!(
         ".arch_extension sme",
         "smstart",
-        "whilelt p0.s, xzr, {n}",            // N cols (.s) — preload/store predicate
-        "whilelt p1.h, xzr, {m2}",           // 2M (.h) — BFMOPA row predicate
-        "whilelt p2.h, xzr, {n2}",           // 2N (.h) — BFMOPA col predicate
+        "whilelt p0.s, xzr, {n}",            // N cols (.s), preload/store predicate
+        "whilelt p1.h, xzr, {m2}",           // 2M (.h), BFMOPA row predicate
+        "whilelt p2.h, xzr, {n2}",           // 2N (.h), BFMOPA col predicate
         // preload C into ZA horizontal slices
         "mov {i}, xzr",
         "20:",

@@ -1,13 +1,6 @@
-//! The execution-context (ISA token) abstraction.
-//!
-//! A [`Backend<T>`] is a zero-sized token identifying an instruction set (scalar, AVX2,
-//! NEON, …, or a GPU subgroup) *for a specific scalar `T`*. The trait is keyed per scalar
-//! — rather than carrying a `Vector<T>` GAT — so a hand-written backend can pick the exact
-//! intrinsic for the type (`_mm256_add_ps` vs `_mm256_add_pd`): each `(ISA, scalar)` pair
-//! is its own concrete impl with concrete [`Backend::Vector`]/[`Backend::Mask`] types. A
-//! kernel written against `S: Backend<T>` therefore runs for any `T` on any ISA — the
-//! float-agnosticism and the portability come from the same place. The lane count is a
-//! `fn` (not a `const`) because the GPU subgroup backend only learns it at runtime.
+//! ISA tokens: a [`Backend<T>`] is a zero-sized token identifying an instruction set (scalar,
+//! AVX2, NEON, …, GPU subgroup) for a specific scalar `T`, each `(ISA, scalar)` pair its own
+//! impl. The lane count is a `fn`, not a `const`: the GPU subgroup only learns it at runtime.
 
 use crate::scalar::{FloatScalar, IntScalar, Scalar};
 
@@ -20,11 +13,9 @@ pub trait Backend<T: Scalar>: Copy {
     type Mask: Copy;
 
     /// Independent accumulator chains the multi-accumulator reductions (`Gang::reduce`,
-    /// `Gang::zip_reduce`, `Gang::count_n`) run to saturate this backend's FP pipes — the ILP
-    /// unroll factor, baked in at the dispatch that picks the backend rather than measured per call.
-    /// A compile-time constant, so the reduction loops unroll to exactly this many chains with no
-    /// runtime `K` lookup. Must not exceed [`MAX_UNROLL`](crate::MAX_UNROLL). The default suits x86's
-    /// 2–3 vector pipes; wide cores (Apple NEON, SVE) raise it, the scalar floor drops it to 1.
+    /// `Gang::zip_reduce`, `Gang::count_n`) run: the ILP unroll factor, a compile-time constant
+    /// baked in at dispatch. Must not exceed [`MAX_UNROLL`](crate::MAX_UNROLL). The default suits
+    /// x86's 2–3 vector pipes; wide cores (Apple NEON, SVE) raise it, the scalar floor drops it to 1.
     const UNROLL: usize = 4;
 
     /// Number of `T` lanes in one register under this backend.
@@ -42,9 +33,8 @@ pub trait Backend<T: Scalar>: Copy {
     /// Negation: IEEE sign flip for the float elements, wrapping for the integer elements.
     fn neg(self, a: Self::Vector) -> Self::Vector;
 
-    /// Float-family only (`where T: FloatScalar` makes calls with an integer element a compile
-    /// error, so the defaults below are statically unreachable — float backends override them,
-    /// integer impls never mention them).
+    /// Float-family only. `where T: FloatScalar` makes integer-element calls a compile error, so
+    /// the defaults below are statically unreachable; float backends override them.
     #[inline]
     fn div(self, _a: Self::Vector, _b: Self::Vector) -> Self::Vector
     where
@@ -67,19 +57,18 @@ pub trait Backend<T: Scalar>: Copy {
         unreachable!("`sqrt` is implemented by every float backend")
     }
 
-    /// `a*b + acc` with the element family's natural fusion: the float backends override this
-    /// with their fused `fma`, integer elements and the portable default use the two-op
-    /// multiply-add (wrapping for ints). Family-neutral — it exists so shared machinery (the
-    /// runtime unroll sweep, generic reduction steps) can probe/feed the multiply-add pipes
-    /// without a `FloatScalar` bound.
+    /// `a*b + acc` with the element family's natural fusion: float backends override this with
+    /// their fused `fma`; integer elements and the portable default use the two-op multiply-add
+    /// (wrapping for ints). Family-neutral so shared machinery (the runtime unroll sweep, generic
+    /// reduction steps) can use it without a `FloatScalar` bound.
     #[inline]
     fn madd(self, a: Self::Vector, b: Self::Vector, acc: Self::Vector) -> Self::Vector {
         self.add(self.mul(a, b), acc)
     }
 
-    /// Integer-family only: lane-wise shift by a uniform count (`k < 32`). `shr` is
-    /// element-appropriate — logical (zero-filling) for `u32`, arithmetic (sign-filling) for
-    /// `i32`. Statically unreachable defaults, same scheme as `div`.
+    /// Integer-family only: lane-wise shift by a uniform count (`k < 32`). `shr` is logical
+    /// (zero-filling) for `u32`, arithmetic (sign-filling) for `i32`. Statically unreachable
+    /// defaults, same scheme as `div`.
     #[inline]
     fn shl(self, _a: Self::Vector, _k: u32) -> Self::Vector
     where
@@ -123,18 +112,17 @@ pub trait Backend<T: Scalar>: Copy {
     {
         unreachable!("`bit_not` is implemented by every integer backend")
     }
-    /// Absolute value. The default is `max(a, -a)` (two ops); a backend overrides it with a single
-    /// dedicated instruction (NEON `fabs`, wasm `f*.abs`, AVX-512 `vabs`) or a sign-bit clear
-    /// (x86 `andps` with the `0x7FFF…` mask).
+    /// Absolute value. The default is `max(a, -a)`; backends override with a dedicated
+    /// instruction or a sign-bit clear.
     #[inline]
     fn abs(self, a: Self::Vector) -> Self::Vector {
         self.max(a, self.neg(a))
     }
     /// Lane-wise IEEE 754-2019 minimumNumber: if exactly one operand of a lane is NaN, that lane
-    /// takes the *other* operand; NaN comes out only when both are NaN. Which zero wins a
-    /// `-0.0`/`+0.0` tie is backend-specific. Every backend implements this contract — natively
-    /// where the ISA has it (aarch64 `FMINNM`, SVE `FMINNM`, RVV `vfmin`), with a NaN-patching
-    /// fixup where it doesn't (x86 `min` + unord-blend, wasm `pmin` + bitselect).
+    /// takes the other operand; NaN comes out only when both are NaN. Which zero wins a
+    /// `-0.0`/`+0.0` tie is backend-specific. Every backend implements this contract, natively
+    /// where the ISA has it (aarch64 `FMINNM`, RVV `vfmin`), with a NaN-patching fixup where it
+    /// doesn't (x86 `min` + unord-blend, wasm `pmin` + bitselect).
     fn min(self, a: Self::Vector, b: Self::Vector) -> Self::Vector;
     /// Lane-wise IEEE 754-2019 maximumNumber; see [`min`](Backend::min) for the NaN contract.
     fn max(self, a: Self::Vector, b: Self::Vector) -> Self::Vector;
@@ -155,13 +143,11 @@ pub trait Backend<T: Scalar>: Copy {
     /// Cross-lane: true if every lane of the mask is set.
     fn all(self, m: Self::Mask) -> bool;
 
-    /// Pack the mask into the low [`lanes`](Backend::lanes) bits of a `u32`: bit `i` set iff lane `i`
-    /// is set; bits at and above `lanes()` are zero. Lets a caller `popcount` the set lanes or walk
-    /// them by `trailing_zeros` instead of a per-lane scalar scan. The default materializes the mask
-    /// through `select`+`store` and packs scalar (no faster than the scan it replaces); the
-    /// fixed-width backends override it with a native movemask (x86 `movemask_ps`, AVX-512 k-regs,
-    /// NEON shift-and-add, wasm `bitmask`). `lanes()` never exceeds [`MAX_LANES`](crate::MAX_LANES)
-    /// (32), so a `u32` always has room.
+    /// Pack the mask into the low [`lanes`](Backend::lanes) bits of a `u32`: bit `i` set iff lane
+    /// `i` is set; bits at and above `lanes()` are zero. Lets a caller popcount the set lanes or
+    /// walk them by `trailing_zeros`. The default materializes the mask through `select`+`store`
+    /// and packs scalar; fixed-width backends override it with a native movemask. `lanes()` never
+    /// exceeds [`MAX_LANES`](crate::MAX_LANES) (32), so a `u32` always has room.
     #[inline]
     fn mask_bitmask(self, m: Self::Mask) -> u32 {
         let n = self.lanes();
@@ -181,16 +167,15 @@ pub trait Backend<T: Scalar>: Copy {
 
     fn reduce_sum(self, v: Self::Vector) -> T;
     /// Horizontal minimum with [`min`](Backend::min)'s minimumNumber semantics folded pairwise:
-    /// NaN lanes are ignored, and the result is NaN only if *every* lane is NaN.
+    /// NaN lanes are ignored, and the result is NaN only if every lane is NaN.
     fn reduce_min(self, v: Self::Vector) -> T;
     /// Horizontal maximum; see [`reduce_min`](Backend::reduce_min).
     fn reduce_max(self, v: Self::Vector) -> T;
 
     /// The 32-bit integer companion register: `lanes()` lanes of `u32` (reinterpretable as
-    /// `i32`) riding alongside the float lanes — lane indices, counters, and bit manipulation of
-    /// float lane patterns. Every default below is a correct-but-slow store/compute/reload
-    /// round-trip (the [`mask_bitmask`](Backend::mask_bitmask) precedent); backends with native
-    /// integer lanes override the ones that matter.
+    /// `i32`) riding alongside the float lanes, for lane indices, counters, and bit manipulation.
+    /// Every default below is a correct-but-slow store/compute/reload round-trip; backends with
+    /// native integer lanes override the ones that matter.
     type IVector: Copy;
 
     /// Load exactly [`lanes()`](Backend::lanes) integers.
@@ -229,7 +214,7 @@ pub trait Backend<T: Scalar>: Copy {
 
     /// Build a [`Mask`](Backend::Mask) from a per-lane integer predicate. The portable default
     /// routes through a `1.0`/`0.0` float image and a `gt` compare; native backends compare the
-    /// integer lanes directly (the mask layouts coincide on every fixed-width ISA).
+    /// integer lanes directly.
     #[doc(hidden)]
     #[inline]
     fn i_cmp(self, a: Self::IVector, b: Self::IVector, f: impl Fn(u32, u32) -> bool) -> Self::Mask {
@@ -275,7 +260,7 @@ pub trait Backend<T: Scalar>: Copy {
     fn isub(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
         self.i_zip(a, b, u32::wrapping_sub)
     }
-    /// Low 32 bits of the lane-wise product (`vmul`/`pmulld` semantics — identical for `u32`
+    /// Low 32 bits of the lane-wise product (`vmul`/`pmulld` semantics, identical for `u32`
     /// and `i32`).
     #[inline]
     fn imul(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
@@ -350,9 +335,8 @@ pub trait Backend<T: Scalar>: Copy {
         self.iload(&x[..n])
     }
 
-    /// Reinterpret each float lane's bit pattern as a `u32` lane — exact for 32-bit `T`, and
-    /// free on backends whose integer companion shares the register file. 16-bit `T`
-    /// zero-extends; `f64` truncates to the low half (see [`Scalar::to_bits32`]).
+    /// Reinterpret each float lane's bit pattern as a `u32` lane: exact for 32-bit `T`; 16-bit
+    /// `T` zero-extends; `f64` truncates to the low half (see [`Scalar::to_bits32`]).
     #[inline]
     fn to_bits(self, v: Self::Vector) -> Self::IVector {
         let n = self.lanes();
@@ -385,10 +369,9 @@ pub trait Backend<T: Scalar>: Copy {
 
 /// The always-available 1-lane backend.
 ///
-/// `Vector = T`, `Mask = bool`, for every `T: Scalar`. It is both the correctness oracle
-/// for the SIMD backends (math routes through [`Scalar::Compute`] identically) and the
-/// natural rust-gpu/SPIR-V lowering target (no data-movement intrinsics, everything
-/// scalar).
+/// `Vector = T`, `Mask = bool`, for every `T: Scalar`. Both the correctness oracle for the
+/// SIMD backends (math routes through [`FloatScalar::Compute`] identically) and the rust-gpu/SPIR-V
+/// lowering target.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScalarBackend;
 
@@ -396,7 +379,6 @@ impl<T: Scalar> Backend<T> for ScalarBackend {
     type Vector = T;
     type Mask = bool;
 
-    /// One lane, one chain: a scalar add chain has nothing to interleave.
     const UNROLL: usize = 1;
 
     #[inline(always)]
@@ -575,16 +557,15 @@ impl<T: Scalar> Backend<T> for ScalarBackend {
     }
 }
 
-/// A backend `B` re-stamped with a compile-time unroll factor `K`. Every op delegates to `B`
-/// (so codegen is identical after inlining); the only thing it changes is [`UNROLL`](Backend::UNROLL),
-/// which becomes the const generic `K`. The dispatch adapter resolves `K` once by runtime detection
-/// and wraps the chosen ISA backend in this, so each reduction sees `K` as a constant — no per-call
-/// `K` lookup — without `K` having to thread through [`Gang`](crate::Gang) or [`Kernel`](crate::Kernel).
-#[cfg(not(any(no_ilp, target_arch = "spirv")))]
+/// A backend `B` re-stamped with a compile-time unroll factor `K`. Every op delegates to `B`;
+/// only [`UNROLL`](Backend::UNROLL) changes, becoming the const generic `K`. The dispatch adapter
+/// resolves `K` once and wraps the chosen ISA backend in this, so each reduction sees `K` as a
+/// constant without threading it through [`Gang`](crate::Gang) or [`Kernel`](crate::Kernel).
+#[cfg(not(any(hp_no_ilp, target_arch = "spirv")))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Unroll<B, const K: usize>(pub(crate) B);
 
-#[cfg(not(any(no_ilp, target_arch = "spirv")))]
+#[cfg(not(any(hp_no_ilp, target_arch = "spirv")))]
 impl<T: Scalar, B: Backend<T>, const K: usize> Backend<T> for Unroll<B, K> {
     type Vector = B::Vector;
     type Mask = B::Mask;
@@ -842,13 +823,11 @@ impl<T: Scalar, B: Backend<T>, const K: usize> Backend<T> for Unroll<B, K> {
     }
 }
 
-/// Every element the crate supports, on one token — the bound [`Kernel::run`](crate::Kernel)
-/// carries so a kernel body can mix element families freely through one [`Gang`](crate::Gang)
-/// (`f32` compute beside `u32` connectivity, `f64` accumulation over `i32` codes, …). Blanket:
-/// any token implementing all six element backends is `BackendAll` automatically. Elements a
-/// token's ISA has no native lanes for ride the emulated array impls below — correct, reachable
-/// only when a kernel *mixes* that element in, and never chosen by the element's own dispatch
-/// ladder.
+/// Every element the crate supports, on one token: the bound [`Kernel::run`](crate::Kernel)
+/// carries so a kernel body can mix element families through one [`Gang`](crate::Gang). Blanket
+/// impl: any token implementing all six element backends. Elements a token's ISA has no native
+/// lanes for ride the emulated array impls below, reachable only when a kernel mixes that
+/// element in and never chosen by the element's own dispatch ladder.
 pub trait BackendAll:
     Backend<f32> + Backend<f64> + Backend<half::f16> + Backend<half::bf16> + Backend<u32> + Backend<i32>
 {
@@ -1470,9 +1449,8 @@ macro_rules! delegate_int_element {
 #[allow(unused_imports)] // used by the x86 capability-superset tokens only
 pub(crate) use {delegate_float_element, delegate_int_element};
 
-// The hand-rolled SIMD tokens are crate-internal: application code never names a backend,
-// it goes through `dispatch`, which picks one by runtime CPU detection. They stay reachable
-// for the in-crate differential tests (`diff_tests`) that verify each against the oracle.
+// The SIMD tokens are crate-internal: application code goes through `dispatch`. They stay
+// reachable for the in-crate differential tests (`diff_tests`) against the oracle.
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 pub(crate) mod avx1;
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
@@ -1496,10 +1474,10 @@ pub(crate) mod rvv;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod wasm;
 
-/// The GPU subgroup backend (SPIR-V) and its portable sequential-vs-subgroup scheduling
-/// policy. Public: the `choose` policy compiles and is tested on the CPU; the `Subgroup`
-/// backend itself compiles only under `target_arch = "spirv"`, reading the warp width from
-/// the hardware `SubgroupSize` builtin.
+/// The GPU subgroup backend (SPIR-V) and its sequential-vs-subgroup scheduling policy.
+/// Public: the `choose` policy compiles and is tested on the CPU; the `Subgroup` backend
+/// itself compiles only under `target_arch = "spirv"`, reading the warp width from the
+/// `SubgroupSize` builtin.
 pub mod subgroup;
 
 #[cfg(test)]

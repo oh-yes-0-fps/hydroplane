@@ -1,8 +1,6 @@
 //! Interop with the [`soa-rs`](https://docs.rs/soa-rs) crate: write your data as an ordinary
-//! `#[derive(Soars)]` struct, then run an `hydroplane` kernel over its field slices — either
-//! zero-copy in place, or via the one-line `Soa::from_columns` bridge.
-//!
-//! Run with `cargo run --example soa_rs_interop`.
+//! `#[derive(Soars)]` struct, then run a hydroplane kernel over its field slices, either zero-copy
+//! in place or via the `Soa::from_columns` bridge.
 
 use soa_rs::{Soars, soa};
 use hydroplane::{BackendAll, Kernel, Gang, dispatch};
@@ -15,9 +13,9 @@ struct Sphere {
     r: f32,
 }
 
-/// Zero-copy: the kernel reads the borrowed `soa-rs` field slices directly. `chunks` walks
-/// them a register at a time; `load_partial` stages the final short tail, filling the radius
-/// column's inactive lanes with `NaN` so they can never produce a false overlap.
+/// Zero-copy: the kernel reads the borrowed `soa-rs` field slices directly. `load_partial` stages
+/// the tail, filling the radius column's inactive lanes with `NaN` so they never produce a false
+/// overlap.
 struct AnyOverlap<'a> {
     xs: &'a [f32],
     ys: &'a [f32],
@@ -81,7 +79,7 @@ fn main() {
     println!("borrow  miss near (2,0,0): {}", query([2.0, 0.0, 0.0, 0.1])); // false
 
     // Copy bridge: build a padded `hydroplane::Soa` from the same field slices when you'd rather
-    // reuse a padded-column kernel. (Here just shown converting; same data either way.)
+    // reuse a padded-column kernel.
     let cols = hydroplane::Soa::from_columns(&[s.x(), s.y(), s.z(), s.r()], &[0.0, 0.0, 0.0, f32::NAN]);
     println!("bridged columns: {} rows, padded to {}", cols.len(), cols.padded());
 }

@@ -1,10 +1,7 @@
-//! Batched 3×3 inverse — the FEM "invert the Jacobian at every quadrature point" kernel. Many live
-//! values (9 inputs + 9 cofactors + det + 9 outputs) over little memory reuse, so it is register- and
-//! bandwidth-bound: the case where `glam`'s within-matrix SLP-autovectorized scalar path is hard to
-//! beat and the across-lane SoA form has to fight register pressure. See `Mat3Wide::inverse`.
+//! Batched 3×3 inverse: register- and bandwidth-bound, stressing register pressure.
 
 use glam::Mat3;
-use hydroplane::{Gang, GangGlamExt, kernel};
+use hydroplane::{Gang, Mat3Wide, kernel};
 use wide::f32x8;
 
 
@@ -21,23 +18,7 @@ pub fn inputs(n: usize) -> [Vec<f32>; 9] {
 
 #[kernel]
 pub fn invert_hp<'a>(ctx: Gang, m: [&'a [f32]; 9], out: [&'a mut [f32]; 9]) {
-    let n = m[0].len();
-    let lanes = ctx.lanes::<f32>();
-    let mut out = out;
-    let mut off = 0;
-    while off + lanes <= n {
-        let cols: [&[f32]; 9] = std::array::from_fn(|c| &m[c][off..off + lanes]);
-        ctx.load_mat3(cols)
-            .inverse()
-            .store(out.each_mut().map(|o| &mut o[off..off + lanes]));
-        off += lanes;
-    }
-    if off < n {
-        let cols: [&[f32]; 9] = std::array::from_fn(|c| &m[c][off..n]);
-        ctx.load_partial_mat3(cols, 1.0)
-            .inverse()
-            .store_partial(out.each_mut().map(|o| &mut o[off..n]));
-    }
+    ctx.map_cols::<f32, 9, 9>(m, out, 1.0, |m| Mat3Wide::from(m).inverse().cols());
 }
 
 pub fn invert_wide(m: &[Vec<f32>; 9], out: &mut [Vec<f32>; 9]) {

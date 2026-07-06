@@ -1,9 +1,5 @@
-//! Hand-written SSE4.1 backend for `x86_64` — the near-universal 128-bit baseline.
-//!
-//! `Backend<f32>` uses `__m128` (4 lanes); `Backend<f64>` uses `__m128d` (2 lanes). SSE4.1
-//! has no FMA, so [`Backend::fma`] is `a*b + c` (two rounds). As with [`super::avx2`], the
-//! unsafety is confined here and justified by the [`Sse4`] token only existing on a CPU
-//! with SSE4.1 (see [`Sse4::detect`]).
+//! Hand-written SSE4.1 backend for `x86_64` (4-wide f32, 2-wide f64).
+//! SSE4.1 has no FMA, so [`Backend::fma`] is `a*b + c` (two roundings).
 #![allow(unsafe_op_in_unsafe_fn)]
 
 #[cfg(target_arch = "x86")]
@@ -18,8 +14,8 @@ use crate::backend::Backend;
 pub struct Sse4(());
 
 impl Sse4 {
-    // Unused once the build's baseline statically guarantees sse4.1 (x86-64-v2+) or a wider
-    // floor: dispatch then takes a backend branchlessly via `new_unchecked`.
+    // Dead when the build baseline statically guarantees sse4.1 (x86-64-v2+) or wider; dispatch
+    // then uses `new_unchecked`.
     #[cfg(feature = "std")]
     #[allow(dead_code)]
     #[inline]
@@ -32,8 +28,8 @@ impl Sse4 {
     }
     /// # Safety
     /// The CPU must support `sse4.1`.
-    // Used only by the statically-pinned and no-std dispatch paths; on a std build the
-    // backend is always reached through runtime `detect`, leaving this constructor unused.
+    // Used only by the statically-pinned and no-std dispatch paths; std builds go through
+    // runtime `detect`.
     #[allow(dead_code)]
     #[inline]
     pub const unsafe fn new_unchecked() -> Self {
@@ -291,8 +287,7 @@ unsafe fn s_sqrt(a: __m128) -> __m128 {
 #[target_feature(enable = "sse4.1")]
 #[inline]
 unsafe fn s_min(a: __m128, b: __m128) -> __m128 {
-    // IEEE minimumNumber: `minps` already yields `b` when `a` is NaN; blend patches the
-    // b-is-NaN case (bare `minps` would return the NaN).
+    // IEEE minimumNumber: `minps` yields `b` when `a` is NaN; the blend patches the b-is-NaN case.
     let m = _mm_min_ps(a, b);
     _mm_blendv_ps(m, a, _mm_cmpunord_ps(b, b))
 }
@@ -337,7 +332,7 @@ unsafe fn s_or(a: __m128, b: __m128) -> __m128 {
 unsafe fn s_xor(a: __m128, b: __m128) -> __m128 {
     _mm_xor_ps(a, b)
 }
-/// Clear the sign bit — a single `andps`, cheaper than `max(a, -a)`.
+/// Clear the sign bit: one `andps`, cheaper than `max(a, -a)`.
 #[target_feature(enable = "sse4.1")]
 #[inline]
 unsafe fn s_abs(a: __m128) -> __m128 {
@@ -882,7 +877,7 @@ unsafe fn d_or(a: __m128d, b: __m128d) -> __m128d {
 unsafe fn d_xor(a: __m128d, b: __m128d) -> __m128d {
     _mm_xor_pd(a, b)
 }
-/// Clear the sign bit — a single `andpd`, cheaper than `max(a, -a)`.
+/// Clear the sign bit: one `andpd`, cheaper than `max(a, -a)`.
 #[target_feature(enable = "sse4.1")]
 #[inline]
 unsafe fn d_abs(a: __m128d) -> __m128d {
@@ -900,10 +895,9 @@ unsafe fn d_reduce<const OP: i32>(v: __m128d) -> f64 {
     _mm_cvtsd_f64(r)
 }
 
-// `f16` and `bf16` on SSE4: `f32x4` widen-compute-narrow with scalar boundary conversion — SSE4 can't
-// assume F16C, and bf16 has no native ALU — so both replace the 1-lane scalar fallback that pre-AVX2
-// x86 took. Every compute op delegates to the shared `s_*`/intrinsic f32 path; only the load/store
-// boundary and the reduction return type differ, so one macro generates both.
+// f16/bf16 on SSE4: f32x4 widen-compute-narrow with scalar boundary conversions (SSE4 can't
+// assume F16C, and bf16 has no native ALU). Every compute op delegates to the shared f32 path;
+// only the load/store boundary and the reduction return type differ, so one macro generates both.
 macro_rules! sse4_widen_half {
     ($t:ident, $modname:ident) => {
         mod $modname {
@@ -979,7 +973,7 @@ macro_rules! sse4_widen_half {
                     unsafe { s_xor(a, s_splat(-0.0)) }
                 }
                 #[inline(always)]
-                #[allow(unused_unsafe)] // identity for the u32 arm, intrinsic for i32
+                #[allow(unused_unsafe)]
             fn abs(self, a: __m128) -> __m128 {
                     unsafe { s_abs(a) }
                 }

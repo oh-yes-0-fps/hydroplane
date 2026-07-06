@@ -1,17 +1,6 @@
-//! Hand-written WebAssembly SIMD backends (4-wide f32, 2-wide f64).
-//!
-//! WASM SIMD is fixed-width 128-bit (`v128`) — the [`Simd128`] and [`RelaxedSimd`] tokens are the
-//! WASM analogue of NEON, never a scalable vector. Both back `f32`/`f64`/`bf16` (bf16 via the
-//! widen path: 16-bit storage, `f32x4` compute). The single 128-bit register type means
-//! `Vector = Mask = v128` for every scalar; masks are all-ones/all-zero lanes, `select` is
-//! `v128_bitselect`, and cross-lane reductions are unrolled lane extracts (WASM has no horizontal
-//! reduce intrinsics).
-//!
-//! The two tokens differ only in [`fma`](Backend::fma): base `simd128` has no fused multiply-add,
-//! so it lowers to a separate `mul` then `add`; [`RelaxedSimd`] uses the relaxed-SIMD
-//! `f32x4_relaxed_madd`/`f64x2_relaxed_madd` (fused where the engine supports it, with the
-//! non-deterministic rounding the relaxed proposal permits). WASM has no runtime feature
-//! detection, so which token a build gets is decided at compile time from `target_feature`.
+//! Hand-written WebAssembly SIMD backends over the fixed-width `v128` (4-wide f32, 2-wide f64).
+//! [`Simd128`] and [`RelaxedSimd`] differ only in [`fma`](Backend::fma); WASM has no runtime
+//! feature detection, so the token is chosen at compile time from `target_feature`.
 #![cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -205,9 +194,8 @@ macro_rules! wasm_backend {
             }
             #[inline(always)]
             fn min(self, a: v128, b: v128) -> v128 {
-                // IEEE minimumNumber: `pmin` (`b < a ? b : a`) already yields `a` when `b` is
-                // NaN; the bitselect patches the a-is-NaN case (wasm's `f32x4.min` would
-                // propagate the NaN instead).
+                // IEEE minimumNumber: `pmin` (`b < a ? b : a`) yields `a` when `b` is NaN; the
+                // bitselect patches the a-is-NaN case (wasm's `f32x4.min` would propagate NaN).
                 v128_bitselect(b, f32x4_pmin(a, b), f32x4_ne(a, a))
             }
             #[inline(always)]
@@ -418,8 +406,8 @@ macro_rules! wasm_backend {
             }
         }
 
-        // bf16: 16-bit storage, `f32x4` compute (WASM has no bf16 ALU). Widen on load/splat, narrow
-        // on store/reduce — conversions at the memory boundary only, all arithmetic native f32 SIMD.
+        // bf16: 16-bit storage, f32x4 compute (WASM has no bf16 ALU). Widen on load/splat,
+        // narrow on store/reduce; conversions live at the memory boundary only.
         impl Backend<bf16> for $token {
             type Vector = v128;
             type Mask = v128;
@@ -493,9 +481,6 @@ macro_rules! wasm_backend {
             }
             #[inline(always)]
             fn min(self, a: v128, b: v128) -> v128 {
-                // IEEE minimumNumber: `pmin` (`b < a ? b : a`) already yields `a` when `b` is
-                // NaN; the bitselect patches the a-is-NaN case (wasm's `f32x4.min` would
-                // propagate the NaN instead).
                 v128_bitselect(b, f32x4_pmin(a, b), f32x4_ne(a, a))
             }
             #[inline(always)]
@@ -575,8 +560,7 @@ macro_rules! wasm_backend {
             }
         }
 
-        // f16: 16-bit storage, `f32x4` compute (WASM has no f16 ALU). Same widen-compute-narrow shape
-        // as bf16, only the boundary conversion differs — 4 lanes vs the 1-lane scalar fallback.
+        // f16: same widen-compute-narrow shape as bf16; only the boundary conversion differs.
         impl Backend<f16> for $token {
             type Vector = v128;
             type Mask = v128;
@@ -650,9 +634,6 @@ macro_rules! wasm_backend {
             }
             #[inline(always)]
             fn min(self, a: v128, b: v128) -> v128 {
-                // IEEE minimumNumber: `pmin` (`b < a ? b : a`) already yields `a` when `b` is
-                // NaN; the bitselect patches the a-is-NaN case (wasm's `f32x4.min` would
-                // propagate the NaN instead).
                 v128_bitselect(b, f32x4_pmin(a, b), f32x4_ne(a, a))
             }
             #[inline(always)]
@@ -909,8 +890,8 @@ macro_rules! wasm_backend {
 /// to `mul` then `add`. Available whenever the build enables `simd128`.
 ///
 /// [`fma`]: Backend::fma
-// A build that also enables `relaxed-simd` dispatches to `RelaxedSimd` instead, leaving this token
-// reached only by the in-crate differential tests — hence the allow.
+// A build that also enables `relaxed-simd` dispatches to `RelaxedSimd` instead, leaving this
+// token reached only by the in-crate differential tests.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Simd128;
@@ -926,7 +907,7 @@ impl Simd128 {
 wasm_backend!(Simd128, fma_mul_add_f32, fma_mul_add_f64);
 
 /// WASM relaxed-SIMD execution token. Identical to [`Simd128`] except [`fma`] uses the relaxed
-/// `*_relaxed_madd` instructions — fused where the engine supports it, with the non-deterministic
+/// `*_relaxed_madd` instructions: fused where the engine supports it, with the non-deterministic
 /// rounding the relaxed-SIMD proposal permits. Available only when the build enables
 /// `relaxed-simd`.
 ///

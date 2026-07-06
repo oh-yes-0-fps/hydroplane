@@ -1,13 +1,12 @@
-//! Execution test for the SME ZA matrix engine (`hydroplane::arch::sme1`), run against a scalar GEMM
-//! reference. SME instructions are emitted via raw `asm!` (stable; see `sme1.rs`), so they compile
-//! on any aarch64 target but only *run* where SME is implemented — this test detects SME at runtime
-//! (macOS `sysctl`, Linux `HWCAP2`) and skips with a note where it's absent (e.g. QEMU, M1–M3).
+//! Execution test for the SME ZA matrix engine (`hydroplane::arch::sme1`) against a scalar GEMM
+//! reference. SME instructions are raw `asm!`, so they compile on any aarch64 target but only run
+//! where SME exists; detected at runtime (macOS `sysctl`, Linux `HWCAP2`), skipped otherwise.
 #![cfg(target_arch = "aarch64")]
 
 use half::{bf16, f16};
 
-/// Runtime SME probe for the test (the crate's `sme1::is_supported` is Linux-only; here we also
-/// cover Apple silicon via `sysctl hw.optional.arm.FEAT_SME`, which is how the M4+/M5 expose it).
+/// Runtime SME probe. The crate's `sme1::is_supported` is Linux-only; Apple silicon exposes SME
+/// via `sysctl hw.optional.arm.FEAT_SME`.
 fn sme_present() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -40,7 +39,7 @@ fn sme_present() -> bool {
     }
 }
 
-/// SME2 (multi-vector) presence — macOS `sysctl hw.optional.arm.FEAT_SME2`, else the crate's probe.
+/// SME2 presence: macOS `sysctl hw.optional.arm.FEAT_SME2`, else the crate's probe.
 fn sme2_present() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -124,8 +123,8 @@ fn sme_mma_f32_wide() {
         eprintln!("SME2 absent — skipping sme_mma_f32_wide");
         return;
     }
-    // svl/4 = 16 on the M5: these straddle the tile boundary so all four za tiles are exercised
-    // (high rows M>16, high cols N>16), plus a degenerate single-tile case (M,N ≤ 16).
+    // svl/4 = 16 on the M5: shapes straddle the tile boundary so all four za tiles are exercised,
+    // plus a degenerate single-tile case (M,N ≤ 16).
     check_wide::<24, 20, 10>();
     check_wide::<32, 32, 8>();
     check_wide::<17, 31, 13>();
@@ -206,7 +205,7 @@ fn check_wide_bf16<const M: usize, const N: usize, const K: usize>() {
     unsafe {
         hydroplane::arch::sme2::mma_bf16_wide::<M, N, K>(a.as_ptr(), K, b.as_ptr(), N, c.as_mut_ptr(), N);
     }
-    // bf16 inputs round, but the BFMOPA accumulate is f32 — error is just the bf16 input rounding.
+    // BFMOPA accumulates in f32, so the error is just bf16 input rounding.
     assert!(maxabs_err(&c, &want) < 1e-1, "wide bf16 {M}x{N}x{K}: {c:?} vs {want:?}");
 }
 
@@ -280,7 +279,7 @@ fn sme_mma_half() {
 
     let a16: Vec<f16> = af.iter().map(|&x| f16::from_f32(x)).collect();
     let b16: Vec<f16> = bf.iter().map(|&x| f16::from_f32(x)).collect();
-    // native f16 accumulate (za.h) → the accumulator is f16; compare widened, with f16-precision tol.
+    // Native f16 accumulate (za.h): compare widened, with f16-precision tolerance.
     let mut c16 = vec![f16::ZERO; M * N];
     let mut want16 = vec![0.0f32; M * N];
     ref_gemm(

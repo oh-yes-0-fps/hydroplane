@@ -1,14 +1,6 @@
-//! Low-level SVE (v1) primitives via raw `asm!`.
-//!
-//! An SVE register is *sizeless* and can't live in a Rust struct (see `SVE.md`), so a vector is
-//! represented as its **memory image**: [`SveVec<C>`] = `C` bytes. Every op loads the image into a
-//! `z` register at a fixed active-lane count (`whilelt` over `C / elem_size`), computes, and stores
-//! back — so the fixed width is `C`, and one `SveVec<C>` byte size = one vector length. The
-//! per-VL/per-version backends ([`crate::arch`]) wrap these.
-//!
-//! These emit SVE instructions under `#[target_feature(enable = "sve")]`; they **compile**
-//! everywhere but **run only where base (non-streaming) SVE exists** — notably *not* on Apple
-//! silicon, which has SVE only inside SME streaming mode (see [`crate::arch::sme1`]).
+//! Low-level SVE (v1) primitives via raw `asm!`. An SVE register is sizeless and can't live in a
+//! Rust struct, so a vector is its fixed-size memory image: [`SveVec<C>`] = `C` bytes = one
+//! vector length.
 #![allow(dead_code, unsafe_op_in_unsafe_fn, clippy::missing_safety_doc)]
 
 use core::arch::asm;
@@ -24,8 +16,6 @@ impl<const C: usize> SveVec<C> {
         Self([0u8; C])
     }
 }
-
-// ─────────────────────────────── f32 (C/4 lanes, `.s`) ───────────────────────────────
 
 /// Broadcast `v` to all `C/4` lanes.
 #[target_feature(enable = "sve")]
@@ -108,10 +98,10 @@ pub unsafe fn fma_f32<const C: usize>(a: &SveVec<C>, b: &SveVec<C>, c: &SveVec<C
     let mut o = SveVec::<C>::zeroed();
     asm!(
         "whilelt p0.s, xzr, {n}",
-        "ld1w {{z0.s}}, p0/z, [{c}]", // accumulator
+        "ld1w {{z0.s}}, p0/z, [{c}]",
         "ld1w {{z1.s}}, p0/z, [{a}]",
         "ld1w {{z2.s}}, p0/z, [{b}]",
-        "fmla z0.s, p0/m, z1.s, z2.s", // z0 += z1*z2
+        "fmla z0.s, p0/m, z1.s, z2.s",
         "st1w {{z0.s}}, p0, [{o}]",
         n = in(reg) C / 4,
         a = in(reg) a.0.as_ptr(),
@@ -146,8 +136,8 @@ macro_rules! sve1_unop_f32 {
 sve1_unop_f32!(neg_f32, "fneg z0.s, p0/m, z0.s");
 sve1_unop_f32!(sqrt_f32, "fsqrt z0.s, p0/m, z0.s");
 
-/// Comparison → a vector mask (`-1` lanes where true, `0` where false), so the mask is itself an
-/// `SveVec<C>` (matching the NEON vector-mask convention rather than a sizeless predicate).
+/// Comparison to a vector mask (`-1` where true, `0` where false): the mask is itself an
+/// `SveVec<C>`, matching the NEON vector-mask convention rather than a sizeless predicate.
 macro_rules! sve1_cmp_f32 {
     ($name:ident, $cmp:literal) => {
         #[target_feature(enable = "sve")]
@@ -157,7 +147,7 @@ macro_rules! sve1_cmp_f32 {
                 "whilelt p0.s, xzr, {n}",
                 "ld1w {{z0.s}}, p0/z, [{a}]",
                 "ld1w {{z1.s}}, p0/z, [{b}]",
-                $cmp,                       // p1 = (z0 ? z1)
+                $cmp,
                 "cpy z2.s, p1/z, #-1",      // -1 in true lanes, 0 elsewhere
                 "st1w {{z2.s}}, p0, [{o}]",
                 n = in(reg) C / 4,
@@ -230,10 +220,10 @@ pub unsafe fn select_f32<const C: usize>(
     asm!(
         "whilelt p0.s, xzr, {n}",
         "ld1w {{z0.s}}, p0/z, [{m}]",
-        "cmpne p1.s, p0/z, z0.s, #0", // p1 = mask lane set
+        "cmpne p1.s, p0/z, z0.s, #0",
         "ld1w {{z1.s}}, p0/z, [{a}]",
         "ld1w {{z2.s}}, p0/z, [{b}]",
-        "sel z1.s, p1, z1.s, z2.s",   // p1 ? a : b
+        "sel z1.s, p1, z1.s, z2.s",
         "st1w {{z1.s}}, p0, [{o}]",
         n = in(reg) C / 4,
         m = in(reg) mask.0.as_ptr(),
@@ -262,9 +252,8 @@ pub unsafe fn any_mask<const C: usize>(mask: &SveVec<C>) -> bool {
     r != 0
 }
 
-/// True if every mask lane is set.
-/// True if every mask lane is set. Byte-granular (a set lane is all-`0xFF`, a clear lane all-`0x00`),
-/// so it is correct for every element width — `f32`/`f64`/`f16`/`bf16` masks alike.
+/// True if every mask lane is set. Byte-granular (a set lane is all-`0xFF`, a clear lane
+/// all-`0x00`), so correct for every element width.
 #[target_feature(enable = "sve")]
 pub unsafe fn all_mask<const C: usize>(mask: &SveVec<C>) -> bool {
     let r: u64;
@@ -290,7 +279,7 @@ macro_rules! sve1_reduce_f32 {
             asm!(
                 "whilelt p0.s, xzr, {n}",
                 "ld1w {{z0.s}}, p0/z, [{a}]",
-                $op,                    // s0 = reduce(z0) — s0 aliases z0's low lane
+                $op,                    // s0 aliases z0's low lane
                 "fmov {r:w}, s0",
                 n = in(reg) C / 4,
                 a = in(reg) a.0.as_ptr(),
@@ -305,8 +294,6 @@ macro_rules! sve1_reduce_f32 {
 sve1_reduce_f32!(reduce_sum_f32, "faddv s0, p0, z0.s");
 sve1_reduce_f32!(reduce_min_f32, "fminnmv s0, p0, z0.s");
 sve1_reduce_f32!(reduce_max_f32, "fmaxnmv s0, p0, z0.s");
-
-// ─────────────────────────────── f64 (C/8 lanes, `.d`) ───────────────────────────────
 
 /// Broadcast `v` to all `C/8` lanes.
 #[target_feature(enable = "sve")]
@@ -489,7 +476,7 @@ macro_rules! sve1_reduce_f64 {
             asm!(
                 "whilelt p0.d, xzr, {n}",
                 "ld1d {{z0.d}}, p0/z, [{a}]",
-                $op,                    // d0 = reduce(z0) — d0 aliases z0's low lane
+                $op,                    // d0 aliases z0's low lane
                 "fmov {r}, d0",
                 n = in(reg) C / 8,
                 a = in(reg) a.0.as_ptr(),
@@ -507,12 +494,9 @@ sve1_reduce_f64!(reduce_max_f64, "fmaxnmv d0, p0, z0.d");
 
 use half::{bf16, f16};
 
-// ──────────────── f16 native (C/2 lanes, `.h`) ────────────────
-//
-// Speed over parity: SVE mandates FEAT_FP16, so f16 computes in **native 16-bit lanes** — `C/2` of
-// them, twice the f32 lane count — with no widen to f32. `SveVec<C>` for f16 is the raw f16 image,
-// load/store are bare `ld1h`/`st1h`, and the ALU is the `.h` SVE ops. Intermediates round at f16
-// precision, so results do NOT bit-match the f32-accumulate backends (the deliberate tradeoff).
+// SVE mandates FEAT_FP16, so f16 computes in native 16-bit lanes (C/2, twice the f32 count) with
+// no widen to f32. Intermediates round at f16 precision, so results do not bit-match the
+// f32-accumulate backends; speed over parity is deliberate.
 
 /// Broadcast `v` to all `C/2` `f16` lanes.
 #[target_feature(enable = "sve")]
@@ -695,7 +679,7 @@ macro_rules! sve1_reduce_f16 {
             asm!(
                 "whilelt p0.h, xzr, {n}",
                 "ld1h {{z0.h}}, p0/z, [{a}]",
-                $op,                    // h0 = reduce(z0) — h0 aliases z0's low lane
+                $op,                    // h0 aliases z0's low lane
                 "fmov {r:w}, h0",
                 n = in(reg) C / 2,
                 a = in(reg) a.0.as_ptr(),
@@ -711,13 +695,9 @@ sve1_reduce_f16!(reduce_sum_f16, "faddv h0, p0, z0.h");
 sve1_reduce_f16!(reduce_min_f16, "fminnmv h0, p0, z0.h");
 sve1_reduce_f16!(reduce_max_f16, "fmaxnmv h0, p0, z0.h");
 
-// ──────────────── bf16 (storage 16-bit, compute f32 — no native bf16 ALU) ────────────────
-//
-// Unlike f16, SVE has no native bf16 element-wise ALU (only the fused `BFDOT`/`BFMMLA`/`BFCVT`
-// family), so bf16 keeps the widen-compute-narrow model: `SveVec<C>` holds the `f32` image (`C/4`
-// lanes) and the arithmetic is the `*_f32` SVE asm above. The widen/narrow is vectorized — load is
-// `ld1h {z.s}` + `lsl #16` (a bf16 is the top half of its f32); store is `bfcvt` (round-to-nearest
-// -even, matching `bf16::from_f32`). Reuse `add_f32`/`mul_f32`/`fma_f32`/… on the image directly.
+// SVE has no bf16 element-wise ALU (only the fused BFDOT/BFMMLA/BFCVT family), so bf16 uses the
+// widen-compute-narrow model: `SveVec<C>` holds the f32 image (C/4 lanes) and arithmetic reuses
+// the `*_f32` ops above.
 
 /// Widen `C/4` `bf16` lanes from `p` into the `f32` compute image (vectorized).
 #[target_feature(enable = "sve")]
@@ -725,8 +705,8 @@ pub unsafe fn load_bf16<const C: usize>(p: *const bf16) -> SveVec<C> {
     let mut o = SveVec::<C>::zeroed();
     asm!(
         "whilelt p0.s, xzr, {n}",
-        "ld1h {{z0.s}}, p0/z, [{s}]",   // C/4 × 16-bit → low half of each .s lane
-        "lsl z0.s, z0.s, #16",          // bf16 (top 16 of f32) → f32
+        "ld1h {{z0.s}}, p0/z, [{s}]",
+        "lsl z0.s, z0.s, #16",          // bf16 is the top half of its f32
         "st1w {{z0.s}}, p0, [{o}]",
         n = in(reg) C / 4,
         s = in(reg) p,
@@ -743,7 +723,7 @@ pub unsafe fn store_bf16<const C: usize>(v: &SveVec<C>, p: *mut bf16) {
         "whilelt p0.s, xzr, {n}",
         "ld1w {{z0.s}}, p0/z, [{v}]",
         ".arch_extension bf16",
-        "bfcvt z0.h, p0/m, z0.s",       // f32 → bf16, round-to-nearest-even
+        "bfcvt z0.h, p0/m, z0.s",       // round-to-nearest-even, matching bf16::from_f32
         ".arch_extension nobf16",
         "st1h {{z0.s}}, p0, [{s}]",
         n = in(reg) C / 4,

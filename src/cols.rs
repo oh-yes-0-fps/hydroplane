@@ -1,14 +1,6 @@
-//! Fixed-arity bundles of structure-of-arrays columns.
-//!
-//! [`Cols`] owns `N` parallel `Vec<T>` planes — the layout the column-array combinators
-//! ([`Gang::map_cols`](crate::Gang::map_cols), [`Gang::load_partial_n`](crate::Gang), …)
-//! consume — and hands out `[&[T]; N]` / `[&mut [T]; N]` views of them. It is a transparent
-//! bundle, not an abstraction: the planes are a public field, and all indexing conventions
-//! (column-major matrices, corner-major stacks) stay at the call sites.
-//!
-//! Unlike [`Soa`](crate::Soa), the planes are separate unpadded allocations: nothing here
-//! guarantees a full final register, so kernels over `Cols` views use the masked-tail
-//! combinators (or `load_partial`) rather than sentinel padding.
+//! Fixed-arity bundles of SoA columns: [`Cols`] owns `N` parallel `Vec<T>` planes and hands out
+//! `[&[T]; N]` / `[&mut [T]; N]` views. The planes are unpadded, so kernels over `Cols` views
+//! use the masked-tail combinators (or `load_partial`) rather than sentinel padding.
 
 use alloc::vec;
 use alloc::vec::Vec;

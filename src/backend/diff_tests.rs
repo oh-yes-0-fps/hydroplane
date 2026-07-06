@@ -1,11 +1,6 @@
-//! Differential tests: every SIMD backend must agree with the [`ScalarBackend`] oracle,
-//! op for op, lane for lane. These live in-crate because the SIMD tokens are `pub(crate)`
-//! — application code reaches them only through `dispatch`, but the tests need to pin a
-//! specific backend to verify it in isolation.
-//!
-//! Exact agreement is required for add/sub/mul/div/min/max/neg and the comparison/select
-//! paths; sqrt/fma and the horizontal sum use a relative tolerance (fma may be fused;
-//! reduce order differs).
+//! Differential tests: every SIMD backend must agree with the [`ScalarBackend`] oracle, op for
+//! op, lane for lane. Exact for most ops; sqrt/fma and the horizontal sum use a relative
+//! tolerance (fma may be fused; reduce order differs).
 
 use rand::Rng;
 
@@ -539,9 +534,8 @@ fn rvv_matches_scalar() {
     }
 }
 
-/// armv7 A32 NEON is f32-only (no f64 vector), so it can't go through `check_all` (which needs
-/// `Backend<f64>`); check the `f32` element-wise ops and the register-blocked `mma` directly. Skips
-/// where NEON is absent.
+/// armv7 A32 NEON is f32-only, so it can't go through `check_all` (which needs `Backend<f64>`);
+/// check the `f32` element-wise ops and the register-blocked `mma` directly.
 #[cfg(target_arch = "arm")]
 #[test]
 fn neon_a32_matches_scalar() {
@@ -776,9 +770,9 @@ fn neon_bf16_matches_scalar() {
     }
 }
 
-/// AVX-512-BF16 element-wise backend: bf16 storage, f32x16 compute, hardware bf16↔f32 at the
-/// load/store boundary. Single ops narrow exactly once (RNE), so they match the scalar bf16 oracle
-/// bit-for-bit — this also checks the hardware `vcvtneps2bf16` rounds identically to `half`.
+/// AVX-512-BF16 element-wise backend: bf16 storage, f32x16 compute, hardware conversions at the
+/// load/store boundary. Single ops narrow exactly once (RNE), so they match the scalar bf16
+/// oracle bit-for-bit; this also checks that `vcvtneps2bf16` rounds identically to `half`.
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 #[test]
 fn avx512bf16_matches_scalar() {
@@ -882,10 +876,10 @@ fn check_dpbf16_mma<S: crate::matrix::MatrixBackend<half::bf16>>(b: S) {
     }
 }
 
-/// AMX-BF16 `tdpbf16ps` tile kernel: `D = C + A·B` for `bf16` operands into an `f32` accumulator,
-/// one tile block. Odd `K = 17` exercises the zero-padded VNNI pair tail and `N = 13` a non-16
-/// column count; matches the f32 oracle within bf16 tolerance. Runs only where AMX-BF16 is present
-/// and tile-data permission was granted (skips otherwise).
+/// AMX-BF16 `tdpbf16ps` tile kernel: `D = C + A·B` for `bf16` operands into an `f32` accumulator.
+/// Odd `K = 17` exercises the zero-padded VNNI pair tail and `N = 13` a non-16 column count;
+/// matches the f32 oracle within bf16 tolerance. Skips unless AMX-BF16 is present and tile-data
+/// permission was granted.
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[test]
 fn amx_bf16_mma_matches_scalar() {
@@ -918,11 +912,9 @@ fn amx_bf16_mma_matches_scalar() {
     }
 }
 
-/// AMX-FP16 `tdpfp16ps` tile kernel: `D = C + A·B` for IEEE `f16` operands into an `f32`
-/// accumulator, one tile block. Same odd `K = 17` / non-16 `N = 13` corners as the bf16 case;
-/// matches the f32 oracle within f16's tighter tolerance. Runs only where AMX-FP16 is present and
-/// tile-data permission was granted (skips otherwise — AMX-FP16 is a separate CPUID bit, so a
-/// bf16-only AMX host skips this).
+/// AMX-FP16 `tdpfp16ps` tile kernel: same odd `K = 17` / non-16 `N = 13` corners as the bf16
+/// case, within f16's tighter tolerance. AMX-FP16 is a separate CPUID bit, so a bf16-only AMX
+/// host skips this.
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[test]
 fn amx_f16_mma_matches_scalar() {

@@ -1,9 +1,6 @@
-//! End-to-end proof: `wreck`'s sphere–sphere "does the query overlap any sphere in the
-//! batch?" kernel, written **once** with the `#[kernel]` attribute and run for `f32` *and* `f64`
-//! on whatever backend `dispatch` selects (AVX2 when present, else scalar).
-//!
-//! Run with `cargo run --example spheres --release` (add `-C target-cpu=native` via
-//! RUSTFLAGS to force the compile-time AVX2 path).
+//! An SoA sphere-overlap query kernel ("does the query overlap any sphere in the batch?"),
+//! written once with `#[kernel]` and run for `f32` and `f64` on whatever backend `dispatch`
+//! selects.
 
 use hydroplane::{Gang, Scalar, Soa, kernel};
 
@@ -13,8 +10,8 @@ const Y: usize = 1;
 const Z: usize = 2;
 const R: usize = 3;
 
-/// Build a sphere SoA whose radius column pads inactive lanes with `NaN`, so the
-/// `d² ≤ (r+R)²` test is always false on padding (no false positives).
+/// Sphere SoA whose radius column pads inactive lanes with `NaN`, so the `d² ≤ (r+R)²` test is
+/// always false on padding.
 pub fn spheres_soa<T: Scalar>(rows: &[[T; 4]]) -> Soa<T> {
     let mut soa = Soa::with_pad_fills(&[T::ZERO, T::ZERO, T::ZERO, T::from_f64(f64::NAN)]);
     for row in rows {
@@ -23,8 +20,8 @@ pub fn spheres_soa<T: Scalar>(rows: &[[T; 4]]) -> Soa<T> {
     soa
 }
 
-/// The kernel — reads like scalar Rust, runs as SIMD. `q = [cx, cy, cz, radius]`. `#[kernel]`
-/// generates the dispatching `any_overlap(soa, q)` callable; no struct, impl, or `dispatch` by hand.
+/// `q = [cx, cy, cz, radius]`. `#[kernel]` generates the dispatching `any_overlap(soa, q)`
+/// callable; no struct, impl, or `dispatch` by hand.
 #[kernel]
 pub fn any_overlap<'a, T: Scalar>(ctx: Gang, soa: &'a Soa<T>, q: [T; 4]) -> bool {
     let lanes = ctx.lanes::<T>();
@@ -58,7 +55,6 @@ pub fn any_overlap<'a, T: Scalar>(ctx: Gang, soa: &'a Soa<T>, q: [T; 4]) -> bool
 }
 
 fn main() {
-    // a handful of f32 spheres on a line, plus an f64 run of the same data
     let rows_f32 = [
         [0.0f32, 0.0, 0.0, 0.5],
         [5.0, 0.0, 0.0, 0.5],

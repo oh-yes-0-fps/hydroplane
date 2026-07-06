@@ -1,7 +1,6 @@
-//! `soa-rs` interop: a `#[derive(Soars)]` struct's field slices feed `hydroplane` two ways —
-//! the zero-copy `chunks` + `load_partial` path (operate in place on the borrowed slices),
-//! and the `Soa::from_columns` copy bridge (reuse a padded-column kernel verbatim). Both
-//! must agree with a brute-force reference.
+//! `soa-rs` interop: a `#[derive(Soars)]` struct's field slices feed hydroplane two ways, the
+//! zero-copy `chunks` + `load_partial` path and the `Soa::from_columns` copy bridge. Both must
+//! agree with a brute-force reference.
 
 use rand::Rng;
 use soa_rs::{Soars, soa};
@@ -15,9 +14,8 @@ struct Sphere {
     r: f32,
 }
 
-/// Zero-copy: run directly over the borrowed `soa-rs` field slices. Full registers come from
-/// the dispatched backend; the final short tail is staged by `load_partial`, with `NaN` in
-/// the radius column so inactive lanes never produce a false hit.
+/// Zero-copy: run directly over the borrowed `soa-rs` field slices. The tail is staged by
+/// `load_partial` with `NaN` in the radius column so inactive lanes never produce a false hit.
 struct AnyOverlapBorrowed<'a> {
     xs: &'a [f32],
     ys: &'a [f32],

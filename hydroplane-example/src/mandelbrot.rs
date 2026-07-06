@@ -1,7 +1,5 @@
-//! Escape-time Mandelbrot — the most complex workload: a data-dependent iteration count per element,
-//! driven by a per-lane active mask with early exit when a whole register has escaped. The classic
-//! SPMD showcase (divergent control flow expressed as masks), and the sharpest test that hydroplane's
-//! mask algebra matches a hand-rolled `wide` blend loop.
+//! Escape-time Mandelbrot: data-dependent iteration with per-lane masks and whole-register early
+//! exit, stressing mask algebra.
 
 use hydroplane::{Gang, kernel};
 use wide::f32x8;
@@ -20,8 +18,8 @@ pub fn inputs(n: usize) -> (Vec<f32>, Vec<f32>) {
 #[kernel]
 pub fn mandelbrot_hp<'a>(ctx: Gang, cx: &'a [f32], cy: &'a [f32], max_iter: u32, out: &'a mut [f32]) {
     let (zero, one, four) = (ctx.splat(0.0), ctx.splat(1.0), ctx.splat(4.0));
-    // Elementwise `(cx, cy) -> escape count`; `zip_map` handles the chunking and masked tail, and the
-    // closure is the escape-time iteration itself — the active mask and early-exit stay per lane.
+    // `zip_map` handles the chunking and masked tail; the closure is the escape-time iteration,
+    // with the active mask and early exit per lane.
     ctx.zip_map(cx, cy, out, 0.0, 0.0, |cxv, cyv| {
         let (mut zx, mut zy, mut count) = (zero, zero, zero);
         for _ in 0..max_iter {

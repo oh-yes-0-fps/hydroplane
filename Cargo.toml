@@ -20,24 +20,24 @@ libm = ["dep:libm", "glam?/libm"]
 # the core stays geometry-free; pulls `glam` (no-std unless `std`/`libm` are also on).
 glam = ["dep:glam"]
 
-# Declare `target_arch = "spirv"` (the rust-gpu target) and the opt-out `no_apple_accelerate`
+# Declare `target_arch = "spirv"` (the rust-gpu target) and the opt-out `hp_no_apple_accelerate`
 # cfg as known, so the platform-specific `#[cfg]`s don't trip the unexpected_cfgs lint.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(target_arch, values("spirv"))',
-    'cfg(no_apple_accelerate)',
-    'cfg(no_sve)',
-    'cfg(no_sme)',
-    'cfg(no_amx)',
-    'cfg(no_ilp)',
-    'cfg(no_avx)',
-    'cfg(no_avx512)',
-    'cfg(static_dispatch)',
-    'cfg(neon_over_sve)',
+    'cfg(hp_no_apple_accelerate)',
+    'cfg(hp_no_sve)',
+    'cfg(hp_no_sme)',
+    'cfg(hp_no_amx)',
+    'cfg(hp_no_ilp)',
+    'cfg(hp_no_avx)',
+    'cfg(hp_no_avx512)',
+    'cfg(hp_static_dispatch)',
+    'cfg(hp_neon_over_sve)',
     # Set by the analysis driver's rustc pass; activates the `#[kernel]`-emitted metrics tool
     # attribute so build-time MIR analysis can find each kernel's body.
-    'cfg(hydro_analyze)',
-    # Set by build.rs when static_dispatch + a pinned target-cpu let the unroll factor be resolved at
+    'cfg(hp_analyze)',
+    # Set by build.rs when hp_static_dispatch + a pinned target-cpu let the unroll factor be resolved at
     # build time instead of by the runtime sweep.
     'cfg(hp_resolved_unroll)',
 ] }
@@ -62,7 +62,7 @@ soa-rs = "1.0.0"
 wide = "1.5.0"
 
 # Same f32 GEMM kernel through `dispatch_matrix`; compare default (Accelerate) vs
-# `--cfg no_apple_accelerate` (SME) via criterion baselines — see the file header.
+# `--cfg hp_no_apple_accelerate` (SME) via criterion baselines — see the file header.
 [[bench]]
 name = "gemm_accel_toggle"
 harness = false
@@ -78,7 +78,7 @@ harness = false
 name = "combinators_vs_wide"
 harness = false
 
-# `Gang::map`/`map_n` ILP unroll: unrolled (default) vs `--cfg no_ilp` (K=1) vs hand-written `wide`.
+# `Gang::map`/`map_n` ILP unroll: unrolled (default) vs `--cfg hp_no_ilp` (K=1) vs hand-written `wide`.
 [[bench]]
 name = "map_ilp"
 harness = false

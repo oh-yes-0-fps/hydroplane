@@ -1,6 +1,6 @@
-//! The `f16`/`bf16` SIMD backends agree with the scalar oracle, and `f16` reaches its native
-//! wide backend (8-wide NEON FEAT_FP16, 16/32-wide AVX-512(-FP16)) when the CPU supports it rather
-//! than falling back to the 1-lane `ScalarBackend`.
+//! The `f16`/`bf16` SIMD backends agree with the scalar oracle, and `f16` reaches its native wide
+//! backend (8-wide NEON FEAT_FP16, 16/32-wide AVX-512-FP16) rather than the 1-lane
+//! `ScalarBackend` when the CPU supports it.
 
 use hydroplane::{BackendAll, Backend, Gang, Kernel, SimdDispatch, bf16, dispatch, f16, kernel};
 
@@ -28,14 +28,13 @@ fn f16_reaches_native_wide_backend() {
 
 #[kernel]
 fn f16_count_sum_k<'a>(ctx: Gang, xs: &'a [f16], t: f16) -> usize {
-    // counts and a reduction in one pass exercise load / compare / mask-bitmask / horizontal add.
     let tv = ctx.splat(t);
     ctx.count_n([xs], |[x]| x.gt(tv))
 }
 
 #[test]
 fn f16_count_matches_scalar_oracle() {
-    // Small integers are exact in f16, so the count is an exact comparison across the lane boundary.
+    // Small integers are exact in f16, so the count is an exact comparison.
     for len in [0usize, 1, 7, 8, 9, 16, 31, 100] {
         let xs: Vec<f16> = (0..len).map(|i| f16::from_f32((i % 17) as f32)).collect();
         let t = f16::from_f32(8.0);

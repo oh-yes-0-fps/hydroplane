@@ -1,96 +1,22 @@
 //! The `#[kernel]` attribute — write a `hydroplane` kernel as a plain generic function.
 //!
-//! A kernel must be generic over the backend (unknown until runtime dispatch picks it), and a Rust
-//! closure can't be generic over a type, so the hand-written form is a struct (to carry the borrows
-//! past the dispatch boundary) plus a [`Kernel`] impl with a generic `run` method. `#[kernel]`
-//! generates both from a function whose first parameter is the SIMD context, and emits a callable
-//! that runs `dispatch` for you:
+//! From a function whose first parameter is the SIMD context, `#[kernel]` generates the kernel
+//! struct and `Kernel` impl (`MatrixKernel` with `#[kernel(matrix)]`, adding the `.tiles()`
+//! surface), a callable wrapper that runs `dispatch` for you, and a `<name>_on(ctx, …)` companion
+//! that runs the body on a caller-supplied context — call it from another kernel to skip dispatch.
 //!
 //! ```ignore
 //! #[hydroplane::kernel]
-//! pub fn any_overlap<'a, T: Scalar>(ctx: Gang, soa: &'a Soa<T>, q: [T; 4]) -> bool {
-//!     // `ctx`, `soa`, `q` are all in scope; write the kernel body directly.
-//! }
-//! // call site — no struct, no impl, no `dispatch`:
-//! let hit = any_overlap(&soa, q);
+//! fn any_overlap<'a, T: Scalar>(ctx: Gang, soa: &'a Soa<T>, q: [T; 4]) -> bool { /* body */ }
+//! let hit = any_overlap(&soa, q);   // call site — no struct, no impl, no `dispatch`
 //! ```
 //!
-//! The leading parameters are contexts, written bare (`ctx: Gang` — the gang is element-free;
-//! the backend is filled in by dispatch). Every parameter after the contexts becomes a field
-//! carried across the dispatch boundary. The dispatch element is the generic bound by
-//! `Scalar`/`FloatScalar`/`IntScalar` (or the one named `T`); for concrete kernels it is
-//! inferred from the elements the body touches; override with `#[kernel(scalar = U)]`.
-//!
-//! ## Element attributes and combo dispatch
-//!
-//! A kernel's *type-combo* — the set of elements its body touches — decides which ISA tier the
-//! generated wrapper can dispatch to (see `hydroplane::dispatch::combo_tier`). It is discovered
-//! by a token scan (or measured MIR when the `hydroplane-auto` analysis ran). List element names
-//! in the attribute to guarantee bits the scan cannot see — e.g. integer-companion work hidden
-//! inside a helper: `#[kernel(tiny, u32, f32)]`. Attribute elements are OR'd into the combo
-//! unconditionally, even over the measured set.
-//!
-//! ## Surface
-//!
-//! A kernel takes exactly one leading context parameter (`ctx: Gang<T>`). Bare `#[kernel]` binds it to
-//! a [`Backend<T>`] — the element-wise SIMD surface (`splat`/`load`/`map`/`sum`…). `#[kernel(matrix)]`
-//! binds it to a [`MatrixBackend<T>`] instead, adding the `.tiles()` matmul surface — and since
-//! `MatrixBackend<T>: Backend<T>`, a matrix context still does every vector op, so one `ctx` serves
-//! both. A matrix kernel is a [`MatrixKernel`] dispatched via `dispatch_matrix`; a vector kernel is a
-//! [`Kernel`] dispatched via `dispatch`.
-//!
-//! ```ignore
-//! #[hydroplane::kernel(matrix)]
-//! fn gemm<'a, T: Scalar, const M: usize, const N: usize, const K: usize>(
-//!     ctx: Gang<T>, a: &'a [T], b: &'a [T], out: &'a mut [T::Compute],
-//! ) {
-//!     let tl = ctx.tiles();                                   // matmul surface
-//!     tl.mma::<M, N, K>(tl.load_a_rm::<M, K>(a), tl.load_b_rm::<K, N>(b), tl.zero_acc::<M, N>())
-//!         .store_rm(out);
-//!     let _ = ctx.lanes();                                    // …and vector ops on the same ctx
-//! }
-//! ```
-//!
-//! ## Tuning
-//!
-//! By default the body runs behind a non-inlined `noalias` boundary: its data parameters are passed
-//! as real function arguments, so `&`/`&mut` slices carry the `noalias` attribute a load through the
-//! generated kernel struct would drop — worth up to ~1.6x on memory-bound kernels by letting LLVM
-//! cluster and reorder loads/stores. The trade is a single per-invocation call. `#[kernel(tiny)]`
-//! opts out (fully inlined, no call) for micro-kernels whose fixed work is smaller than that call;
-//! `#[kernel(noalias)]` states the default explicitly. `tiny` and `noalias` are mutually exclusive.
-//! `#[kernel(unroll = N)]` pins the ILP unroll factor. `noalias`/`tiny` and `unroll` are also what the
-//! build-time analysis (`hydroplane-auto`) chooses automatically; the attribute is the manual override.
-//!
-//! The scalar may be concrete: `#[kernel] fn any_gt(ctx: Gang<f32>, …)` infers `f32` from the context
-//! type, so no generic parameter is required. Backend selection inside `dispatch` is itself cached
-//! (resolved once per process), so even tiny kernels called in a hot loop don't re-probe the CPU.
-//!
-//! ## Calling a kernel from another kernel
-//!
-//! Every kernel also gets a `<name>_on(ctx, …)` companion that runs the body on a context **you**
-//! supply, skipping dispatch. Call it from inside another kernel to reuse the outer kernel's
-//! already-dispatched backend, so dispatch happens once (at the outer boundary) instead of again per
-//! inner call:
-//!
-//! ```ignore
-//! #[hydroplane::kernel]
-//! fn scaled<'a, T: Scalar>(ctx: Gang<T>, xs: &'a [T], k: T) -> f64 { /* … */ }
-//!
-//! #[hydroplane::kernel]
-//! fn scaled_then_sum<'a, T: Scalar>(ctx: Gang<T>, xs: &'a [T], ys: &'a [T], k: T) -> f64 {
-//!     scaled_on(ctx, xs, k) + scaled_on(ctx, ys, k)   // one dispatch, two inner runs
-//! }
-//! ```
-//!
-//! Unlike the `macro_rules!` fallback, generics use ordinary `<…>` syntax and may carry multiple
-//! bounds, where-clauses, several lifetimes, and several type parameters.
-//!
-//! [`Backend<T>`]: ../hydroplane/trait.Backend.html
-//! [`MatrixBackend<T>`]: ../hydroplane/trait.MatrixBackend.html
-//!
-//! [`Kernel`]: ../hydroplane/trait.Kernel.html
-//! [`MatrixKernel`]: ../hydroplane/trait.MatrixKernel.html
+//! The context is written bare (`ctx: Gang`) or concrete (`ctx: Gang<f32>`); every later parameter
+//! becomes a struct field carried across the dispatch boundary, so borrows need explicit
+//! lifetimes. The dispatch element is the generic bound by `Scalar`/`FloatScalar`/`IntScalar` (or
+//! the one named `T`), inferred for concrete kernels; attribute overrides: `scalar = U`, extra
+//! element names (OR'd into the dispatch type-combo), `tiny`/`noalias` (mutually exclusive), and
+//! `unroll = N` — the manual knobs over what the `hydroplane-auto` build-time analysis picks.
 
 use hydroplane_auto::analysis;
 
@@ -122,24 +48,20 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 struct KernelOpts {
-    /// `#[kernel(matrix)]` — the single context is a [`MatrixBackend`], adding the `.tiles()` matmul
-    /// surface (and it is still a [`Backend`], so vector ops work too). Bare `#[kernel]` is a plain
-    /// vector context.
+    /// `#[kernel(matrix)]`: the context is a [`MatrixBackend`] (still a [`Backend`], so vector ops
+    /// work too).
     matrix: bool,
     scalar: Option<Ident>,
-    /// Run the body behind a non-inlined `noalias` boundary. On by default (worth up to ~1.6x on
-    /// memory-bound kernels); `tiny` turns it off for micro-kernels that can't afford the call.
+    /// Run the body behind a non-inlined `noalias` boundary. On by default; `tiny` turns it off.
     noalias: bool,
-    /// The author wrote `tiny` or `noalias` explicitly. When set, build-time analysis must not
-    /// override the boundary choice — an explicit annotation always wins.
+    /// `tiny` or `noalias` was written explicitly; build-time analysis must not override it.
     explicit_boundary: bool,
-    /// Explicit ILP unroll cap, overriding the build-time estimate. The escape hatch for kernels
-    /// whose register pressure the analysis can't measure — a `map_cols` transform that keeps its
-    /// varyings in a closure the register proxy under-counts, so the author pins `unroll = 1`.
+    /// Explicit ILP unroll cap, overriding the build-time estimate. Escape hatch for kernels whose
+    /// register pressure the analysis under-counts (e.g. varyings kept in a combinator closure).
     unroll: Option<usize>,
-    /// Element names listed in the attribute (`#[kernel(u32, f32)]`): unconditionally OR'd into
-    /// the type-combo bitmask (even over MIR-measured sets — the author's guarantee wins), and
-    /// the first listed doubles as the dispatch element when nothing else names one.
+    /// Element names listed in the attribute (`#[kernel(u32, f32)]`): OR'd into the type-combo
+    /// bitmask unconditionally, even over MIR-measured sets. The first listed doubles as the
+    /// dispatch element when nothing else names one.
     types: Vec<Ident>,
 }
 
@@ -185,8 +107,7 @@ impl KernelOpts {
                     tiny_span = Some(p.span());
                     noalias = false;
                 }
-                // The `noalias` boundary is the default; `noalias` is accepted as an explicit
-                // affirmation, so a kernel can state its intent (and to keep older annotations valid).
+                // Already the default; accepting it explicitly marks the boundary as authored.
                 Meta::Path(p) if p.is_ident("noalias") => {
                     if noalias_span.is_some() {
                         return Err(syn::Error::new(p.span(), "duplicate `noalias`"));
@@ -257,7 +178,6 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         return Err(syn::Error::new_spanned(v, "a kernel cannot be variadic"));
     }
 
-    // A kernel takes exactly one leading context parameter (`ctx: Gang<T>`).
     let mut inputs = sig.inputs.into_iter();
     let mut ctx_idents = Vec::with_capacity(1);
     let mut ctx_tys = Vec::with_capacity(1);
@@ -301,9 +221,8 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
     for arg in inputs {
         match arg {
             FnArg::Typed(pt) => {
-                // `#[hint_cnt(N)]` on a data parameter is a length hint for the passed slice/iterator.
-                // Parsed and thrown out for now — reserved for future count-driven codegen (static tail
-                // specialization, prefetch distance). It is never re-emitted, so it can't reach rustc.
+                // `#[hint_cnt(N)]` is a slice-length hint, parsed and discarded (reserved for
+                // count-driven codegen). Never re-emitted, so it can't reach rustc.
                 let _hint_cnt = parse_hint_cnt(&pt.attrs);
                 match *pt.pat {
                     Pat::Ident(pi) => field_idents.push(pi.ident),
@@ -330,11 +249,9 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         ReturnType::Type(_, t) => *t,
     };
 
-    // Scalar precedence: explicit `scalar = …` > the `Scalar`-bound / `T`-named generic > the
-    // context's element type (a legacy `ctx: Gang<f32>`) > the first attribute element
-    // (`#[kernel(u32, …)]`) > the lowest element the token scan finds > `f32`. With combo
-    // dispatch the element only keys the `Kernel<T>` trait and the generic fallback ladder, so
-    // any element the kernel touches is a correct choice.
+    // Scalar precedence: explicit `scalar = …` > `Scalar`-bound or `T`-named generic > the
+    // context's element type > first attribute element > lowest scanned element > `f32`. The
+    // element only keys the `Kernel<T>` trait, so any element the kernel touches is correct.
     let scanned_bits_early = {
         let mut ts = TokenStream2::new();
         func_tokens.to_tokens(&mut ts);
@@ -378,9 +295,9 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         }
     }
 
-    // A PhantomData over every lifetime and type parameter keeps the struct well-formed even when a
-    // parameter only appears in the return type or a const dimension — `*const T` so the marker adds
-    // no Send/Sync/Drop obligation. Const params need no marker (unused const generics are allowed).
+    // PhantomData over every lifetime and type parameter keeps the struct well-formed when a
+    // parameter only appears in the return type or a const dimension; `*const T` adds no
+    // Send/Sync/Drop obligation. Unused const generics are allowed, so no marker for them.
     let phantom_items: Vec<TokenStream2> = lifetimes
         .iter()
         .map(|lt| quote!(& #lt ()))
@@ -431,9 +348,9 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
 
     let name = sig.ident;
 
-    // Fold build-time MIR analysis (when available) into the codegen knobs. Matrix kernels dispatch
-    // through a different path (`dispatch_matrix`, no `Unroll` wrapper, no `run_scalar`), so they take
-    // none of it. An explicit `tiny`/`noalias` always wins over the analysis boundary choice.
+    // Fold build-time MIR analysis into the codegen knobs. Matrix kernels dispatch through a
+    // different path (no `Unroll` wrapper, no `run_scalar`), so they take none of it; an explicit
+    // `tiny`/`noalias` always wins over the analysis boundary choice.
     let name_str = name.to_string();
     let metrics = if matrix_present {
         None
@@ -444,23 +361,19 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         Some(m) if !opts.explicit_boundary => m.noalias(),
         _ => opts.noalias,
     };
-    // An explicit `unroll = N` pins the cap; otherwise the build-time estimate (if any) sets it.
     let k_cap = opts.unroll.or_else(|| metrics.map(|m| m.k_cap()));
 
-    // Under the (default) `noalias` boundary the real body lives in `_on`, so that is what the analysis
-    // driver measures. The attribute is inert until the driver compiles with `--cfg hydro_analyze`.
-    // Explicit-`tiny` and matrix kernels aren't measured (the body isn't in `_on`, or isn't capped).
-    // Only the analysis driver's nested build (which sets `HYDRO_ANALYZE_INNER` alongside
-    // `--cfg hydro_analyze`) ever evaluates the metrics attribute, so it is emitted only there.
-    // A normal consumer build never sees the `hydro_analyze` token: the `unexpected_cfgs` lint
-    // fires during expansion config, before any generated `#[allow]` could apply, so keeping the
-    // `cfg_attr` out entirely is the only way consumers stay warning-free without registering
-    // the cfg in their own check-cfg table.
+    // Under the default `noalias` boundary the real body lives in `_on`, which is what the analysis
+    // driver measures; explicit-`tiny` and matrix kernels aren't measured. The metrics attribute is
+    // emitted only inside the driver's nested build (`HYDRO_ANALYZE_INNER` + `--cfg hp_analyze`):
+    // a normal consumer build must never see the `hp_analyze` token, because `unexpected_cfgs`
+    // fires before any generated `#[allow]` could apply, so keeping the `cfg_attr` out entirely is
+    // the only way consumers stay warning-free without registering the cfg themselves.
     let metrics_attr = if use_noalias
         && !matrix_present
         && std::env::var_os("HYDRO_ANALYZE_INNER").is_some()
     {
-        quote!(#[cfg_attr(hydro_analyze, hydro_analyze::metrics(kernel = #name_str))])
+        quote!(#[cfg_attr(hp_analyze, hp_analyze::metrics(kernel = #name_str))])
     } else {
         quote!()
     };
@@ -469,30 +382,25 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         None => quote!(),
     };
 
-    // The trait's `run` takes one context. Every requested mode shares the single dispatched backend,
-    // so the first context is the real parameter and the rest are `Copy` aliases of it (`Gang` is
-    // `Copy`), giving each its declared name and surface inside the body.
+    // The trait's `run` takes one context; any extra contexts become `Copy` aliases of it so each
+    // keeps its declared name inside the body.
     let primary_ctx = &ctx_idents[0];
     let primary_ty = &ctx_tys[0];
     let ctx_aliases = ctx_idents[1..]
         .iter()
         .map(|id| quote!(let #id = #primary_ctx;));
 
-    // `<name>_on(ctx, …)` runs the body on a caller-supplied, already-dispatched context — the entry
-    // point one kernel calls from inside another so the backend is selected only once, at the outer
-    // kernel's boundary, instead of re-dispatching per inner call. Generic over the backend `__S`
-    // (no dispatch bound); takes the primary context plus the data parameters.
+    // `<name>_on(ctx, …)` runs the body on a caller-supplied context, skipping dispatch, so nested
+    // kernel calls dispatch once at the outer boundary. Generic over the backend `__S`, no dispatch
+    // bound.
     let on_name = format_ident!("{}_on", name);
     let mut on_generics = generics.clone();
     on_generics.params.push(syn::GenericParam::Type(parse_quote!(__S: #run_bound)));
     let (on_impl_generics, _, on_where) = on_generics.split_for_impl();
 
-    // Default (`!tiny`): run the body inside `_on` — whose data parameters are real function
-    // arguments, so the `&`/`&mut` slices carry the `noalias` attribute that a load through the
-    // `__Kernel` struct field drops. That attribute lets LLVM cluster and reorder loads/stores across
-    // the loop (worth up to ~1.6x on memory-bound kernels), but only survives a genuine call, so `_on`
-    // is `#[inline(never)]`. `#[kernel(tiny)]` opts out — fully inlined, no per-invocation call — for
-    // micro-kernels whose fixed work is smaller than that call (~0.2ns).
+    // Default (`!tiny`): the body runs inside `_on`, whose slice parameters keep the `noalias`
+    // attribute that a load through the `__Kernel` struct field drops. The attribute only survives
+    // a genuine call, so `_on` is `#[inline(never)]`; `tiny` inlines everything instead.
     let on_call_turbofish = if turbofish_args.is_empty() {
         quote!(::<__S>)
     } else {
@@ -524,17 +432,15 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         )
     };
 
-    // Type-combo for combo dispatch: the scanned (or MIR-measured) element set plus the dispatch
-    // element's own bits, as a compile-time constant in the wrapper. Matrix kernels keep the
-    // element-keyed `dispatch_matrix` path.
+    // Type-combo: the scanned (or MIR-measured) element set plus the dispatch element's own bits,
+    // baked as a constant in the wrapper.
     let attr_bits: u8 = opts
         .types
         .iter()
         .filter_map(|i| element_bits(&i.to_string()))
         .fold(0, |a, b| a | b);
     let combo_bits = metrics.and_then(|m| m.type_bits()).unwrap_or(scanned_bits_early) | attr_bits;
-    // Whether the scalar is a generic parameter (then the tier arms cannot be pruned by the
-    // half/int bits — the element is only known at monomorphization).
+    // A generic scalar's tier arms cannot be pruned; the element is only known at monomorphization.
     let scalar_str = quote!(#scalar).to_string();
     let scalar_is_generic = generics.params.iter().any(|p| match p {
         GenericParam::Type(t) => t.ident == scalar_str,
@@ -547,8 +453,8 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
 
     let fp16_arm = may_half_f16.then(|| quote! {
         #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-        // SAFETY (all arms): `combo_tier` returns a tier code only after the matching feature
-        // detection (or compile-time guarantee) confirmed the host supports it.
+        // SAFETY (all arms): `combo_tier` returns a tier code only after feature detection (or a
+        // compile-time guarantee) confirmed the host supports it.
         ::hydroplane::towers::AVX512FP16 => ::hydroplane::dispatch::run_kernel_on(
             __kernel,
             unsafe { ::hydroplane::towers::Avx512Fp16::new_unchecked() },
@@ -586,9 +492,8 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         ),
     });
 
-    // Combo dispatch needs `Token: Backend<T>` provable in the wrapper body, which only holds
-    // for the concrete elements — generic-scalar kernels keep the element-keyed `dispatch` path
-    // (they monomorphize per element anyway, so there is no combo-pruning to win there).
+    // Combo dispatch needs `Token: Backend<T>` provable in the wrapper body, which only holds for
+    // concrete elements; generic-scalar kernels keep the element-keyed `dispatch` path.
     let dispatch_call = if matrix_present || scalar_is_generic {
         quote!(#dispatch_fn(#name::__Kernel #turbofish { #( #field_idents, )* #phantom_init }))
     } else {
@@ -659,7 +564,7 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         #[inline]
         #[allow(clippy::multiple_bound_locations)]
         // Splat-constant scalars arrive as plain params, so kernels routinely exceed clippy's arg
-        // limit; the author can't annotate a generated fn, so the wrapper opts out for them.
+        // limit; the author can't annotate a generated fn.
         #[allow(clippy::too_many_arguments)]
         #vis fn #name #w_impl_generics ( #( #field_idents: #field_tys ),* ) -> #ret
         #w_where
@@ -679,12 +584,10 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
     })
 }
 
-/// The element bits (`Scalar::TYPE_BITS` values) whose names appear anywhere in the kernel's
-/// tokens — a safe over-approximation of the elements the body touches, used to prune the
-/// combo-dispatch match to tiers that are distinct on them. Build-time MIR analysis
-/// (`hydroplane-auto`) replaces this with the measured set when available; the generated combo
-/// also ORs the dispatch element's own `TYPE_BITS`, so under-approximation is impossible for the
-/// declared element and a generic scalar folds its bits in at monomorphization.
+/// Element bits (`Scalar::TYPE_BITS` values) whose names appear anywhere in the kernel's tokens: a
+/// safe over-approximation of the elements the body touches, used to prune the combo-dispatch
+/// match. MIR analysis replaces this with the measured set when available; the generated combo
+/// also ORs the dispatch element's own `TYPE_BITS`, so the declared element is never missed.
 fn scan_type_bits(tokens: &TokenStream2) -> u8 {
     fn walk(ts: TokenStream2, bits: &mut u8) {
         for tt in ts {
@@ -710,8 +613,8 @@ fn scan_type_bits(tokens: &TokenStream2) -> u8 {
     bits
 }
 
-/// The value of a `#[hint_cnt(N)]` attribute on a kernel parameter, if present. Currently discarded
-/// by the caller (the hint is not yet wired into codegen); malformed forms are leniently ignored.
+/// The `#[hint_cnt(N)]` value on a kernel parameter, if present. Currently discarded by the caller;
+/// malformed forms are leniently ignored.
 fn parse_hint_cnt(attrs: &[syn::Attribute]) -> Option<u64> {
     attrs
         .iter()
@@ -720,9 +623,9 @@ fn parse_hint_cnt(attrs: &[syn::Attribute]) -> Option<u64> {
         .and_then(|lit| lit.base10_parse::<u64>().ok())
 }
 
-/// Turn the context parameter's written type into the backend-carrying form: `Gang<T>` (written by
-/// the author, with the backend elided) becomes `Gang<T, __S>`. The author's path is preserved, so a
-/// plain `Gang` import stays meaningful and a fully-qualified `hydroplane::Gang<T>` works too.
+/// Rewrite the context parameter's written type into the backend-carrying form, filling in `__S`.
+/// The author's path is preserved, so a plain `Gang` import and a fully-qualified
+/// `hydroplane::Gang<T>` both work.
 fn ctx_type_with_backend(ty: Type) -> syn::Result<Type> {
     let bad = |t: &dyn quote::ToTokens| {
         syn::Error::new_spanned(
@@ -737,8 +640,8 @@ fn ctx_type_with_backend(ty: Type) -> syn::Result<Type> {
     let Some(seg) = tp.path.segments.last_mut() else {
         return Err(bad(&tp));
     };
-    // Bare `ctx: Gang` is the canonical form — the gang is element-free, so there is nothing to
-    // write; a legacy bracketed element (`Gang<f32>`) is accepted and names the dispatch element.
+    // Bare `ctx: Gang` is canonical (the gang is element-free); a legacy bracketed element
+    // (`Gang<f32>`) is accepted and names the dispatch element.
     match &mut seg.arguments {
         syn::PathArguments::None => {
             seg.arguments = syn::PathArguments::AngleBracketed(parse_quote!(<__S>));
@@ -752,8 +655,8 @@ fn ctx_type_with_backend(ty: Type) -> syn::Result<Type> {
     Ok(Type::Path(tp))
 }
 
-/// The first type argument of the context type — `Gang<f32>` → `f32`, `Gang<T>` → `T` — used to
-/// infer the scalar of a kernel that has no generic scalar parameter (a concrete `Gang<f32>` kernel).
+/// First type argument of the context type (`Gang<f32>` → `f32`), used to infer the scalar of a
+/// kernel with no generic scalar parameter.
 fn ctx_scalar_arg(ty: &Type) -> Option<Type> {
     let Type::Path(tp) = ty else { return None };
     let seg = tp.path.segments.last()?;

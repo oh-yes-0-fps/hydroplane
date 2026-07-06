@@ -1,7 +1,4 @@
-//! `Σ |xᵢ - yᵢ|` — the L1 (Manhattan) distance, a two-input reduction. Like `dot` it is memory-bound
-//! with a loop-carried accumulator, so instruction-level parallelism (several independent accumulator
-//! chains) is the deciding factor — supplied by hydroplane's runtime unroll and mirrored by the
-//! hand-rolled `wide` baseline. The per-element work is a subtract and an `abs` instead of an FMA.
+//! `Σ |xᵢ − yᵢ|` two-input reduction: memory-bound, ILP-dominated.
 
 use hydroplane::{Gang, kernel};
 use wide::f32x8;
@@ -26,8 +23,7 @@ pub fn l1dist_hp<'a>(ctx: Gang, x: &'a [f32], y: &'a [f32]) -> f32 {
     .reduce_sum()
 }
 
-/// One f32x8 accumulator (8 lanes/iter), single chain — no manual ILP. The subtract-then-`abs` is the
-/// full-width body; a scalar tail finishes the leftover lanes.
+/// One f32x8 accumulator, single chain, no manual ILP; a scalar tail finishes the leftover lanes.
 pub fn l1dist_wide(x: &[f32], y: &[f32]) -> f32 {
     let n = x.len();
     let mut acc = f32x8::splat(0.0);

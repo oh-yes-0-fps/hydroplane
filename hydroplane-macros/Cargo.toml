@@ -7,6 +7,9 @@ license = "Apache-2.0"
 description = "Proc-macro `#[kernel]` attribute for hydroplane: write a SIMD/SPMD kernel as a plain generic function."
 repository = "https://github.com/valstad-shipworks/hydroplane"
 documentation = "https://docs.rs/hydroplane-macros"
+readme = "README.md"
+keywords = ["simd", "spmd", "kernel", "vectorization"]
+categories = ["development-tools::procedural-macro-helpers", "hardware-support"]
 
 [lib]
 proc-macro = true

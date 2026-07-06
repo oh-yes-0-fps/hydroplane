@@ -14,7 +14,7 @@ fn dot<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
 let s = dot(&a, &b); // dispatched: AVX-512 / AVX2 / SSE4 / NEON / SVE / ... picked per host
 ```
 
-`#[kernel]` monomorphizes the body per backend and generates a dispatching wrapper (plus an `_on` companion for composing kernels on an already-selected backend). Kernels never name an ISA. Elements are generic too: one body serves `f32`, `f64`, `f16`, `bf16` (half types widen-compute-narrow unless the target has native lanes). Integers are supported as well: `u32` and `i32` are first-class kernel scalars and also run as companion lanes alongside float kernels for argmin-style index tracking and float bit manipulation via `to_bits`/`from_bits`.
+`#[kernel]` monomorphizes the body per backend and generates a dispatching wrapper (plus an `_on` companion for composing kernels on an already-selected backend). Besides the leading `ctx: Gang` argument, a kernel is no different from any other Rust function: ordinary parameters, borrows, generics, and return type, called like a plain `fn` — `dot(&a, &b)` above. Kernels never name an ISA. Elements are generic too: one body serves `f32`, `f64`, `f16`, `bf16` (half types widen-compute-narrow unless the target has native lanes). Integers are supported as well: `u32` and `i32` are first-class kernel scalars and also run as companion lanes alongside float kernels for argmin-style index tracking and float bit manipulation via `to_bits`/`from_bits`.
 
 ## What "raising" means
 

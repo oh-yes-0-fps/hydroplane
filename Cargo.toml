@@ -1,11 +1,11 @@
 [package]
 name = "hydroplane"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
 description = "Floating but fast: float-agnostic, ISPC-style SPMD/SIMD infrastructure — write one kernel generic over the scalar element (f32/f64/f16/bf16) and run it with runtime ISA dispatch."
-repository = "https://github.com/valstad-shipworks/hydroplane"
+repository = "https://github.com/oh-yes-0-fps/hydroplane"
 documentation = "https://docs.rs/hydroplane"
 readme = "README.md"
 keywords = ["simd", "spmd", "ispc", "vectorization", "no-std"]
@@ -16,12 +16,8 @@ default = ["std"]
 std = ["alloc", "half/std", "glam?/std"]
 alloc = []
 libm = ["dep:libm", "glam?/libm"]
-# Opt-in `glam`-aware wide-vector helpers (`Vec3Wide`/`Mat3Wide`/`GangGlamExt`). Off by default so
-# the core stays geometry-free; pulls `glam` (no-std unless `std`/`libm` are also on).
 glam = ["dep:glam"]
 
-# Declare `target_arch = "spirv"` (the rust-gpu target) and the opt-out `hp_no_apple_accelerate`
-# cfg as known, so the platform-specific `#[cfg]`s don't trip the unexpected_cfgs lint.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(target_arch, values("spirv"))',
@@ -34,20 +30,14 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(hp_no_avx512)',
     'cfg(hp_static_dispatch)',
     'cfg(hp_neon_over_sve)',
-    # Set by the analysis driver's rustc pass; activates the `#[kernel]`-emitted metrics tool
-    # attribute so build-time MIR analysis can find each kernel's body.
     'cfg(hp_analyze)',
-    # Set by build.rs when hp_static_dispatch + a pinned target-cpu let the unroll factor be resolved at
-    # build time instead of by the runtime sweep.
     'cfg(hp_resolved_unroll)',
 ] }
 
 [dependencies]
 glam = { version = "0.32", default-features = false, optional = true }
-# f16/bf16 element support (widen-to-f32 compute path; native AVX-512-FP16 / NEON-fp16 lanes layer
-# on top where the target supports them). Always present — `f16`/`bf16` are re-exported from the crate root.
 half = { version = "2", default-features = false, features = ["num-traits"] }
-hydroplane-macros = { version = "0.0.1", path = "hydroplane-macros" }
+hydroplane-macros = { version = "0.1.0", path = "hydroplane-macros" }
 libm = { version = "0.2", optional = true }
 num-traits = { version = "0.2.19", default-features = false }
 

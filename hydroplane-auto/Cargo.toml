@@ -1,11 +1,11 @@
 [package]
 name = "hydroplane-auto"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 description = "Build-time MIR analysis for hydroplane `#[kernel]`s: a nightly StableMIR pass (quarantined out-of-process) that measures each kernel and feeds per-kernel codegen decisions back to the `#[kernel]` macro."
-repository = "https://github.com/valstad-shipworks/hydroplane"
+repository = "https://github.com/oh-yes-0-fps/hydroplane"
 documentation = "https://docs.rs/hydroplane-auto"
 readme = "README.md"
 keywords = ["simd", "spmd", "mir", "analysis", "kernel"]

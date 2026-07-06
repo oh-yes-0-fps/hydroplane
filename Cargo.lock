@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "hydroplane"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "glam 0.32.1",

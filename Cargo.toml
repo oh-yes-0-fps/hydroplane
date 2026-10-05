@@ -1,6 +1,6 @@
 [package]
 name = "hydroplane"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
@@ -37,7 +37,7 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 [dependencies]
 glam = { version = "0.32", default-features = false, optional = true }
 half = { version = "2", default-features = false, features = ["num-traits"] }
-hydroplane-macros = { version = "0.1.0", path = "hydroplane-macros" }
+hydroplane-macros = { version = "0.1.1", path = "hydroplane-macros" }
 libm = { version = "0.2", optional = true }
 num-traits = { version = "0.2.19", default-features = false }
 
@@ -85,6 +85,6 @@ name = "asm_mat3"
 required-features = ["glam"]
 
 [workspace]
-members = ["hydroplane-macros", "hydroplane-auto", "hydroplane-example"]
+members = ["hydroplane-macros", "hydroplane-auto", "hydroplane-example", "hydroplane-whatcpu"]
 resolver = "2"
 

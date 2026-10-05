@@ -1,6 +1,6 @@
 [package]
 name = "hydroplane-macros"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -15,7 +15,7 @@ categories = ["development-tools::procedural-macro-helpers", "hardware-support"]
 proc-macro = true
 
 [dependencies]
-hydroplane-auto = { version = "0.1.0", path = "../hydroplane-auto" }
+hydroplane-auto = { version = "0.1.1", path = "../hydroplane-auto" }
 proc-macro2 = "1.0.106"
 quote = "1.0.46"
 syn = { version = "2.0.118", features = ["full"] }

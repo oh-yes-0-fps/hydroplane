@@ -369,9 +369,15 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
     // a normal consumer build must never see the `hp_analyze` token, because `unexpected_cfgs`
     // fires before any generated `#[allow]` could apply, so keeping the `cfg_attr` out entirely is
     // the only way consumers stay warning-free without registering the cfg themselves.
+    // Only the crate under analysis gets it: dependencies with kernels of their own compile with
+    // the same `--cfg hp_analyze` but through plain rustc, which rejects the unregistered tool.
+    let analyzed = std::env::var("HYDRO_ANALYZE_CRATE").ok().is_some_and(|want| {
+        std::env::var("CARGO_CRATE_NAME").is_ok_and(|name| name == want)
+    });
     let metrics_attr = if use_noalias
         && !matrix_present
         && std::env::var_os("HYDRO_ANALYZE_INNER").is_some()
+        && analyzed
     {
         quote!(#[cfg_attr(hp_analyze, hp_analyze::metrics(kernel = #name_str))])
     } else {

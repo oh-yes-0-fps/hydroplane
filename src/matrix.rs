@@ -1,6 +1,7 @@
 //! Portable tile matrix-multiply: [`MatrixBackend`] extends the element-wise [`Backend`] with a
 //! 2-D tile and the fused multiply-add `D = A·B + C`, lowered per backend. Mixed precision
-//! follows [`FloatScalar::Compute`]: an `f16` matmul accumulates in `f32`.
+//! follows [`FloatScalar::Compute`]: an `f16` matmul accumulates in `f32`. The accumulator also
+//! carries elementwise combine, per-row/column broadcasts, and row/column reductions.
 
 use crate::backend::Backend;
 use crate::scalar::{FloatScalar, Scalar};
@@ -86,6 +87,17 @@ impl<'a, E: Scalar, const R: usize, const C: usize> View<'a, E, R, C> {
     #[inline]
     pub fn dense_ptr(self) -> Option<*const E> {
         if matches!(self.layout, Layout::RowMajor) && self.row_stride == C {
+            Some(self.ptr)
+        } else {
+            None
+        }
+    }
+    /// The backing pointer iff the tile is dense column-major (`row_stride == R`), i.e. the
+    /// memory holds the tile's transpose row-major. Hardware paths that take a transposed
+    /// operand natively (BLAS `Trans`) consume this without a gather.
+    #[inline]
+    pub fn dense_t_ptr(self) -> Option<*const E> {
+        if matches!(self.layout, Layout::ColMajor) && self.row_stride == R {
             Some(self.ptr)
         } else {
             None
@@ -232,6 +244,49 @@ pub trait MatrixBackend<T: FloatScalar>: Backend<T> {
         f: impl Fn(E) -> E,
     ) -> Self::Tile<'a, E, R, C, Ro>;
 
+    /// Combine two accumulators elementwise, `f(a, b)` per element. Accumulator-only, like the
+    /// row/column ops below: the input roles are read-only borrowed views.
+    fn tile_zip<'a, E: Scalar, const R: usize, const C: usize>(
+        self,
+        a: Self::Tile<'a, E, R, C, Accumulator>,
+        b: Self::Tile<'a, E, R, C, Accumulator>,
+        f: impl Fn(E, E) -> E,
+    ) -> Self::Tile<'a, E, R, C, Accumulator>;
+
+    /// Fold each row into the matching entry of `acc`: `acc[r] = f(…f(acc[r], t[r][0])…, t[r][C-1])`.
+    /// Position-dependent, hence accumulator-only: a lowering with an opaque element→`(row, col)`
+    /// mapping implements the row/column ops via a memory round-trip.
+    fn tile_fold_rows<E: Scalar, const R: usize, const C: usize>(
+        self,
+        t: Self::Tile<'_, E, R, C, Accumulator>,
+        acc: [E; R],
+        f: impl Fn(E, E) -> E,
+    ) -> [E; R];
+
+    /// Fold each column into the matching entry of `acc` (see [`tile_fold_rows`](MatrixBackend::tile_fold_rows)).
+    fn tile_fold_cols<E: Scalar, const R: usize, const C: usize>(
+        self,
+        t: Self::Tile<'_, E, R, C, Accumulator>,
+        acc: [E; C],
+        f: impl Fn(E, E) -> E,
+    ) -> [E; C];
+
+    /// Apply `f(elem, v[row])` to every element — broadcast a per-row scalar across each row.
+    fn tile_zip_rows<'a, E: Scalar, const R: usize, const C: usize>(
+        self,
+        t: Self::Tile<'a, E, R, C, Accumulator>,
+        v: [E; R],
+        f: impl Fn(E, E) -> E,
+    ) -> Self::Tile<'a, E, R, C, Accumulator>;
+
+    /// Apply `f(elem, v[col])` to every element — broadcast a per-column scalar down each column.
+    fn tile_zip_cols<'a, E: Scalar, const R: usize, const C: usize>(
+        self,
+        t: Self::Tile<'a, E, R, C, Accumulator>,
+        v: [E; C],
+        f: impl Fn(E, E) -> E,
+    ) -> Self::Tile<'a, E, R, C, Accumulator>;
+
     /// `D = A·B + C`. `A`/`B` hold element `T`; the accumulator holds `T::Compute`. All three
     /// tiles and the result share one lifetime `'i`: the inputs borrow their source slices for it,
     /// the owned accumulator just carries it.
@@ -249,6 +304,79 @@ fn tile_index(r: usize, c: usize, row_stride: usize, layout: Layout) -> usize {
         Layout::RowMajor => r * row_stride + c,
         Layout::ColMajor => c * row_stride + r,
     }
+}
+
+// The accumulator row/column/zip ops over the owned `[[E; C]; R]` repr, shared by every array
+// backend through `array_tile_methods!`.
+
+#[inline]
+pub(crate) fn acc_zip<E: Scalar, const R: usize, const C: usize>(
+    mut a: [[E; C]; R],
+    b: [[E; C]; R],
+    f: impl Fn(E, E) -> E,
+) -> [[E; C]; R] {
+    for (ar, br) in a.iter_mut().zip(&b) {
+        for (av, bv) in ar.iter_mut().zip(br) {
+            *av = f(*av, *bv);
+        }
+    }
+    a
+}
+
+#[inline]
+pub(crate) fn acc_fold_rows<E: Scalar, const R: usize, const C: usize>(
+    t: [[E; C]; R],
+    mut acc: [E; R],
+    f: impl Fn(E, E) -> E,
+) -> [E; R] {
+    for (a, row) in acc.iter_mut().zip(&t) {
+        for &v in row {
+            *a = f(*a, v);
+        }
+    }
+    acc
+}
+
+#[inline]
+pub(crate) fn acc_fold_cols<E: Scalar, const R: usize, const C: usize>(
+    t: [[E; C]; R],
+    mut acc: [E; C],
+    f: impl Fn(E, E) -> E,
+) -> [E; C] {
+    for row in &t {
+        for (a, &v) in acc.iter_mut().zip(row) {
+            *a = f(*a, v);
+        }
+    }
+    acc
+}
+
+#[inline]
+pub(crate) fn acc_zip_rows<E: Scalar, const R: usize, const C: usize>(
+    mut t: [[E; C]; R],
+    v: [E; R],
+    f: impl Fn(E, E) -> E,
+) -> [[E; C]; R] {
+    for (row, &s) in t.iter_mut().zip(&v) {
+        for e in row {
+            *e = f(*e, s);
+        }
+    }
+    t
+}
+
+#[inline]
+pub(crate) fn acc_zip_cols<E: Scalar, const R: usize, const C: usize>(
+    mut t: [[E; C]; R],
+    v: [E; C],
+    f: impl Fn(E, E) -> E,
+) -> [[E; C]; R] {
+    for row in t.iter_mut() {
+        for (e, &s) in row.iter_mut().zip(&v) {
+            *e = f(*e, s);
+        }
+    }
+    t
 }
 
 /// Register-blocked GEMM, all operands already in compute precision `C`. Blocks `N` into
@@ -954,6 +1082,47 @@ where
         }
     }
 
+    // Apple: when both operands are dense in some orientation and already in compute precision,
+    // Accelerate applies the transposition itself — no gather pass for a column-major view over
+    // a dense transposed buffer (the `load_a_t`/`load_b_t` shape).
+    #[cfg(all(target_vendor = "apple", not(hp_no_apple_accelerate)))]
+    if !needs_widen && M >= ACCEL_MIN_DIM && N >= ACCEL_MIN_DIM && K >= ACCEL_MIN_DIM {
+        use core::any::TypeId;
+        // (pointer, trans flag, leading dimension): `lda` is the stored row length, so `K` for
+        // an `M×K` A stored as-is and `M` for one stored transposed (`K×M`); likewise for B.
+        let a_src = a_dense
+            .map(|p| (p, accel::NO_TRANS, K))
+            .or_else(|| a.dense_t_ptr().map(|p| (p, accel::TRANS, M)));
+        let b_src = b_dense
+            .map(|p| (p, accel::NO_TRANS, N))
+            .or_else(|| b.dense_t_ptr().map(|p| (p, accel::TRANS, K)));
+        if let (Some((ap, ta, lda)), Some((bp, tb, ldb))) = (a_src, b_src) {
+            let compute = TypeId::of::<T::Compute>();
+            if compute == TypeId::of::<f32>() {
+                let mut c = c;
+                unsafe {
+                    accel::cblas_sgemm(
+                        accel::ROW_MAJOR, ta, tb, M as _, N as _, K as _,
+                        1.0, ap as *const f32, lda as _, bp as *const f32, ldb as _,
+                        1.0, c.as_mut_ptr() as *mut f32, N as _,
+                    );
+                }
+                return c;
+            }
+            if compute == TypeId::of::<f64>() {
+                let mut c = c;
+                unsafe {
+                    accel::cblas_dgemm(
+                        accel::ROW_MAJOR, ta, tb, M as _, N as _, K as _,
+                        1.0, ap as *const f64, lda as _, bp as *const f64, ldb as _,
+                        1.0, c.as_mut_ptr() as *mut f64, N as _,
+                    );
+                }
+                return c;
+            }
+        }
+    }
+
     if needs_materialize {
         materialize(&mut ac, &mut bc);
     }
@@ -1273,6 +1442,56 @@ macro_rules! array_tile_methods {
         ) -> <Ro as $crate::matrix::Role>::Repr<'a, E, R, C> {
             $crate::matrix::CpuTile::ct_map(t, f)
         }
+
+        #[inline]
+        fn tile_zip<'a, E: Scalar, const R: usize, const C: usize>(
+            self,
+            a: <$crate::matrix::Accumulator as $crate::matrix::Role>::Repr<'a, E, R, C>,
+            b: <$crate::matrix::Accumulator as $crate::matrix::Role>::Repr<'a, E, R, C>,
+            f: impl Fn(E, E) -> E,
+        ) -> <$crate::matrix::Accumulator as $crate::matrix::Role>::Repr<'a, E, R, C> {
+            $crate::matrix::acc_zip(a, b, f)
+        }
+
+        #[inline]
+        fn tile_fold_rows<E: Scalar, const R: usize, const C: usize>(
+            self,
+            t: <$crate::matrix::Accumulator as $crate::matrix::Role>::Repr<'_, E, R, C>,
+            acc: [E; R],
+            f: impl Fn(E, E) -> E,
+        ) -> [E; R] {
+            $crate::matrix::acc_fold_rows(t, acc, f)
+        }
+
+        #[inline]
+        fn tile_fold_cols<E: Scalar, const R: usize, const C: usize>(
+            self,
+            t: <$crate::matrix::Accumulator as $crate::matrix::Role>::Repr<'_, E, R, C>,
+            acc: [E; C],
+            f: impl Fn(E, E) -> E,
+        ) -> [E; C] {
+            $crate::matrix::acc_fold_cols(t, acc, f)
+        }
+
+        #[inline]
+        fn tile_zip_rows<'a, E: Scalar, const R: usize, const C: usize>(
+            self,
+            t: <$crate::matrix::Accumulator as $crate::matrix::Role>::Repr<'a, E, R, C>,
+            v: [E; R],
+            f: impl Fn(E, E) -> E,
+        ) -> <$crate::matrix::Accumulator as $crate::matrix::Role>::Repr<'a, E, R, C> {
+            $crate::matrix::acc_zip_rows(t, v, f)
+        }
+
+        #[inline]
+        fn tile_zip_cols<'a, E: Scalar, const R: usize, const C: usize>(
+            self,
+            t: <$crate::matrix::Accumulator as $crate::matrix::Role>::Repr<'a, E, R, C>,
+            v: [E; C],
+            f: impl Fn(E, E) -> E,
+        ) -> <$crate::matrix::Accumulator as $crate::matrix::Role>::Repr<'a, E, R, C> {
+            $crate::matrix::acc_zip_cols(t, v, f)
+        }
     };
 }
 
@@ -1507,6 +1726,27 @@ impl<T: FloatScalar, S: MatrixBackend<T>> Tiles<T, S> {
         self.load_acc::<M, N>(mem, N, Layout::RowMajor)
     }
 
+    /// Load the `M×K` left operand from a buffer holding `Aᵀ` (`K×M`, dense row-major). A
+    /// zero-copy transposed view: `Aᵀ·B` products (normal equations `JᵀJ`) read straight from
+    /// the row-major source, and backends with a native transposed operand skip the gather.
+    #[inline]
+    pub fn load_a_t<'a, const M: usize, const K: usize>(
+        self,
+        mem: &'a [T],
+    ) -> Tile<'a, T, S, T, M, K, MatrixA> {
+        self.load_a::<M, K>(mem, M, Layout::ColMajor)
+    }
+
+    /// Load the `K×N` right operand from a buffer holding `Bᵀ` (`N×K`, dense row-major) — the
+    /// `A·Bᵀ` form (Gram/covariance matrices, `J·Jᵀ`) with no transpose copy at load.
+    #[inline]
+    pub fn load_b_t<'a, const K: usize, const N: usize>(
+        self,
+        mem: &'a [T],
+    ) -> Tile<'a, T, S, T, K, N, MatrixB> {
+        self.load_b::<K, N>(mem, K, Layout::ColMajor)
+    }
+
     /// A zeroed `M×N` accumulator. Owned, so it carries whatever lifetime `mma` unifies it to.
     #[inline]
     pub fn zero_acc<'a, const M: usize, const N: usize>(
@@ -1590,6 +1830,100 @@ impl<'a, T: FloatScalar, S: MatrixBackend<T>, E: Scalar, const R: usize, const C
             inner: self.backend.tile_map(self.inner, f),
             _p: PhantomData,
         }
+    }
+}
+
+impl<'a, T: FloatScalar, S: MatrixBackend<T>, E: Scalar, const R: usize, const C: usize>
+    Tile<'a, T, S, E, R, C, Accumulator>
+{
+    /// Combine with another accumulator elementwise: `f(self, other)` per element.
+    #[inline]
+    pub fn zip(self, other: Self, f: impl Fn(E, E) -> E) -> Self {
+        Tile {
+            backend: self.backend,
+            inner: self.backend.tile_zip(self.inner, other.inner, f),
+            _p: PhantomData,
+        }
+    }
+
+    /// Fold each row into the matching entry of `acc` — the online form, for running
+    /// maxima/sums carried across successive tiles.
+    #[inline]
+    pub fn fold_rows(self, acc: [E; R], f: impl Fn(E, E) -> E) -> [E; R] {
+        self.backend.tile_fold_rows(self.inner, acc, f)
+    }
+
+    /// Fold each column into the matching entry of `acc` (see [`fold_rows`](Tile::fold_rows)).
+    #[inline]
+    pub fn fold_cols(self, acc: [E; C], f: impl Fn(E, E) -> E) -> [E; C] {
+        self.backend.tile_fold_cols(self.inner, acc, f)
+    }
+
+    /// Reduce each row to a scalar: `out[r] = f(…f(init, t[r][0])…, t[r][C-1])`.
+    #[inline]
+    pub fn reduce_rows(self, init: E, f: impl Fn(E, E) -> E) -> [E; R] {
+        self.fold_rows([init; R], f)
+    }
+
+    /// Reduce each column to a scalar (see [`reduce_rows`](Tile::reduce_rows)).
+    #[inline]
+    pub fn reduce_cols(self, init: E, f: impl Fn(E, E) -> E) -> [E; C] {
+        self.fold_cols([init; C], f)
+    }
+
+    /// The sum of each row.
+    #[inline]
+    pub fn row_sums(self) -> [E; R] {
+        self.reduce_rows(E::ZERO, |a, v| a + v)
+    }
+
+    /// The sum of each column.
+    #[inline]
+    pub fn col_sums(self) -> [E; C] {
+        self.reduce_cols(E::ZERO, |a, v| a + v)
+    }
+
+    /// Apply `f(elem, v[row])` across each row — a per-row scalar broadcast (bias add, per-row
+    /// scale, softmax normalization).
+    #[inline]
+    pub fn zip_rows(self, v: [E; R], f: impl Fn(E, E) -> E) -> Self {
+        Tile {
+            backend: self.backend,
+            inner: self.backend.tile_zip_rows(self.inner, v, f),
+            _p: PhantomData,
+        }
+    }
+
+    /// Apply `f(elem, v[col])` down each column — a per-column scalar broadcast.
+    #[inline]
+    pub fn zip_cols(self, v: [E; C], f: impl Fn(E, E) -> E) -> Self {
+        Tile {
+            backend: self.backend,
+            inner: self.backend.tile_zip_cols(self.inner, v, f),
+            _p: PhantomData,
+        }
+    }
+}
+
+impl<'a, T: FloatScalar, S: MatrixBackend<T>, E: Scalar, const R: usize, const C: usize>
+    core::ops::Add for Tile<'a, T, S, E, R, C, Accumulator>
+{
+    type Output = Self;
+    /// Elementwise sum of two accumulators.
+    #[inline]
+    fn add(self, rhs: Self) -> Self {
+        self.zip(rhs, |a, b| a + b)
+    }
+}
+
+impl<'a, T: FloatScalar, S: MatrixBackend<T>, E: Scalar, const R: usize, const C: usize>
+    core::ops::Sub for Tile<'a, T, S, E, R, C, Accumulator>
+{
+    type Output = Self;
+    /// Elementwise difference of two accumulators.
+    #[inline]
+    fn sub(self, rhs: Self) -> Self {
+        self.zip(rhs, |a, b| a - b)
     }
 }
 

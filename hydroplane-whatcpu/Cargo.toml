@@ -1,0 +1,15 @@
+[package]
+name = "hydroplane-whatcpu"
+version = "0.1.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Minimal, dependency-free, no_std CPU microarchitecture identification (Zen 5, Lion Cove, Firestorm, Neoverse V2, ...) for hydroplane's per-core tuning."
+repository = "https://github.com/oh-yes-0-fps/hydroplane"
+documentation = "https://docs.rs/hydroplane-whatcpu"
+readme = "README.md"
+keywords = ["cpu", "cpuid", "microarchitecture", "no-std", "detection"]
+categories = ["hardware-support", "no-std"]
+
+[dependencies]

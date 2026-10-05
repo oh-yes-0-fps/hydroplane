@@ -28,4 +28,4 @@ name = "case_study"
 harness = false
 
 [build-dependencies]
-hydroplane-auto = { version = "0.0.1", path = "../hydroplane-auto" }
+hydroplane-auto = { version = "0.1.1", path = "../hydroplane-auto" }

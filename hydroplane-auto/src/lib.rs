@@ -132,6 +132,7 @@ fn run_nested_analysis(manifest: &Path, out_dir: &Path, driver: &Path, metrics: 
         .arg(format!("+{TOOLCHAIN}"))
         .args(["build", "--quiet", "--release", "--manifest-path"])
         .arg(manifest.join("Cargo.toml"))
+        .args(["--no-default-features", "--features", &active_features()])
         .arg("--target-dir")
         .arg(out_dir.join("analysis-target"))
         .env("RUSTC_WORKSPACE_WRAPPER", driver)
@@ -144,6 +145,17 @@ fn run_nested_analysis(manifest: &Path, out_dir: &Path, driver: &Path, metrics: 
     if !status.success() {
         println!("cargo::warning=hydroplane analysis build exited with {status}");
     }
+}
+
+/// The features the outer build enabled, so the analysis sees the same kernels: cargo exposes
+/// each as `CARGO_FEATURE_<NAME>` (upper-cased, `-` as `_`), which maps back unambiguously for
+/// the usual lower-case feature names.
+fn active_features() -> String {
+    let mut names: Vec<String> = std::env::vars()
+        .filter_map(|(k, _)| k.strip_prefix("CARGO_FEATURE_").map(|f| f.to_lowercase()))
+        .collect();
+    names.sort();
+    names.join(",")
 }
 
 /// A cargo command with the outer toolchain's rustc overrides scrubbed, so the nested `+nightly` isn't

@@ -1,0 +1,22 @@
+[package]
+name = "hydroplane-solvers"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+description = "Sparse and dense solvers tuned per device: nested-dissection ordering, supernodal Cholesky on the CPU, multifrontal Cholesky on Vulkan GPUs (rust-gpu kernels, f32 and f64)."
+repository = "https://github.com/oh-yes-0-fps/hydroplane"
+
+[features]
+default = []
+# Multifrontal Cholesky on Vulkan compute. The build script compiles `kernels/` to SPIR-V with
+# rust-gpu (installing its pinned nightly on first use), once in f32 and once in f64.
+vulkan = ["dep:ash", "dep:cargo-gpu-install"]
+
+[dependencies]
+ash = { version = "0.38.0", optional = true }
+faer = { version = "0.24.4", default-features = false, features = ["std", "rayon"] }
+rayon = "1.12.0"
+
+[build-dependencies]
+cargo-gpu-install = { version = "0.10.0", optional = true }

@@ -85,6 +85,7 @@ name = "asm_mat3"
 required-features = ["glam"]
 
 [workspace]
-members = ["hydroplane-macros", "hydroplane-auto", "hydroplane-example", "hydroplane-whatcpu"]
+members = ["hydroplane-macros", "hydroplane-auto", "hydroplane-example", "hydroplane-whatcpu", "hydroplane-solvers"]
+exclude = ["hydroplane-solvers/kernels"]
 resolver = "2"
 

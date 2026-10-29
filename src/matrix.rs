@@ -1321,9 +1321,7 @@ where
             && is_x86_feature_detected!("avx512bw");
         #[cfg(hp_static_dispatch)]
         let avx512bf16 = cfg!(all(
-            target_feature = "avx512bf16",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
+            hp_tf_v4bf16
         ));
         if let (Some(adp), Some(bdp)) = (a_dense, b_dense)
             && TypeId::of::<T>() == TypeId::of::<half::bf16>()
@@ -1351,7 +1349,7 @@ where
     if M >= 32 && N >= 32 && K >= 32 {
         // Size the MR×NR block from the cached per-core unroll factor, capped to fit the SIMD
         // register file with scratch to spare (`5*NR + 1 <= REGS - 2`).
-        const REGS: usize = if cfg!(target_arch = "aarch64") || cfg!(target_feature = "avx512f") {
+        const REGS: usize = if cfg!(target_arch = "aarch64") || cfg!(hp_tf_v4) {
             32
         } else {
             16
@@ -1966,18 +1964,18 @@ macro_rules! impl_matrix_dispatch_simd {
                 {
                     #[cfg(not(any(hp_no_avx, hp_no_avx512)))]
                     if let Some(b) = crate::backend::avx512::Avx512::detect() {
-                        return kernel.run(Gang::new(b));
+                        return crate::dispatch::run_entered!(kernel, b);
                     }
                     #[cfg(not(hp_no_avx))]
                     if let Some(b) = crate::backend::avx2::Avx2::detect() {
-                        return kernel.run(Gang::new(b));
+                        return crate::dispatch::run_entered!(kernel, b);
                     }
-                    #[cfg(not(hp_no_avx))]
+                    #[cfg(all(not(hp_no_avx), feature = "avx1"))]
                     if let Some(b) = crate::backend::avx1::Avx1::detect() {
-                        return kernel.run(Gang::new(b));
+                        return crate::dispatch::run_entered!(kernel, b);
                     }
                     if let Some(b) = crate::backend::sse4::Sse4::detect() {
-                        return kernel.run(Gang::new(b));
+                        return crate::dispatch::run_entered!(kernel, b);
                     }
                 }
                 // Compile-time selection (no-std, or `hp_static_dispatch` on std): the widest
@@ -1985,52 +1983,51 @@ macro_rules! impl_matrix_dispatch_simd {
                 #[cfg(all(
                     any(target_arch = "x86_64", target_arch = "x86"),
                     any(not(feature = "std"), hp_static_dispatch),
-                    target_feature = "avx512f",
+                    hp_tf_v4,
                     not(any(hp_no_avx, hp_no_avx512))
                 ))]
                 {
                     // SAFETY: target compiled with avx512f.
                     let b = unsafe { crate::backend::avx512::Avx512::new_unchecked() };
-                    return kernel.run(Gang::new(b));
+                    return crate::dispatch::run_entered!(kernel, b);
                 }
                 #[cfg(all(
                     any(target_arch = "x86_64", target_arch = "x86"),
                     any(not(feature = "std"), hp_static_dispatch),
-                    not(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512)))),
-                    target_feature = "avx2",
-                    target_feature = "fma",
+                    not(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512)))),
+                    hp_tf_v3,
                     not(hp_no_avx)
                 ))]
                 {
                     // SAFETY: target compiled with avx2+fma.
                     let b = unsafe { crate::backend::avx2::Avx2::new_unchecked() };
-                    return kernel.run(Gang::new(b));
+                    return crate::dispatch::run_entered!(kernel, b);
                 }
                 #[cfg(all(
                     any(target_arch = "x86_64", target_arch = "x86"),
                     any(not(feature = "std"), hp_static_dispatch),
-                    not(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512)))),
-                    not(all(target_feature = "avx2", target_feature = "fma", not(hp_no_avx))),
-                    target_feature = "avx",
+                    not(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512)))),
+                    not(all(hp_tf_v3, not(hp_no_avx))),
+                    hp_tf_avx,
                     not(hp_no_avx)
                 ))]
                 {
                     // SAFETY: target compiled with avx.
                     let b = unsafe { crate::backend::avx1::Avx1::new_unchecked() };
-                    return kernel.run(Gang::new(b));
+                    return crate::dispatch::run_entered!(kernel, b);
                 }
                 #[cfg(all(
                     any(target_arch = "x86_64", target_arch = "x86"),
                     any(not(feature = "std"), hp_static_dispatch),
-                    not(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512)))),
-                    not(all(target_feature = "avx2", target_feature = "fma", not(hp_no_avx))),
-                    not(all(target_feature = "avx", not(hp_no_avx))),
-                    target_feature = "sse4.1"
+                    not(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512)))),
+                    not(all(hp_tf_v3, not(hp_no_avx))),
+                    not(all(hp_tf_avx, not(hp_no_avx))),
+                    hp_tf_v2
                 ))]
                 {
                     // SAFETY: target compiled with sse4.1.
                     let b = unsafe { crate::backend::sse4::Sse4::new_unchecked() };
-                    return kernel.run(Gang::new(b));
+                    return crate::dispatch::run_entered!(kernel, b);
                 }
                 // aarch64: non-Apple SVE token (its `mma` lands on the SME ZA engine where
                 // present), else NEON; Apple NEON delegates large tiles to Accelerate.
@@ -2066,22 +2063,20 @@ mod half_matrix_dispatch {
             ))]
             {
                 if let Some(b) = crate::backend::avx2::Avx2::detect() {
-                    return kernel.run(Gang::new(b));
+                    return crate::dispatch::run_entered!(kernel, b);
                 }
             }
             // Compile-time AVX2 F16C widen tile (no-std, or `hp_static_dispatch` on std).
             #[cfg(all(
                 any(target_arch = "x86_64", target_arch = "x86"),
                 any(not(feature = "std"), hp_static_dispatch),
-                target_feature = "avx2",
-                target_feature = "fma",
-                target_feature = "f16c",
+                hp_tf_v3,
                 not(hp_no_avx)
             ))]
             {
                 // SAFETY: target compiled with avx2+fma+f16c.
                 let b = unsafe { crate::backend::avx2::Avx2::new_unchecked() };
-                return kernel.run(Gang::new(b));
+                return crate::dispatch::run_entered!(kernel, b);
             }
             crate::dispatch::aarch64_dispatch_tail!(kernel, crate::backend::ScalarBackend);
             kernel.run(Gang::new(crate::backend::ScalarBackend))
@@ -2101,37 +2096,36 @@ mod half_matrix_dispatch {
             {
                 #[cfg(not(any(hp_no_avx, hp_no_avx512)))]
                 if let Some(b) = crate::backend::avx512::Avx512::detect() {
-                    return kernel.run(Gang::new(b));
+                    return crate::dispatch::run_entered!(kernel, b);
                 }
                 #[cfg(not(hp_no_avx))]
                 if let Some(b) = crate::backend::avx2::Avx2::detect() {
-                    return kernel.run(Gang::new(b));
+                    return crate::dispatch::run_entered!(kernel, b);
                 }
             }
             // Compile-time bf16 widen tile: AVX-512 if the build guarantees `avx512f`, else AVX2.
             #[cfg(all(
                 any(target_arch = "x86_64", target_arch = "x86"),
                 any(not(feature = "std"), hp_static_dispatch),
-                target_feature = "avx512f",
+                hp_tf_v4,
                 not(any(hp_no_avx, hp_no_avx512))
             ))]
             {
                 // SAFETY: target compiled with avx512f.
                 let b = unsafe { crate::backend::avx512::Avx512::new_unchecked() };
-                return kernel.run(Gang::new(b));
+                return crate::dispatch::run_entered!(kernel, b);
             }
             #[cfg(all(
                 any(target_arch = "x86_64", target_arch = "x86"),
                 any(not(feature = "std"), hp_static_dispatch),
-                not(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512)))),
-                target_feature = "avx2",
-                target_feature = "fma",
+                not(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512)))),
+                hp_tf_v3,
                 not(hp_no_avx)
             ))]
             {
                 // SAFETY: target compiled with avx2+fma.
                 let b = unsafe { crate::backend::avx2::Avx2::new_unchecked() };
-                return kernel.run(Gang::new(b));
+                return crate::dispatch::run_entered!(kernel, b);
             }
             crate::dispatch::aarch64_dispatch_tail!(kernel, crate::backend::neon::Neon::new());
             crate::dispatch::wasm_dispatch_tail!(kernel);

@@ -21,16 +21,12 @@ impl Avx1 {
     #[allow(dead_code)]
     #[inline]
     pub fn detect() -> Option<Self> {
-        if is_x86_feature_detected!("avx") {
-            Some(Self(()))
-        } else {
-            None
-        }
+        if crate::__hp_isa!(detect AVX) { Some(Self(())) } else { None }
     }
 
     /// # Safety
-    /// The caller guarantees the running CPU supports `avx`. Calling any [`Backend`] method on a
-    /// token built this way on an unsupported CPU is UB.
+    /// The caller guarantees the running CPU has the whole `AVX` tier bundle ([`crate::isa`]).
+    /// Calling any [`Backend`] method on a token built this way on an unsupported CPU is UB.
     // Dead only on a std build with no static avx guarantee, which goes through runtime `detect`.
     #[allow(dead_code)]
     #[inline]
@@ -40,6 +36,8 @@ impl Avx1 {
 }
 
 impl Backend<f32> for Avx1 {
+    crate::backend::enter_with_features!(AVX);
+
     type Vector = __m256;
     type Mask = __m256;
 

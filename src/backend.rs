@@ -6,6 +6,49 @@ use crate::scalar::{FloatScalar, IntScalar, Scalar};
 
 /// An instruction-set execution context for scalar `T`. Implemented by [`ScalarBackend`]
 /// (every `T`) and, per `(ISA, scalar)`, by the hand-rolled `core::arch` backends.
+/// [`Backend::load_first`]'s portable default. Cold and out of line so the staging buffer never
+/// spills registers out of a caller's inner loop.
+#[cold]
+#[inline(never)]
+fn stage_load_first<T: Scalar, B: Backend<T>>(b: B, s: &[T], fill: T) -> B::Vector {
+    let n = b.lanes();
+    // A bounded `0..n` loop rather than `copy_from_slice`, so DSE can shrink the
+    // `[fill; MAX_LANES]` init to the lanes actually loaded once `n` is a constant.
+    let mut buf = [fill; crate::MAX_LANES];
+    for i in 0..n {
+        if i < s.len() {
+            buf[i] = s[i];
+        }
+    }
+    b.load(&buf[..n])
+}
+
+/// [`Backend::store_first`]'s portable default.
+#[cold]
+#[inline(never)]
+fn stage_store_first<T: Scalar, B: Backend<T>>(b: B, v: B::Vector, s: &mut [T]) {
+    let n = b.lanes();
+    let mut buf = [T::ZERO; crate::MAX_LANES];
+    b.store(v, &mut buf[..n]);
+    s.copy_from_slice(&buf[..s.len()]);
+}
+
+/// Work run by [`Backend::enter`]. A closure is one; an implementor whose `call` is
+/// `#[inline(always)]` is guaranteed to land inside the entered function however large its body,
+/// which a closure is not.
+pub trait Enter {
+    type Output;
+    fn call(self) -> Self::Output;
+}
+
+impl<R, F: FnOnce() -> R> Enter for F {
+    type Output = R;
+    #[inline(always)]
+    fn call(self) -> R {
+        self()
+    }
+}
+
 pub trait Backend<T: Scalar>: Copy {
     /// The varying register holding [`Backend::lanes`] elements of `T`.
     type Vector: Copy;
@@ -21,11 +64,59 @@ pub trait Backend<T: Scalar>: Copy {
     /// Number of `T` lanes in one register under this backend.
     fn lanes(self) -> usize;
 
+    /// Runs `work` inside a function compiled with this token's target features. Every op of a
+    /// runtime-detected ISA is a `#[target_feature]` primitive, which can only inline into code
+    /// compiled with those features; dispatch runs each kernel through here so the kernel body is
+    /// such code. Token-wide: dispatch calls it through `Backend<f32>`, so only the `f32` impls
+    /// override it ([`enter_with_features`]). The default suits tokens whose ISA is the build's
+    /// baseline.
+    #[inline(always)]
+    fn enter<E: Enter>(self, work: E) -> E::Output {
+        work.call()
+    }
+
+    /// The [`crate::isa`] tier [`enter`](Backend::enter) compiles for: `#[kernel]` matches on it to pick
+    /// the copy of the kernel body compiled with that ISA's target features. Set alongside `enter`
+    /// by [`enter_with_features`].
+    #[doc(hidden)]
+    const ISA: u8 = crate::isa::BASE;
+
     fn splat(self, v: T) -> Self::Vector;
     /// Load exactly one register. `s.len()` must equal [`Backend::lanes`].
     fn load(self, s: &[T]) -> Self::Vector;
     /// Store exactly one register. `s.len()` must equal [`Backend::lanes`].
     fn store(self, v: Self::Vector, s: &mut [T]);
+    /// The first `s.len()` lanes from `s` (fewer than [`lanes`](Backend::lanes)), the rest `fill`.
+    /// The default stages through a buffer out of line; ISAs with masked loads override it.
+    #[inline]
+    fn load_first(self, s: &[T], fill: T) -> Self::Vector {
+        stage_load_first(self, s, fill)
+    }
+    /// Lanes `0..cnt` active (`cnt <= lanes()`). The default compares a lane ramp against `cnt`;
+    /// ISAs that can build the mask directly override it.
+    #[inline(always)]
+    fn mask_first(self, cnt: usize) -> Self::Mask {
+        let n = self.lanes();
+        let mut ramp = [T::ZERO; crate::MAX_LANES];
+        for (i, slot) in ramp[..n].iter_mut().enumerate() {
+            *slot = T::from_f64(i as f64);
+        }
+        self.lt(self.load(&ramp[..n]), self.splat(T::from_f64(cnt as f64)))
+    }
+    /// The `N` columns of exactly [`lanes`](Backend::lanes) rows of `[T; N]`, split by a
+    /// deinterleaving load or an in-register transpose, or `None` where this backend has neither
+    /// for this `N`.
+    #[inline(always)]
+    fn load_rows<const N: usize>(self, rows: &[[T; N]]) -> Option<[Self::Vector; N]> {
+        let _ = rows;
+        None
+    }
+    /// Stores the first `s.len()` lanes of `v` (fewer than [`lanes`](Backend::lanes)) into `s`.
+    /// The default stages through a buffer out of line; ISAs with masked stores override it.
+    #[inline]
+    fn store_first(self, v: Self::Vector, s: &mut [T]) {
+        stage_store_first(self, v, s)
+    }
 
     fn add(self, a: Self::Vector, b: Self::Vector) -> Self::Vector;
     fn sub(self, a: Self::Vector, b: Self::Vector) -> Self::Vector;
@@ -301,6 +392,67 @@ pub trait Backend<T: Scalar>: Copy {
         self.i_map(a, |x| ((x as i32) >> k) as u32)
     }
 
+    /// Per-lane logical left shift: lane `l` of `a` shifts by lane `l` of `counts`. Every active
+    /// count must be `< 32`; out-of-range counts are backend-specific (x86 `vpsllvd` yields 0,
+    /// NEON `vshl` saturates to 0, RISC-V masks modulo 32), so the in-range contract is the only
+    /// portable one. The portable default shifts lane-wise; backends with a native variable shift
+    /// (AVX2 `vpsllvd`, AVX-512, NEON `vshl` with a per-lane count) override it.
+    #[inline]
+    fn ishl_var(self, a: Self::IVector, counts: Self::IVector) -> Self::IVector {
+        self.i_zip(a, counts, |x, k| {
+            debug_assert!(k < 32);
+            x.wrapping_shl(k)
+        })
+    }
+    /// Per-lane logical (zero-filling) right shift; see [`ishl_var`](Backend::ishl_var).
+    #[inline]
+    fn ishr_var(self, a: Self::IVector, counts: Self::IVector) -> Self::IVector {
+        self.i_zip(a, counts, |x, k| {
+            debug_assert!(k < 32);
+            x.wrapping_shr(k)
+        })
+    }
+    /// Per-lane arithmetic (sign-filling) right shift, for the `i32` view; see
+    /// [`ishl_var`](Backend::ishl_var).
+    #[inline]
+    fn ishr_arith_var(self, a: Self::IVector, counts: Self::IVector) -> Self::IVector {
+        self.i_zip(a, counts, |x, k| {
+            debug_assert!(k < 32);
+            ((x as i32).wrapping_shr(k)) as u32
+        })
+    }
+
+    /// Lane-wise unsigned minimum of the integer companion. Portable default lane-wise; backends
+    /// with a native integer min (NEON `vmin`, x86 `pminud`) override it. `imax_u` is the maximum.
+    #[inline]
+    fn imin_u(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.i_zip(a, b, core::cmp::Ord::min)
+    }
+    #[inline]
+    fn imax_u(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.i_zip(a, b, core::cmp::Ord::max)
+    }
+    /// Lane-wise signed minimum/maximum (the `i32` view).
+    #[inline]
+    fn imin_s(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.i_zip(a, b, |x, y| core::cmp::min(x as i32, y as i32) as u32)
+    }
+    #[inline]
+    fn imax_s(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.i_zip(a, b, |x, y| core::cmp::max(x as i32, y as i32) as u32)
+    }
+    /// Lane-wise absolute value of the `i32` view; `iabs(i32::MIN)` wraps to `i32::MIN`.
+    #[inline]
+    fn iabs(self, a: Self::IVector) -> Self::IVector {
+        self.i_map(a, |x| (x as i32).wrapping_abs() as u32)
+    }
+    /// Lane-wise count of leading zero bits, treating each lane as `u32`; `clz(0) == 32`.
+    /// Backends with a native count-leading-zeros (NEON `vclz`, AVX-512CD `vplzcntd`) override it.
+    #[inline]
+    fn ileading_zeros(self, a: Self::IVector) -> Self::IVector {
+        self.i_map(a, u32::leading_zeros)
+    }
+
     #[inline]
     fn ieq(self, a: Self::IVector, b: Self::IVector) -> Self::Mask {
         self.i_cmp(a, b, |x, y| x == y)
@@ -364,6 +516,249 @@ pub trait Backend<T: Scalar>: Copy {
             i += 1;
         }
         self.load(&f[..n])
+    }
+
+    /// Numerically truncate each float lane toward zero to a signed integer lane (the `i32` view
+    /// of the companion) — the value cast `f as i32`, not the [`to_bits`](Backend::to_bits) bit
+    /// reinterpret. Saturates at the `i32` range. This is how an f32-domain value becomes a gather
+    /// index. Float-family only; native backends override with a single convert instruction
+    /// (NEON `vcvtq_s32_f32`, x86 `cvttps`).
+    #[inline]
+    fn trunc_to_i32(self, v: Self::Vector) -> Self::IVector
+    where
+        T: FloatScalar,
+    {
+        let n = self.lanes();
+        let mut f = [T::ZERO; crate::MAX_LANES];
+        self.store(v, &mut f[..n]);
+        let mut u = [0u32; crate::MAX_LANES];
+        let mut i = 0;
+        while i < n {
+            u[i] = (f[i].into_f64() as i32) as u32;
+            i += 1;
+        }
+        self.iload(&u[..n])
+    }
+    /// Numerically round each float lane to the nearest signed integer (ties to even), matching
+    /// the hardware convert's default rounding. See [`trunc_to_i32`](Backend::trunc_to_i32).
+    #[inline]
+    fn round_to_i32(self, v: Self::Vector) -> Self::IVector
+    where
+        T: FloatScalar,
+    {
+        let n = self.lanes();
+        let mut f = [T::ZERO; crate::MAX_LANES];
+        self.store(v, &mut f[..n]);
+        let mut u = [0u32; crate::MAX_LANES];
+        let mut i = 0;
+        while i < n {
+            u[i] = (crate::scalar::round_ties_even_f64(f[i].into_f64()) as i32) as u32;
+            i += 1;
+        }
+        self.iload(&u[..n])
+    }
+    /// Numerically convert each signed-integer companion lane to a float lane (`i32 as f`); the
+    /// inverse of [`trunc_to_i32`](Backend::trunc_to_i32)/[`round_to_i32`](Backend::round_to_i32).
+    #[inline]
+    #[allow(clippy::wrong_self_convention)]
+    fn i32_to_float(self, v: Self::IVector) -> Self::Vector
+    where
+        T: FloatScalar,
+    {
+        let n = self.lanes();
+        let mut u = [0u32; crate::MAX_LANES];
+        self.istore(v, &mut u[..n]);
+        let mut f = [T::ZERO; crate::MAX_LANES];
+        let mut i = 0;
+        while i < n {
+            f[i] = T::from_f64((u[i] as i32) as f64);
+            i += 1;
+        }
+        self.load(&f[..n])
+    }
+    /// Numerically convert each unsigned-integer companion lane to a float lane (`u32 as f`).
+    #[inline]
+    #[allow(clippy::wrong_self_convention)]
+    fn u32_to_float(self, v: Self::IVector) -> Self::Vector
+    where
+        T: FloatScalar,
+    {
+        let n = self.lanes();
+        let mut u = [0u32; crate::MAX_LANES];
+        self.istore(v, &mut u[..n]);
+        let mut f = [T::ZERO; crate::MAX_LANES];
+        let mut i = 0;
+        while i < n {
+            f[i] = T::from_f64(u[i] as f64);
+            i += 1;
+        }
+        self.load(&f[..n])
+    }
+
+    /// Varying-index gather: lane `l` loads `base[idx_l]`, a distinct address per lane. This is
+    /// the access the SoA [`load`](Backend::load) and `gather_n` staging can't express — those
+    /// move a fixed layout, this reads an independent index per lane. It is the primitive under
+    /// any per-lane indexed table: a histogram bin, a BVH node or triangle fetched by a per-lane
+    /// id. Every index must be in bounds (`< base.len()`); an out-of-range index panics. The
+    /// portable default stores the index register and loads element-wise; an ISA with a native
+    /// gather (AVX2 `vgatherdps`, AVX-512, SVE `ld1*` gather) overrides it.
+    /// Whether [`gather`](Backend::gather) is one hardware instruction rather than the
+    /// element-wise default, so a strided gather beats a transpose through scratch memory.
+    const NATIVE_GATHER: bool = false;
+
+    #[inline]
+    fn gather(self, base: &[T], idx: Self::IVector) -> Self::Vector {
+        let n = self.lanes();
+        let mut ix = [0u32; crate::MAX_LANES];
+        self.istore(idx, &mut ix[..n]);
+        let mut out = [T::ZERO; crate::MAX_LANES];
+        let mut i = 0;
+        while i < n {
+            out[i] = base[ix[i] as usize];
+            i += 1;
+        }
+        self.load(&out[..n])
+    }
+
+    /// Masked gather: active lanes load `base[idx_l]`; inactive lanes take the matching lane of
+    /// `fill` and their index is never dereferenced, so a masked-off lane may carry any index, in
+    /// range or not. Lets a gather run against a partial final stripe or a guarded table.
+    #[inline]
+    fn gather_masked(
+        self,
+        base: &[T],
+        idx: Self::IVector,
+        m: Self::Mask,
+        fill: Self::Vector,
+    ) -> Self::Vector {
+        let n = self.lanes();
+        let mut ix = [0u32; crate::MAX_LANES];
+        self.istore(idx, &mut ix[..n]);
+        let mut out = [T::ZERO; crate::MAX_LANES];
+        self.store(fill, &mut out[..n]);
+        let bits = self.mask_bitmask(m);
+        let mut i = 0;
+        while i < n {
+            if bits & (1 << i) != 0 {
+                out[i] = base[ix[i] as usize];
+            }
+            i += 1;
+        }
+        self.load(&out[..n])
+    }
+
+    /// Varying-index scatter: lane `l` writes its value to `out[idx_l]`. When two active lanes
+    /// target the same slot the stored value is one of the contenders and which is unspecified;
+    /// this default and the native paths let the highest lane win (matching AVX-512 `vpscatter`,
+    /// whose stores retire from the low lane up). A read-modify-write table update — a histogram,
+    /// the entropy-coder context stats — must therefore resolve same-slot collisions itself:
+    /// scatter is placement, not atomic accumulation. Every index must be in bounds.
+    #[inline]
+    fn scatter(self, out: &mut [T], idx: Self::IVector, v: Self::Vector) {
+        let n = self.lanes();
+        let mut ix = [0u32; crate::MAX_LANES];
+        self.istore(idx, &mut ix[..n]);
+        let mut vals = [T::ZERO; crate::MAX_LANES];
+        self.store(v, &mut vals[..n]);
+        let mut i = 0;
+        while i < n {
+            out[ix[i] as usize] = vals[i];
+            i += 1;
+        }
+    }
+
+    /// Masked scatter: only active lanes write; an inactive lane touches nothing and its index is
+    /// not dereferenced. Same highest-lane-wins collision contract as [`scatter`](Backend::scatter).
+    #[inline]
+    fn scatter_masked(self, out: &mut [T], idx: Self::IVector, v: Self::Vector, m: Self::Mask) {
+        let n = self.lanes();
+        let mut ix = [0u32; crate::MAX_LANES];
+        self.istore(idx, &mut ix[..n]);
+        let mut vals = [T::ZERO; crate::MAX_LANES];
+        self.store(v, &mut vals[..n]);
+        let bits = self.mask_bitmask(m);
+        let mut i = 0;
+        while i < n {
+            if bits & (1 << i) != 0 {
+                out[ix[i] as usize] = vals[i];
+            }
+            i += 1;
+        }
+    }
+
+    /// Integer companion to [`gather`](Backend::gather): lane `l` loads `base[idx_l]` from a `u32`
+    /// table into the integer register, for index-of-index walks — a BVH child-pointer fetch, the
+    /// per-lane bin counters behind a SIMD histogram.
+    #[inline]
+    fn igather(self, base: &[u32], idx: Self::IVector) -> Self::IVector {
+        let n = self.lanes();
+        let mut ix = [0u32; crate::MAX_LANES];
+        self.istore(idx, &mut ix[..n]);
+        let mut out = [0u32; crate::MAX_LANES];
+        let mut i = 0;
+        while i < n {
+            out[i] = base[ix[i] as usize];
+            i += 1;
+        }
+        self.iload(&out[..n])
+    }
+
+    /// Masked integer gather; see [`gather_masked`](Backend::gather_masked).
+    #[inline]
+    fn igather_masked(
+        self,
+        base: &[u32],
+        idx: Self::IVector,
+        m: Self::Mask,
+        fill: Self::IVector,
+    ) -> Self::IVector {
+        let n = self.lanes();
+        let mut ix = [0u32; crate::MAX_LANES];
+        self.istore(idx, &mut ix[..n]);
+        let mut out = [0u32; crate::MAX_LANES];
+        self.istore(fill, &mut out[..n]);
+        let bits = self.mask_bitmask(m);
+        let mut i = 0;
+        while i < n {
+            if bits & (1 << i) != 0 {
+                out[i] = base[ix[i] as usize];
+            }
+            i += 1;
+        }
+        self.iload(&out[..n])
+    }
+
+    /// Integer companion to [`scatter`](Backend::scatter); same highest-lane-wins contract.
+    #[inline]
+    fn iscatter(self, out: &mut [u32], idx: Self::IVector, v: Self::IVector) {
+        let n = self.lanes();
+        let mut ix = [0u32; crate::MAX_LANES];
+        self.istore(idx, &mut ix[..n]);
+        let mut vals = [0u32; crate::MAX_LANES];
+        self.istore(v, &mut vals[..n]);
+        let mut i = 0;
+        while i < n {
+            out[ix[i] as usize] = vals[i];
+            i += 1;
+        }
+    }
+
+    /// Masked integer scatter; see [`scatter_masked`](Backend::scatter_masked).
+    #[inline]
+    fn iscatter_masked(self, out: &mut [u32], idx: Self::IVector, v: Self::IVector, m: Self::Mask) {
+        let n = self.lanes();
+        let mut ix = [0u32; crate::MAX_LANES];
+        self.istore(idx, &mut ix[..n]);
+        let mut vals = [0u32; crate::MAX_LANES];
+        self.istore(v, &mut vals[..n]);
+        let bits = self.mask_bitmask(m);
+        let mut i = 0;
+        while i < n {
+            if bits & (1 << i) != 0 {
+                out[ix[i] as usize] = vals[i];
+            }
+            i += 1;
+        }
     }
 }
 
@@ -555,6 +950,43 @@ impl<T: Scalar> Backend<T> for ScalarBackend {
     fn istore(self, v: u32, out: &mut [u32]) {
         out[0] = v;
     }
+
+    #[inline(always)]
+    fn gather(self, base: &[T], idx: u32) -> T {
+        base[idx as usize]
+    }
+    #[inline(always)]
+    fn gather_masked(self, base: &[T], idx: u32, m: bool, fill: T) -> T {
+        if m { base[idx as usize] } else { fill }
+    }
+    #[inline(always)]
+    fn scatter(self, out: &mut [T], idx: u32, v: T) {
+        out[idx as usize] = v;
+    }
+    #[inline(always)]
+    fn scatter_masked(self, out: &mut [T], idx: u32, v: T, m: bool) {
+        if m {
+            out[idx as usize] = v;
+        }
+    }
+    #[inline(always)]
+    fn igather(self, base: &[u32], idx: u32) -> u32 {
+        base[idx as usize]
+    }
+    #[inline(always)]
+    fn igather_masked(self, base: &[u32], idx: u32, m: bool, fill: u32) -> u32 {
+        if m { base[idx as usize] } else { fill }
+    }
+    #[inline(always)]
+    fn iscatter(self, out: &mut [u32], idx: u32, v: u32) {
+        out[idx as usize] = v;
+    }
+    #[inline(always)]
+    fn iscatter_masked(self, out: &mut [u32], idx: u32, v: u32, m: bool) {
+        if m {
+            out[idx as usize] = v;
+        }
+    }
 }
 
 /// A backend `B` re-stamped with a compile-time unroll factor `K`. Every op delegates to `B`;
@@ -575,6 +1007,28 @@ impl<T: Scalar, B: Backend<T>, const K: usize> Backend<T> for Unroll<B, K> {
     #[inline(always)]
     fn lanes(self) -> usize {
         self.0.lanes()
+    }
+    #[inline(always)]
+    fn enter<E: Enter>(self, work: E) -> E::Output {
+        self.0.enter(work)
+    }
+    const ISA: u8 = B::ISA;
+    const NATIVE_GATHER: bool = B::NATIVE_GATHER;
+    #[inline(always)]
+    fn load_first(self, s: &[T], fill: T) -> Self::Vector {
+        self.0.load_first(s, fill)
+    }
+    #[inline(always)]
+    fn load_rows<const N: usize>(self, rows: &[[T; N]]) -> Option<[Self::Vector; N]> {
+        self.0.load_rows(rows)
+    }
+    #[inline(always)]
+    fn mask_first(self, cnt: usize) -> Self::Mask {
+        self.0.mask_first(cnt)
+    }
+    #[inline(always)]
+    fn store_first(self, v: Self::Vector, s: &mut [T]) {
+        self.0.store_first(v, s)
     }
     #[inline(always)]
     fn splat(self, v: T) -> Self::Vector {
@@ -798,6 +1252,66 @@ impl<T: Scalar, B: Backend<T>, const K: usize> Backend<T> for Unroll<B, K> {
         self.0.ishr_arith(a, k)
     }
     #[inline(always)]
+    fn ishl_var(self, a: Self::IVector, counts: Self::IVector) -> Self::IVector {
+        self.0.ishl_var(a, counts)
+    }
+    #[inline(always)]
+    fn ishr_var(self, a: Self::IVector, counts: Self::IVector) -> Self::IVector {
+        self.0.ishr_var(a, counts)
+    }
+    #[inline(always)]
+    fn ishr_arith_var(self, a: Self::IVector, counts: Self::IVector) -> Self::IVector {
+        self.0.ishr_arith_var(a, counts)
+    }
+    #[inline(always)]
+    fn imin_u(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.0.imin_u(a, b)
+    }
+    #[inline(always)]
+    fn imax_u(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.0.imax_u(a, b)
+    }
+    #[inline(always)]
+    fn imin_s(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.0.imin_s(a, b)
+    }
+    #[inline(always)]
+    fn imax_s(self, a: Self::IVector, b: Self::IVector) -> Self::IVector {
+        self.0.imax_s(a, b)
+    }
+    #[inline(always)]
+    fn iabs(self, a: Self::IVector) -> Self::IVector {
+        self.0.iabs(a)
+    }
+    #[inline(always)]
+    fn trunc_to_i32(self, v: Self::Vector) -> Self::IVector
+    where
+        T: FloatScalar,
+    {
+        self.0.trunc_to_i32(v)
+    }
+    #[inline(always)]
+    fn round_to_i32(self, v: Self::Vector) -> Self::IVector
+    where
+        T: FloatScalar,
+    {
+        self.0.round_to_i32(v)
+    }
+    #[inline(always)]
+    fn i32_to_float(self, v: Self::IVector) -> Self::Vector
+    where
+        T: FloatScalar,
+    {
+        self.0.i32_to_float(v)
+    }
+    #[inline(always)]
+    fn u32_to_float(self, v: Self::IVector) -> Self::Vector
+    where
+        T: FloatScalar,
+    {
+        self.0.u32_to_float(v)
+    }
+    #[inline(always)]
     fn ieq(self, a: Self::IVector, b: Self::IVector) -> Self::Mask {
         self.0.ieq(a, b)
     }
@@ -820,6 +1334,50 @@ impl<T: Scalar, B: Backend<T>, const K: usize> Backend<T> for Unroll<B, K> {
     #[inline(always)]
     fn from_bits(self, v: Self::IVector) -> Self::Vector {
         self.0.from_bits(v)
+    }
+    #[inline(always)]
+    fn gather(self, base: &[T], idx: Self::IVector) -> Self::Vector {
+        self.0.gather(base, idx)
+    }
+    #[inline(always)]
+    fn gather_masked(
+        self,
+        base: &[T],
+        idx: Self::IVector,
+        m: Self::Mask,
+        fill: Self::Vector,
+    ) -> Self::Vector {
+        self.0.gather_masked(base, idx, m, fill)
+    }
+    #[inline(always)]
+    fn scatter(self, out: &mut [T], idx: Self::IVector, v: Self::Vector) {
+        self.0.scatter(out, idx, v)
+    }
+    #[inline(always)]
+    fn scatter_masked(self, out: &mut [T], idx: Self::IVector, v: Self::Vector, m: Self::Mask) {
+        self.0.scatter_masked(out, idx, v, m)
+    }
+    #[inline(always)]
+    fn igather(self, base: &[u32], idx: Self::IVector) -> Self::IVector {
+        self.0.igather(base, idx)
+    }
+    #[inline(always)]
+    fn igather_masked(
+        self,
+        base: &[u32],
+        idx: Self::IVector,
+        m: Self::Mask,
+        fill: Self::IVector,
+    ) -> Self::IVector {
+        self.0.igather_masked(base, idx, m, fill)
+    }
+    #[inline(always)]
+    fn iscatter(self, out: &mut [u32], idx: Self::IVector, v: Self::IVector) {
+        self.0.iscatter(out, idx, v)
+    }
+    #[inline(always)]
+    fn iscatter_masked(self, out: &mut [u32], idx: Self::IVector, v: Self::IVector, m: Self::Mask) {
+        self.0.iscatter_masked(out, idx, v, m)
     }
 }
 
@@ -1141,16 +1699,58 @@ macro_rules! emulated_int_element {
 #[allow(unused_imports)] // per-target: each ISA file imports only what it lacks
 pub(crate) use {emulated_common_methods, emulated_float_element, emulated_int_element};
 
+/// Overrides [`Backend::enter`] inside a token's `impl Backend<f32>` with a trampoline compiled
+/// for tier `$isa`'s feature bundle ([`crate::isa`]), which every way of constructing the token
+/// must guarantee, and sets [`Backend::ISA`] to it.
+#[allow(unused_macros)] // per-target: only the ISA files of the build's arch instantiate it
+macro_rules! enter_with_features {
+    ($isa:ident) => {
+        const ISA: u8 = crate::isa::$isa;
+
+        #[inline(always)]
+        fn enter<E: crate::backend::Enter>(self, work: E) -> E::Output {
+            crate::__hp_isa! { item $isa
+                #[inline]
+                fn on<E: crate::backend::Enter>(work: E) -> E::Output {
+                    work.call()
+                }
+            }
+            // SAFETY: the token exists only on a CPU with the tier's whole feature bundle.
+            unsafe { on(work) }
+        }
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use enter_with_features;
+
 /// Delegate an element's whole backend to another token's impl (for capability-superset tokens:
 /// `Avx512Fp16`/`Avx512Bf16` imply `avx512f`, so their non-native elements ride `Avx512`).
 #[allow(unused_macros)] // per-target: each ISA file instantiates only what it lacks
 macro_rules! delegate_float_element {
-    ($token:ty, $t:ty, $inner_ty:ty, $inner:expr) => {
+    ($token:ty, $t:ty, $inner_ty:ty, $inner:expr $(, enter = $isa:ident)?) => {
         impl crate::backend::Backend<$t> for $token {
             type Vector = <$inner_ty as crate::backend::Backend<$t>>::Vector;
             type Mask = <$inner_ty as crate::backend::Backend<$t>>::Mask;
             type IVector = <$inner_ty as crate::backend::Backend<$t>>::IVector;
             const UNROLL: usize = <$inner_ty as crate::backend::Backend<$t>>::UNROLL;
+            const NATIVE_GATHER: bool = <$inner_ty as crate::backend::Backend<$t>>::NATIVE_GATHER;
+            #[inline(always)]
+            fn load_first(self, s: &[$t], fill: $t) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::load_first($inner, s, fill)
+            }
+            #[inline(always)]
+            fn load_rows<const N: usize>(self, rows: &[[$t; N]]) -> Option<[Self::Vector; N]> {
+                <$inner_ty as crate::backend::Backend<$t>>::load_rows($inner, rows)
+            }
+            #[inline(always)]
+            fn mask_first(self, cnt: usize) -> Self::Mask {
+                <$inner_ty as crate::backend::Backend<$t>>::mask_first($inner, cnt)
+            }
+            #[inline(always)]
+            fn store_first(self, v: Self::Vector, s: &mut [$t]) {
+                <$inner_ty as crate::backend::Backend<$t>>::store_first($inner, v, s)
+            }
+            $(crate::backend::enter_with_features!($isa);)?
 
             #[inline(always)]
             fn lanes(self) -> usize {
@@ -1297,6 +1897,23 @@ macro_rules! delegate_int_element {
             type Mask = <$inner_ty as crate::backend::Backend<$t>>::Mask;
             type IVector = <$inner_ty as crate::backend::Backend<$t>>::IVector;
             const UNROLL: usize = <$inner_ty as crate::backend::Backend<$t>>::UNROLL;
+            const NATIVE_GATHER: bool = <$inner_ty as crate::backend::Backend<$t>>::NATIVE_GATHER;
+            #[inline(always)]
+            fn load_first(self, s: &[$t], fill: $t) -> Self::Vector {
+                <$inner_ty as crate::backend::Backend<$t>>::load_first($inner, s, fill)
+            }
+            #[inline(always)]
+            fn load_rows<const N: usize>(self, rows: &[[$t; N]]) -> Option<[Self::Vector; N]> {
+                <$inner_ty as crate::backend::Backend<$t>>::load_rows($inner, rows)
+            }
+            #[inline(always)]
+            fn mask_first(self, cnt: usize) -> Self::Mask {
+                <$inner_ty as crate::backend::Backend<$t>>::mask_first($inner, cnt)
+            }
+            #[inline(always)]
+            fn store_first(self, v: Self::Vector, s: &mut [$t]) {
+                <$inner_ty as crate::backend::Backend<$t>>::store_first($inner, v, s)
+            }
 
             #[inline(always)]
             fn lanes(self) -> usize {

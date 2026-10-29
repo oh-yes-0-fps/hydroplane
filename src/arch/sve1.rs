@@ -341,6 +341,65 @@ pub unsafe fn store_f64<const C: usize>(v: &SveVec<C>, p: *mut f64) {
     );
 }
 
+// UNVALIDATED AT RUNTIME: written against the SVE gather encoding, type-checked on aarch64, but
+// this machine has no SVE so it has not executed. The `uxtw #2`/`lsl #3` addressing scales the
+// 32-bit element index into the byte offset. Only gather is native; scatter keeps the portable
+// default, which is the only path that honours the highest-lane-wins tie-break on duplicate
+// indices (SVE's scatter store is CONSTRAINED UNPREDICTABLE there).
+
+/// Gather `C/4` `f32` lanes: lane `l` loads `base[idx[l]]`. `idx` points to `C/4` `u32` indices.
+#[target_feature(enable = "sve")]
+pub unsafe fn gather_f32<const C: usize>(base: *const f32, idx: *const u32) -> SveVec<C> {
+    let mut o = SveVec::<C>::zeroed();
+    asm!(
+        "whilelt p0.s, xzr, {n}",
+        "ld1w {{z1.s}}, p0/z, [{i}]",
+        "ld1w {{z0.s}}, p0/z, [{a}, z1.s, uxtw #2]",
+        "st1w {{z0.s}}, p0, [{o}]",
+        n = in(reg) C / 4,
+        a = in(reg) base,
+        i = in(reg) idx,
+        o = in(reg) o.0.as_mut_ptr(),
+        out("z0") _, out("z1") _, out("p0") _,
+    );
+    o
+}
+
+/// Gather `C/8` `f64` lanes; `idx` points to `C/8` `u32` indices (zero-extended into 64-bit lanes
+/// by the `.d` word load, then scaled by 8).
+#[target_feature(enable = "sve")]
+pub unsafe fn gather_f64<const C: usize>(base: *const f64, idx: *const u32) -> SveVec<C> {
+    let mut o = SveVec::<C>::zeroed();
+    asm!(
+        "whilelt p0.d, xzr, {n}",
+        "ld1w {{z1.d}}, p0/z, [{i}]",
+        "ld1d {{z0.d}}, p0/z, [{a}, z1.d, lsl #3]",
+        "st1d {{z0.d}}, p0, [{o}]",
+        n = in(reg) C / 8,
+        a = in(reg) base,
+        i = in(reg) idx,
+        o = in(reg) o.0.as_mut_ptr(),
+        out("z0") _, out("z1") _, out("p0") _,
+    );
+    o
+}
+
+/// Gather `n` `u32` lanes into `out` (the integer companion); `n` is the caller's lane count.
+#[target_feature(enable = "sve")]
+pub unsafe fn gather_u32(base: *const u32, idx: *const u32, out: *mut u32, n: usize) {
+    asm!(
+        "whilelt p0.s, xzr, {n}",
+        "ld1w {{z1.s}}, p0/z, [{i}]",
+        "ld1w {{z0.s}}, p0/z, [{a}, z1.s, uxtw #2]",
+        "st1w {{z0.s}}, p0, [{o}]",
+        n = in(reg) n,
+        a = in(reg) base,
+        i = in(reg) idx,
+        o = in(reg) out,
+        out("z0") _, out("z1") _, out("p0") _,
+    );
+}
+
 macro_rules! sve1_binop_f64 {
     ($name:ident, $op:literal) => {
         #[target_feature(enable = "sve")]
@@ -751,3 +810,161 @@ macro_rules! sve1_reduce_bf16 {
 sve1_reduce_bf16!(reduce_sum_bf16, reduce_sum_f32);
 sve1_reduce_bf16!(reduce_min_bf16, reduce_min_f32);
 sve1_reduce_bf16!(reduce_max_bf16, reduce_max_f32);
+
+/// Lanes `0..len` from `p` (`len < C/4`), the rest `fill`: a `whilelt len` predicated load never
+/// touches memory past the slice.
+#[target_feature(enable = "sve")]
+pub unsafe fn load_first_f32<const C: usize>(p: *const f32, len: usize, fill: f32) -> SveVec<C> {
+    let mut o = SveVec::<C>::zeroed();
+    asm!(
+        "whilelt p0.s, xzr, {len}",
+        "whilelt p1.s, xzr, {n}",
+        "ld1w {{z0.s}}, p0/z, [{a}]",
+        "mov z1.s, {bits:w}",
+        "sel z0.s, p0, z0.s, z1.s",
+        "st1w {{z0.s}}, p1, [{o}]",
+        len = in(reg) len,
+        n = in(reg) C / 4,
+        a = in(reg) p,
+        bits = in(reg) fill.to_bits(),
+        o = in(reg) o.0.as_mut_ptr(),
+        out("z0") _, out("z1") _, out("p0") _, out("p1") _,
+    );
+    o
+}
+
+/// Store lanes `0..len` of `v` to `p` (`len < C/4`), nothing past them.
+#[target_feature(enable = "sve")]
+pub unsafe fn store_first_f32<const C: usize>(v: &SveVec<C>, p: *mut f32, len: usize) {
+    asm!(
+        "whilelt p0.s, xzr, {len}",
+        "ld1w {{z0.s}}, p0/z, [{a}]",
+        "st1w {{z0.s}}, p0, [{o}]",
+        len = in(reg) len,
+        a = in(reg) v.0.as_ptr(),
+        o = in(reg) p,
+        out("z0") _, out("p0") _,
+    );
+}
+
+/// [`load_first_f32`] for `C/8` `f64` lanes.
+#[target_feature(enable = "sve")]
+pub unsafe fn load_first_f64<const C: usize>(p: *const f64, len: usize, fill: f64) -> SveVec<C> {
+    let mut o = SveVec::<C>::zeroed();
+    asm!(
+        "whilelt p0.d, xzr, {len}",
+        "whilelt p1.d, xzr, {n}",
+        "ld1d {{z0.d}}, p0/z, [{a}]",
+        "mov z1.d, {bits}",
+        "sel z0.d, p0, z0.d, z1.d",
+        "st1d {{z0.d}}, p1, [{o}]",
+        len = in(reg) len,
+        n = in(reg) C / 8,
+        a = in(reg) p,
+        bits = in(reg) fill.to_bits(),
+        o = in(reg) o.0.as_mut_ptr(),
+        out("z0") _, out("z1") _, out("p0") _, out("p1") _,
+    );
+    o
+}
+
+/// [`store_first_f32`] for `C/8` `f64` lanes.
+#[target_feature(enable = "sve")]
+pub unsafe fn store_first_f64<const C: usize>(v: &SveVec<C>, p: *mut f64, len: usize) {
+    asm!(
+        "whilelt p0.d, xzr, {len}",
+        "ld1d {{z0.d}}, p0/z, [{a}]",
+        "st1d {{z0.d}}, p0, [{o}]",
+        len = in(reg) len,
+        a = in(reg) v.0.as_ptr(),
+        o = in(reg) p,
+        out("z0") _, out("p0") _,
+    );
+}
+
+/// Scatter `C/4` `f32` lanes to `base[idx[i]]`. Scatter stores retire in element order, so on
+/// duplicate indices the highest lane wins.
+#[target_feature(enable = "sve")]
+pub unsafe fn scatter_f32<const C: usize>(base: *mut f32, idx: *const u32, v: &SveVec<C>) {
+    asm!(
+        "whilelt p0.s, xzr, {n}",
+        "ld1w {{z1.s}}, p0/z, [{i}]",
+        "ld1w {{z0.s}}, p0/z, [{v}]",
+        "st1w {{z0.s}}, p0, [{a}, z1.s, uxtw #2]",
+        n = in(reg) C / 4,
+        a = in(reg) base,
+        i = in(reg) idx,
+        v = in(reg) v.0.as_ptr(),
+        out("z0") _, out("z1") _, out("p0") _,
+    );
+}
+
+/// [`scatter_f32`] for the lanes where the vector mask `m` is non-zero.
+#[target_feature(enable = "sve")]
+pub unsafe fn scatter_mask_f32<const C: usize>(base: *mut f32, idx: *const u32, v: &SveVec<C>, m: &SveVec<C>) {
+    asm!(
+        "whilelt p0.s, xzr, {n}",
+        "ld1w {{z2.s}}, p0/z, [{m}]",
+        "cmpne p1.s, p0/z, z2.s, #0",
+        "ld1w {{z1.s}}, p0/z, [{i}]",
+        "ld1w {{z0.s}}, p0/z, [{v}]",
+        "st1w {{z0.s}}, p1, [{a}, z1.s, uxtw #2]",
+        n = in(reg) C / 4,
+        a = in(reg) base,
+        i = in(reg) idx,
+        v = in(reg) v.0.as_ptr(),
+        m = in(reg) m.0.as_ptr(),
+        out("z0") _, out("z1") _, out("z2") _, out("p0") _, out("p1") _,
+    );
+}
+
+/// Scatter `C/8` `f64` lanes; `idx` points to `C/8` `u32` indices.
+#[target_feature(enable = "sve")]
+pub unsafe fn scatter_f64<const C: usize>(base: *mut f64, idx: *const u32, v: &SveVec<C>) {
+    asm!(
+        "whilelt p0.d, xzr, {n}",
+        "ld1w {{z1.d}}, p0/z, [{i}]",
+        "ld1d {{z0.d}}, p0/z, [{v}]",
+        "st1d {{z0.d}}, p0, [{a}, z1.d, lsl #3]",
+        n = in(reg) C / 8,
+        a = in(reg) base,
+        i = in(reg) idx,
+        v = in(reg) v.0.as_ptr(),
+        out("z0") _, out("z1") _, out("p0") _,
+    );
+}
+
+/// [`scatter_f64`] for the lanes where the vector mask `m` is non-zero.
+#[target_feature(enable = "sve")]
+pub unsafe fn scatter_mask_f64<const C: usize>(base: *mut f64, idx: *const u32, v: &SveVec<C>, m: &SveVec<C>) {
+    asm!(
+        "whilelt p0.d, xzr, {n}",
+        "ld1d {{z2.d}}, p0/z, [{m}]",
+        "cmpne p1.d, p0/z, z2.d, #0",
+        "ld1w {{z1.d}}, p0/z, [{i}]",
+        "ld1d {{z0.d}}, p0/z, [{v}]",
+        "st1d {{z0.d}}, p1, [{a}, z1.d, lsl #3]",
+        n = in(reg) C / 8,
+        a = in(reg) base,
+        i = in(reg) idx,
+        v = in(reg) v.0.as_ptr(),
+        m = in(reg) m.0.as_ptr(),
+        out("z0") _, out("z1") _, out("z2") _, out("p0") _, out("p1") _,
+    );
+}
+
+/// Scatter `n` `u32` lanes from `v` to `base[idx[i]]` (the integer companion).
+#[target_feature(enable = "sve")]
+pub unsafe fn scatter_u32(base: *mut u32, idx: *const u32, v: *const u32, n: usize) {
+    asm!(
+        "whilelt p0.s, xzr, {n}",
+        "ld1w {{z1.s}}, p0/z, [{i}]",
+        "ld1w {{z0.s}}, p0/z, [{v}]",
+        "st1w {{z0.s}}, p0, [{a}, z1.s, uxtw #2]",
+        n = in(reg) n,
+        a = in(reg) base,
+        i = in(reg) idx,
+        v = in(reg) v,
+        out("z0") _, out("z1") _, out("p0") _,
+    );
+}

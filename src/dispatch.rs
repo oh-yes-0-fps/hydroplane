@@ -6,6 +6,16 @@ use crate::backend::{Backend, BackendAll, ScalarBackend};
 use crate::scalar::Scalar;
 use crate::varying::Gang;
 
+/// `$kernel.run` on the token `$backend`, inside its [`Backend::enter`] so the kernel body can
+/// inline the token's `#[target_feature]` ops.
+macro_rules! run_entered {
+    ($kernel:expr, $backend:expr) => {{
+        let b = $backend;
+        crate::backend::Backend::<f32>::enter(b, || $kernel.run(crate::varying::Gang::new(b)))
+    }};
+}
+pub(crate) use run_entered;
+
 /// The aarch64 tail of a dispatch, shared by [`SimdDispatch`] and [`MatrixDispatch`]. Non-Apple
 /// aarch64 with SVE takes the widest [`Sve`](crate::backend) token the hardware VL covers;
 /// everything else (Apple, `--cfg hp_no_sve`, `--cfg hp_neon_over_sve`, no SVE) takes `$fallback`, the
@@ -24,18 +34,18 @@ macro_rules! aarch64_dispatch_tail {
         {
             let vl = crate::arch::sve2::vl_bytes();
             if vl >= 64 {
-                return $kernel.run(crate::varying::Gang::new(unsafe {
+                return crate::dispatch::run_entered!($kernel, unsafe {
                     crate::backend::sve::Sve::<64>::new_unchecked()
-                }));
+                });
             }
             if vl >= 32 {
-                return $kernel.run(crate::varying::Gang::new(unsafe {
+                return crate::dispatch::run_entered!($kernel, unsafe {
                     crate::backend::sve::Sve::<32>::new_unchecked()
-                }));
+                });
             }
-            return $kernel.run(crate::varying::Gang::new(unsafe {
+            return crate::dispatch::run_entered!($kernel, unsafe {
                 crate::backend::sve::Sve::<16>::new_unchecked()
-            }));
+            });
         }
         #[cfg(all(
             target_arch = "aarch64",
@@ -50,23 +60,23 @@ macro_rules! aarch64_dispatch_tail {
             if std::arch::is_aarch64_feature_detected!("sve") {
                 let vl = crate::arch::sve2::vl_bytes();
                 if vl >= 64 {
-                    return $kernel.run(crate::varying::Gang::new(unsafe {
+                    return crate::dispatch::run_entered!($kernel, unsafe {
                         crate::backend::sve::Sve::<64>::new_unchecked()
-                    }));
+                    });
                 }
                 if vl >= 32 {
-                    return $kernel.run(crate::varying::Gang::new(unsafe {
+                    return crate::dispatch::run_entered!($kernel, unsafe {
                         crate::backend::sve::Sve::<32>::new_unchecked()
-                    }));
+                    });
                 }
-                return $kernel.run(crate::varying::Gang::new(unsafe {
+                return crate::dispatch::run_entered!($kernel, unsafe {
                     crate::backend::sve::Sve::<16>::new_unchecked()
-                }));
+                });
             }
         }
         #[cfg(target_arch = "aarch64")]
         {
-            return $kernel.run(crate::varying::Gang::new($fallback));
+            return crate::dispatch::run_entered!($kernel, $fallback);
         }
     }};
 }
@@ -80,9 +90,7 @@ macro_rules! wasm_dispatch_tail {
     ($kernel:expr) => {{
         #[cfg(all(target_arch = "wasm32", target_feature = "relaxed-simd"))]
         {
-            return $kernel.run(crate::varying::Gang::new(
-                crate::backend::wasm::RelaxedSimd::new(),
-            ));
+            return crate::dispatch::run_entered!($kernel, crate::backend::wasm::RelaxedSimd::new());
         }
         #[cfg(all(
             target_arch = "wasm32",
@@ -90,7 +98,7 @@ macro_rules! wasm_dispatch_tail {
             not(target_feature = "relaxed-simd")
         ))]
         {
-            return $kernel.run(crate::varying::Gang::new(crate::backend::wasm::Simd128::new()));
+            return crate::dispatch::run_entered!($kernel, crate::backend::wasm::Simd128::new());
         }
     }};
 }
@@ -108,18 +116,18 @@ macro_rules! riscv_dispatch_tail {
             let vl = crate::arch::rvv::vlenb();
             // SAFETY: the build guarantees the "V" extension; `VLENB` ≥ 16 (mandated by "V").
             if vl >= 64 {
-                return $kernel.run(crate::varying::Gang::new(unsafe {
+                return crate::dispatch::run_entered!($kernel, unsafe {
                     crate::backend::rvv::Rvv::<64>::new_unchecked()
-                }));
+                });
             }
             if vl >= 32 {
-                return $kernel.run(crate::varying::Gang::new(unsafe {
+                return crate::dispatch::run_entered!($kernel, unsafe {
                     crate::backend::rvv::Rvv::<32>::new_unchecked()
-                }));
+                });
             }
-            return $kernel.run(crate::varying::Gang::new(unsafe {
+            return crate::dispatch::run_entered!($kernel, unsafe {
                 crate::backend::rvv::Rvv::<16>::new_unchecked()
-            }));
+            });
         }
         #[cfg(all(
             target_arch = "riscv64",
@@ -131,18 +139,18 @@ macro_rules! riscv_dispatch_tail {
             if crate::arch::rvv::is_supported() {
                 let vl = crate::arch::rvv::vlenb();
                 if vl >= 64 {
-                    return $kernel.run(crate::varying::Gang::new(unsafe {
+                    return crate::dispatch::run_entered!($kernel, unsafe {
                         crate::backend::rvv::Rvv::<64>::new_unchecked()
-                    }));
+                    });
                 }
                 if vl >= 32 {
-                    return $kernel.run(crate::varying::Gang::new(unsafe {
+                    return crate::dispatch::run_entered!($kernel, unsafe {
                         crate::backend::rvv::Rvv::<32>::new_unchecked()
-                    }));
+                    });
                 }
-                return $kernel.run(crate::varying::Gang::new(unsafe {
+                return crate::dispatch::run_entered!($kernel, unsafe {
                     crate::backend::rvv::Rvv::<16>::new_unchecked()
-                }));
+                });
             }
         }
     }};
@@ -157,9 +165,9 @@ macro_rules! arm_dispatch_tail {
         #[cfg(all(target_arch = "arm", target_feature = "neon"))]
         {
             // SAFETY: the build guarantees NEON.
-            return $kernel.run(crate::varying::Gang::new(unsafe {
+            return crate::dispatch::run_entered!($kernel, unsafe {
                 crate::backend::neon_a32::Neon::new_unchecked()
-            }));
+            });
         }
         #[cfg(all(
             target_arch = "arm",
@@ -169,7 +177,7 @@ macro_rules! arm_dispatch_tail {
         ))]
         {
             if let Some(b) = crate::backend::neon_a32::Neon::detect() {
-                return $kernel.run(crate::varying::Gang::new(b));
+                return crate::dispatch::run_entered!($kernel, b);
             }
         }
     }};
@@ -190,6 +198,11 @@ pub trait Kernel<T: Scalar> {
     /// build-resolved static path bakes `K` as a const and cannot be per-kernel-capped on stable.
     const K_CAP: usize = crate::MAX_UNROLL;
 
+    /// Mark hand-written impls `#[inline]` (`#[kernel]` does): dispatch runs the body inside a
+    /// function compiled with the backend's target features, and only code inlined into it can
+    /// inline the backend's ops. For the same reason, keep varying math out of closures that are
+    /// called from several places or handed to `[T; N]::map`/`array::from_fn`: such a closure can
+    /// be left out of line, compiled for the baseline ISA, with every op a call.
     fn run<S: BackendAll + Backend<T>>(self, simd: Gang<S>) -> Self::Output;
 }
 
@@ -223,12 +236,12 @@ impl<T: Scalar, K: Kernel<T>> Kernel<T> for UnrollSelect<K> {
         use crate::backend::Unroll;
         let b = g.backend();
         match g.unroll().min(<K as Kernel<T>>::K_CAP) {
-            2 => self.0.run(Gang::new(Unroll::<S, 2>(b))),
-            4 => self.0.run(Gang::new(Unroll::<S, 4>(b))),
-            8 => self.0.run(Gang::new(Unroll::<S, 8>(b))),
-            12 => self.0.run(Gang::new(Unroll::<S, 12>(b))),
-            16 => self.0.run(Gang::new(Unroll::<S, 16>(b))),
-            _ => self.0.run(Gang::new(Unroll::<S, 1>(b))),
+            2 => Entered::run(self.0, Unroll::<S, 2>(b)),
+            4 => Entered::run(self.0, Unroll::<S, 4>(b)),
+            8 => Entered::run(self.0, Unroll::<S, 8>(b)),
+            12 => Entered::run(self.0, Unroll::<S, 12>(b)),
+            16 => Entered::run(self.0, Unroll::<S, 16>(b)),
+            _ => Entered::run(self.0, Unroll::<S, 1>(b)),
         }
     }
 
@@ -238,15 +251,33 @@ impl<T: Scalar, K: Kernel<T>> Kernel<T> for UnrollSelect<K> {
     #[cfg(hp_resolved_unroll)]
     fn run<S: BackendAll + Backend<T>>(self, g: Gang<S>) -> Self::Output {
         use crate::backend::Unroll;
-        self.0
-            .run(Gang::new(Unroll::<S, { crate::varying::STATIC_UNROLL }>(g.backend())))
+        Entered::run(self.0, Unroll::<S, { crate::varying::STATIC_UNROLL }>(g.backend()))
     }
 
     /// ILP compiled out: no factor to resolve, run the kernel on the raw backend.
     #[inline]
     #[cfg(any(hp_no_ilp, target_arch = "spirv"))]
     fn run<S: BackendAll + Backend<T>>(self, g: Gang<S>) -> Self::Output {
-        self.0.run(g)
+        Entered::run(self.0, g.backend())
+    }
+}
+
+/// A kernel run on `B`, entered through the token's [`Backend::enter`]. `call` is
+/// `#[inline(always)]`, so the kernel's `run` is a direct call from inside the entered function.
+struct Entered<T, K, B>(K, B, core::marker::PhantomData<fn() -> T>);
+
+impl<T: Scalar, K: Kernel<T>, B: BackendAll + Backend<T>> Entered<T, K, B> {
+    #[inline(always)]
+    fn run(kernel: K, backend: B) -> K::Output {
+        <B as Backend<f32>>::enter(backend, Self(kernel, backend, core::marker::PhantomData))
+    }
+}
+
+impl<T: Scalar, K: Kernel<T>, B: BackendAll + Backend<T>> crate::backend::Enter for Entered<T, K, B> {
+    type Output = K::Output;
+    #[inline(always)]
+    fn call(self) -> K::Output {
+        self.0.run(Gang::new(self.1))
     }
 }
 
@@ -355,29 +386,27 @@ fn host_caps() -> Caps {
     {
         #[cfg(all(feature = "std", not(hp_static_dispatch)))]
         {
-            caps.sse4 = std::arch::is_x86_feature_detected!("sse4.1");
+            caps.sse4 = crate::__hp_isa!(detect SSE41);
             #[cfg(not(hp_no_avx))]
             {
-                caps.avx1 = std::arch::is_x86_feature_detected!("avx");
-                caps.avx2 = std::arch::is_x86_feature_detected!("avx2")
-                    && std::arch::is_x86_feature_detected!("fma");
+                caps.avx1 = cfg!(feature = "avx1") && crate::__hp_isa!(detect AVX);
+                caps.avx2 = crate::__hp_isa!(detect AVX2);
             }
             #[cfg(not(any(hp_no_avx, hp_no_avx512)))]
             {
-                caps.avx512 = std::arch::is_x86_feature_detected!("avx512f")
-                    && std::arch::is_x86_feature_detected!("avx512bw");
-                caps.fp16 = caps.avx512 && std::arch::is_x86_feature_detected!("avx512fp16");
-                caps.bf16 = caps.avx512 && std::arch::is_x86_feature_detected!("avx512bf16");
+                caps.avx512 = crate::__hp_isa!(detect AVX512);
+                caps.fp16 = crate::__hp_isa!(detect AVX512FP16);
+                caps.bf16 = crate::__hp_isa!(detect AVX512BF16);
             }
         }
         #[cfg(any(not(feature = "std"), hp_static_dispatch))]
         {
-            caps.sse4 = cfg!(target_feature = "sse4.1");
-            caps.avx1 = cfg!(all(target_feature = "avx", not(hp_no_avx)));
-            caps.avx2 = cfg!(all(target_feature = "avx2", target_feature = "fma", not(hp_no_avx)));
-            caps.avx512 = cfg!(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512))));
-            caps.fp16 = caps.avx512 && cfg!(target_feature = "avx512fp16");
-            caps.bf16 = caps.avx512 && cfg!(target_feature = "avx512bf16");
+            caps.sse4 = cfg!(hp_tf_v2);
+            caps.avx1 = cfg!(all(hp_tf_avx, not(hp_no_avx)));
+            caps.avx2 = cfg!(all(hp_tf_v3, not(hp_no_avx)));
+            caps.avx512 = cfg!(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512))));
+            caps.fp16 = caps.avx512 && cfg!(hp_tf_v4fp16);
+            caps.bf16 = caps.avx512 && cfg!(hp_tf_v4bf16);
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -477,7 +506,7 @@ macro_rules! impl_simd_dispatch_x86 {
             fn dispatch<K: Kernel<Self>>(kernel: K) -> K::Output {
                 #[cfg(all(
                     any(target_arch = "x86_64", target_arch = "x86"),
-                    target_feature = "avx512f",
+                    hp_tf_v4,
                     not(any(hp_no_avx, hp_no_avx512))
                 ))]
                 {
@@ -491,14 +520,16 @@ macro_rules! impl_simd_dispatch_x86 {
                     any(target_arch = "x86_64", target_arch = "x86"),
                     feature = "std",
                     not(hp_static_dispatch),
-                    not(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512))))
+                    not(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512))))
                 ))]
                 {
                     use crate::backend::sse4::Sse4;
                     #[cfg(not(any(hp_no_avx, hp_no_avx512)))]
                     use crate::backend::avx512::Avx512;
+                    #[cfg(all(not(hp_no_avx), feature = "avx1"))]
+                    use crate::backend::avx1::Avx1;
                     #[cfg(not(hp_no_avx))]
-                    use crate::backend::{avx1::Avx1, avx2::Avx2};
+                    use crate::backend::avx2::Avx2;
                     static TIER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
                     let t = cached_tier(&TIER, || {
                         #[cfg(not(any(hp_no_avx, hp_no_avx512)))]
@@ -509,7 +540,7 @@ macro_rules! impl_simd_dispatch_x86 {
                         if Avx2::detect().is_some() {
                             return 2;
                         }
-                        #[cfg(not(hp_no_avx))]
+                        #[cfg(all(not(hp_no_avx), feature = "avx1"))]
                         if Avx1::detect().is_some() {
                             return 3;
                         }
@@ -521,7 +552,7 @@ macro_rules! impl_simd_dispatch_x86 {
                         1 => kernel.run(Gang::new(unsafe { Avx512::new_unchecked() })),
                         #[cfg(not(hp_no_avx))]
                         2 => kernel.run(Gang::new(unsafe { Avx2::new_unchecked() })),
-                        #[cfg(not(hp_no_avx))]
+                        #[cfg(all(not(hp_no_avx), feature = "avx1"))]
                         3 => kernel.run(Gang::new(unsafe { Avx1::new_unchecked() })),
                         4 => kernel.run(Gang::new(unsafe { Sse4::new_unchecked() })),
                         _ => kernel.run(Gang::new(ScalarBackend)),
@@ -532,9 +563,8 @@ macro_rules! impl_simd_dispatch_x86 {
                 #[cfg(all(
                     any(target_arch = "x86_64", target_arch = "x86"),
                     any(not(feature = "std"), hp_static_dispatch),
-                    not(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512)))),
-                    target_feature = "avx2",
-                    target_feature = "fma",
+                    not(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512)))),
+                    hp_tf_v3,
                     not(hp_no_avx)
                 ))]
                 {
@@ -546,9 +576,9 @@ macro_rules! impl_simd_dispatch_x86 {
                 #[cfg(all(
                     any(target_arch = "x86_64", target_arch = "x86"),
                     any(not(feature = "std"), hp_static_dispatch),
-                    not(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512)))),
-                    not(all(target_feature = "avx2", target_feature = "fma", not(hp_no_avx))),
-                    target_feature = "avx",
+                    not(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512)))),
+                    not(all(hp_tf_v3, not(hp_no_avx))),
+                    hp_tf_avx,
                     not(hp_no_avx)
                 ))]
                 {
@@ -559,10 +589,10 @@ macro_rules! impl_simd_dispatch_x86 {
                 #[cfg(all(
                     any(target_arch = "x86_64", target_arch = "x86"),
                     any(not(feature = "std"), hp_static_dispatch),
-                    not(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512)))),
-                    not(all(target_feature = "avx2", target_feature = "fma", not(hp_no_avx))),
-                    not(all(target_feature = "avx", not(hp_no_avx))),
-                    target_feature = "sse4.1"
+                    not(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512)))),
+                    not(all(hp_tf_v3, not(hp_no_avx))),
+                    not(all(hp_tf_avx, not(hp_no_avx))),
+                    hp_tf_v2
                 ))]
                 {
                     // SAFETY: target compiled with sse4.1.
@@ -593,7 +623,7 @@ macro_rules! impl_simd_dispatch_int {
             fn dispatch<K: Kernel<Self>>(kernel: K) -> K::Output {
                 #[cfg(all(
                     any(target_arch = "x86_64", target_arch = "x86"),
-                    target_feature = "avx512f",
+                    hp_tf_v4,
                     not(any(hp_no_avx, hp_no_avx512))
                 ))]
                 {
@@ -605,7 +635,7 @@ macro_rules! impl_simd_dispatch_int {
                     any(target_arch = "x86_64", target_arch = "x86"),
                     feature = "std",
                     not(hp_static_dispatch),
-                    not(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512))))
+                    not(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512))))
                 ))]
                 {
                     use crate::backend::sse4::Sse4;
@@ -638,8 +668,8 @@ macro_rules! impl_simd_dispatch_int {
                 #[cfg(all(
                     any(target_arch = "x86_64", target_arch = "x86"),
                     any(not(feature = "std"), hp_static_dispatch),
-                    not(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512)))),
-                    target_feature = "avx2",
+                    not(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512)))),
+                    hp_tf_v3,
                     not(hp_no_avx)
                 ))]
                 {
@@ -650,9 +680,9 @@ macro_rules! impl_simd_dispatch_int {
                 #[cfg(all(
                     any(target_arch = "x86_64", target_arch = "x86"),
                     any(not(feature = "std"), hp_static_dispatch),
-                    not(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512)))),
-                    not(all(target_feature = "avx2", not(hp_no_avx))),
-                    target_feature = "sse4.1"
+                    not(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512)))),
+                    not(all(hp_tf_v3, not(hp_no_avx))),
+                    hp_tf_v2
                 ))]
                 {
                     // SAFETY: target compiled with sse4.1.
@@ -685,7 +715,7 @@ mod half_dispatch {
             // Native AVX-512-FP16 (32-wide), statically guaranteed by the build.
             #[cfg(all(
                 any(target_arch = "x86_64", target_arch = "x86"),
-                target_feature = "avx512fp16",
+                hp_tf_v4fp16,
                 not(any(hp_no_avx, hp_no_avx512))
             ))]
             {
@@ -698,7 +728,7 @@ mod half_dispatch {
                 any(target_arch = "x86_64", target_arch = "x86"),
                 feature = "std",
                 not(hp_static_dispatch),
-                not(all(target_feature = "avx512fp16", not(any(hp_no_avx, hp_no_avx512))))
+                not(all(hp_tf_v4fp16, not(any(hp_no_avx, hp_no_avx512))))
             ))]
             {
                 #[cfg(not(hp_no_avx))]
@@ -742,8 +772,8 @@ mod half_dispatch {
             #[cfg(all(
                 any(target_arch = "x86_64", target_arch = "x86"),
                 any(not(feature = "std"), hp_static_dispatch),
-                not(all(target_feature = "avx512fp16", not(any(hp_no_avx, hp_no_avx512)))),
-                target_feature = "avx512f",
+                not(all(hp_tf_v4fp16, not(any(hp_no_avx, hp_no_avx512)))),
+                hp_tf_v4,
                 not(any(hp_no_avx, hp_no_avx512))
             ))]
             {
@@ -754,10 +784,8 @@ mod half_dispatch {
             #[cfg(all(
                 any(target_arch = "x86_64", target_arch = "x86"),
                 any(not(feature = "std"), hp_static_dispatch),
-                not(all(target_feature = "avx512fp16", not(any(hp_no_avx, hp_no_avx512)))),
-                target_feature = "avx2",
-                target_feature = "fma",
-                target_feature = "f16c",
+                not(all(hp_tf_v4fp16, not(any(hp_no_avx, hp_no_avx512)))),
+                hp_tf_v3,
                 not(hp_no_avx)
             ))]
             {
@@ -768,10 +796,10 @@ mod half_dispatch {
             #[cfg(all(
                 any(target_arch = "x86_64", target_arch = "x86"),
                 any(not(feature = "std"), hp_static_dispatch),
-                not(all(target_feature = "avx512fp16", not(any(hp_no_avx, hp_no_avx512)))),
-                not(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512)))),
-                not(all(target_feature = "avx2", target_feature = "fma", target_feature = "f16c", not(hp_no_avx))),
-                target_feature = "sse4.1"
+                not(all(hp_tf_v4fp16, not(any(hp_no_avx, hp_no_avx512)))),
+                not(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512)))),
+                not(all(hp_tf_v3, not(hp_no_avx))),
+                hp_tf_v2
             ))]
             {
                 // SAFETY: target compiled with sse4.1.
@@ -807,7 +835,7 @@ mod half_dispatch {
             // bf16 is 16-bit storage with f32 compute everywhere except native AVX-512-BF16.
             #[cfg(all(
                 any(target_arch = "x86_64", target_arch = "x86"),
-                target_feature = "avx512bf16",
+                hp_tf_v4bf16,
                 not(any(hp_no_avx, hp_no_avx512))
             ))]
             {
@@ -820,7 +848,7 @@ mod half_dispatch {
                 any(target_arch = "x86_64", target_arch = "x86"),
                 feature = "std",
                 not(hp_static_dispatch),
-                not(all(target_feature = "avx512bf16", not(any(hp_no_avx, hp_no_avx512))))
+                not(all(hp_tf_v4bf16, not(any(hp_no_avx, hp_no_avx512))))
             ))]
             {
                 #[cfg(not(hp_no_avx))]
@@ -863,8 +891,8 @@ mod half_dispatch {
             #[cfg(all(
                 any(target_arch = "x86_64", target_arch = "x86"),
                 any(not(feature = "std"), hp_static_dispatch),
-                not(all(target_feature = "avx512bf16", not(any(hp_no_avx, hp_no_avx512)))),
-                target_feature = "avx512f",
+                not(all(hp_tf_v4bf16, not(any(hp_no_avx, hp_no_avx512)))),
+                hp_tf_v4,
                 not(any(hp_no_avx, hp_no_avx512))
             ))]
             {
@@ -875,10 +903,9 @@ mod half_dispatch {
             #[cfg(all(
                 any(target_arch = "x86_64", target_arch = "x86"),
                 any(not(feature = "std"), hp_static_dispatch),
-                not(all(target_feature = "avx512bf16", not(any(hp_no_avx, hp_no_avx512)))),
-                not(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512)))),
-                target_feature = "avx2",
-                target_feature = "fma",
+                not(all(hp_tf_v4bf16, not(any(hp_no_avx, hp_no_avx512)))),
+                not(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512)))),
+                hp_tf_v3,
                 not(hp_no_avx)
             ))]
             {
@@ -889,10 +916,10 @@ mod half_dispatch {
             #[cfg(all(
                 any(target_arch = "x86_64", target_arch = "x86"),
                 any(not(feature = "std"), hp_static_dispatch),
-                not(all(target_feature = "avx512bf16", not(any(hp_no_avx, hp_no_avx512)))),
-                not(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512)))),
-                not(all(target_feature = "avx2", target_feature = "fma", not(hp_no_avx))),
-                target_feature = "sse4.1"
+                not(all(hp_tf_v4bf16, not(any(hp_no_avx, hp_no_avx512)))),
+                not(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512)))),
+                not(all(hp_tf_v3, not(hp_no_avx))),
+                hp_tf_v2
             ))]
             {
                 // SAFETY: target compiled with sse4.1.

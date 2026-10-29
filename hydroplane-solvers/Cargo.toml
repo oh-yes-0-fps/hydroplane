@@ -1,0 +1,42 @@
+[package]
+name = "hydroplane-solvers"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+description = "Sparse and dense solvers tuned per device: nested-dissection ordering, supernodal Cholesky on the CPU, multifrontal Cholesky on Vulkan GPUs (rust-gpu kernels in f32, f64, and f64 emulated in f32 pairs for GPUs without it), sparse LDLT and LU, and Krylov methods (CG, MINRES, GMRES, BiCGStab, LSQR)."
+repository = "https://github.com/oh-yes-0-fps/hydroplane"
+readme = "README.md"
+keywords = ["sparse", "cholesky", "linear-solver", "vulkan", "gpu"]
+categories = ["mathematics", "science"]
+
+[features]
+default = []
+# Multifrontal Cholesky on Vulkan compute. The build script compiles `kernels/` to SPIR-V with
+# rust-gpu (installing its pinned nightly on first use), once per precision: f32, f64 and emulated f64.
+vulkan = ["dep:ash", "dep:cargo-gpu-install", "dep:hydroplane-whatcompute"]
+glam = ["dep:glam"]
+
+[dependencies]
+ash = { version = "0.38.0", optional = true }
+faer = { version = "0.24.4", default-features = false, features = ["std", "rayon"] }
+glam = { version = "0.32", default-features = false, optional = true, features = ["std"] }
+hydroplane = { version = "0.2.0", path = ".." }
+hydroplane-whatcompute = { version = "0.1.0", path = "../hydroplane-whatcompute", default-features = false, features = ["vulkan"], optional = true }
+rayon = "1.12.0"
+
+[build-dependencies]
+cargo-gpu-install = { version = "0.10.0", optional = true }
+cc = "1.6.0"
+
+[[bench]]
+name = "bvh"
+harness = false
+
+[[bench]]
+name = "batched"
+harness = false
+
+[[bench]]
+name = "spmv"
+harness = false

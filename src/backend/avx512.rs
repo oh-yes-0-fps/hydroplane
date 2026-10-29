@@ -10,7 +10,8 @@ use core::arch::x86_64::*;
 
 use crate::backend::Backend;
 
-/// AVX-512F execution token. Construct only when the CPU supports `avx512f`.
+/// AVX-512 execution token: the x86-64-v4 tier ([`crate::isa`]). Construct only when the CPU has
+/// the whole bundle (F, CD, BW, DQ and VL over v3), as every mainstream AVX-512 CPU does.
 #[derive(Clone, Copy, Debug)]
 pub struct Avx512(());
 
@@ -21,14 +22,10 @@ impl Avx512 {
     #[allow(dead_code)]
     #[inline]
     pub fn detect() -> Option<Self> {
-        if is_x86_feature_detected!("avx512f") {
-            Some(Self(()))
-        } else {
-            None
-        }
+        if crate::__hp_isa!(detect AVX512) { Some(Self(())) } else { None }
     }
     /// # Safety
-    /// The CPU must support `avx512f`.
+    /// The CPU must have the whole `AVX512` tier bundle ([`crate::isa`]).
     // Used only by the statically-pinned and no-std dispatch paths; std builds go through
     // runtime `detect`.
     #[allow(dead_code)]
@@ -39,6 +36,8 @@ impl Avx512 {
 }
 
 impl Backend<f32> for Avx512 {
+    crate::backend::enter_with_features!(AVX512);
+
     type Vector = __m512;
     type Mask = __mmask16;
 
@@ -101,6 +100,58 @@ impl Backend<f32> for Avx512 {
         unsafe { zi_sra(a, k) }
     }
     #[inline(always)]
+    fn ishl_var(self, a: __m512i, counts: __m512i) -> __m512i {
+        unsafe { zi_shl_var(a, counts) }
+    }
+    #[inline(always)]
+    fn ishr_var(self, a: __m512i, counts: __m512i) -> __m512i {
+        unsafe { zi_shr_var(a, counts) }
+    }
+    #[inline(always)]
+    fn ishr_arith_var(self, a: __m512i, counts: __m512i) -> __m512i {
+        unsafe { zi_sra_var(a, counts) }
+    }
+    #[inline(always)]
+    fn imin_u(self, a: __m512i, b: __m512i) -> __m512i {
+        unsafe { zi_min_u(a, b) }
+    }
+    #[inline(always)]
+    fn imax_u(self, a: __m512i, b: __m512i) -> __m512i {
+        unsafe { zi_max_u(a, b) }
+    }
+    #[inline(always)]
+    fn imin_s(self, a: __m512i, b: __m512i) -> __m512i {
+        unsafe { zi_min_s(a, b) }
+    }
+    #[inline(always)]
+    fn imax_s(self, a: __m512i, b: __m512i) -> __m512i {
+        unsafe { zi_max_s(a, b) }
+    }
+    #[inline(always)]
+    fn iabs(self, a: __m512i) -> __m512i {
+        unsafe { zi_abs(a) }
+    }
+    #[inline(always)]
+    fn ileading_zeros(self, a: __m512i) -> __m512i {
+        unsafe { zi_lzcnt(a) }
+    }
+    #[inline(always)]
+    fn trunc_to_i32(self, v: __m512) -> __m512i {
+        unsafe { zi_cvtt(v) }
+    }
+    #[inline(always)]
+    fn round_to_i32(self, v: __m512) -> __m512i {
+        unsafe { zi_cvt(v) }
+    }
+    #[inline(always)]
+    fn i32_to_float(self, v: __m512i) -> __m512 {
+        unsafe { zi_cvt_i2f(v) }
+    }
+    #[inline(always)]
+    fn u32_to_float(self, v: __m512i) -> __m512 {
+        unsafe { zi_cvt_u2f(v) }
+    }
+    #[inline(always)]
     fn ieq(self, a: __m512i, b: __m512i) -> __mmask16 {
         unsafe { zi_eq(a, b) }
     }
@@ -128,6 +179,20 @@ impl Backend<f32> for Avx512 {
     #[inline(always)]
     fn lanes(self) -> usize {
         16
+    }
+    #[inline(always)]
+    fn load_first(self, s: &[f32], fill: f32) -> __m512 {
+        debug_assert!(s.len() < <Self as Backend<f32>>::lanes(self));
+        unsafe { z_load_first(s.as_ptr(), s.len(), fill) }
+    }
+    #[inline(always)]
+    fn mask_first(self, cnt: usize) -> __mmask16 {
+        ((1u32 << cnt) - 1) as __mmask16
+    }
+    #[inline(always)]
+    fn store_first(self, v: __m512, s: &mut [f32]) {
+        debug_assert!(s.len() < <Self as Backend<f32>>::lanes(self));
+        unsafe { z_store_first(s.as_mut_ptr(), s.len(), v) }
     }
     #[inline(always)]
     fn splat(self, v: f32) -> __m512 {
@@ -258,6 +323,153 @@ impl Backend<f32> for Avx512 {
             _mm512_reduce_max_ps(_mm512_mask_mov_ps(v, nan, _mm512_set1_ps(f32::NEG_INFINITY)))
         }
     }
+
+    // AVX-512F has native gather and scatter with a mask-register predicate. `scale = 4` turns the
+    // element index into a byte offset; `vpscatterd` retires lanes low-to-high, so on duplicate
+    // indices the highest lane wins, the contract the trait documents.
+    const NATIVE_GATHER: bool = true;
+    #[inline]
+    fn gather(self, base: &[f32], idx: __m512i) -> __m512 {
+        #[cfg(debug_assertions)]
+        assert_in_bounds(idx, base.len());
+        unsafe { z_gather(idx, base.as_ptr()) }
+    }
+    #[inline]
+    fn gather_masked(self, base: &[f32], idx: __m512i, m: __mmask16, fill: __m512) -> __m512 {
+        unsafe { z_gather_mask(fill, m, idx, base.as_ptr()) }
+    }
+    #[inline]
+    fn scatter(self, out: &mut [f32], idx: __m512i, v: __m512) {
+        #[cfg(debug_assertions)]
+        assert_in_bounds(idx, out.len());
+        unsafe { z_scatter(out.as_mut_ptr(), idx, v) }
+    }
+    #[inline]
+    fn scatter_masked(self, out: &mut [f32], idx: __m512i, v: __m512, m: __mmask16) {
+        unsafe { z_scatter_mask(out.as_mut_ptr(), m, idx, v) }
+    }
+    #[inline]
+    fn igather(self, base: &[u32], idx: __m512i) -> __m512i {
+        #[cfg(debug_assertions)]
+        assert_in_bounds(idx, base.len());
+        unsafe { zi_gather(idx, base.as_ptr().cast()) }
+    }
+    #[inline]
+    fn igather_masked(self, base: &[u32], idx: __m512i, m: __mmask16, fill: __m512i) -> __m512i {
+        unsafe { zi_gather_mask(fill, m, idx, base.as_ptr().cast()) }
+    }
+    #[inline]
+    fn iscatter(self, out: &mut [u32], idx: __m512i, v: __m512i) {
+        #[cfg(debug_assertions)]
+        assert_in_bounds(idx, out.len());
+        unsafe { zi_scatter(out.as_mut_ptr().cast(), idx, v) }
+    }
+    #[inline]
+    fn iscatter_masked(self, out: &mut [u32], idx: __m512i, v: __m512i, m: __mmask16) {
+        unsafe { zi_scatter_mask(out.as_mut_ptr().cast(), m, idx, v) }
+    }
+}
+
+/// Debug guard: an unmasked gather or scatter touches every lane, so every index must be in range.
+#[cfg(debug_assertions)]
+#[inline]
+fn assert_in_bounds(idx: __m512i, len: usize) {
+    let mut ix = [0u32; 16];
+    unsafe { zi_store(ix.as_mut_ptr(), idx) };
+    assert!(ix.iter().all(|&j| (j as usize) < len), "gather/scatter index out of bounds");
+}
+
+// Mask-register loads and stores touch only the selected lanes, so a short slice is never
+// over-read; unselected lanes of a load take the fill.
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn z_load_first(p: *const f32, len: usize, fill: f32) -> __m512 {
+    _mm512_mask_loadu_ps(_mm512_set1_ps(fill), ((1u32 << len) - 1) as __mmask16, p)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn z_store_first(p: *mut f32, len: usize, v: __m512) {
+    _mm512_mask_storeu_ps(p, ((1u32 << len) - 1) as __mmask16, v)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zd_load_first(p: *const f64, len: usize, fill: f64) -> __m512d {
+    _mm512_mask_loadu_pd(_mm512_set1_pd(fill), ((1u32 << len) - 1) as __mmask8, p)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zd_store_first(p: *mut f64, len: usize, v: __m512d) {
+    _mm512_mask_storeu_pd(p, ((1u32 << len) - 1) as __mmask8, v)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_load_first(p: *const i32, len: usize, fill: u32) -> __m512i {
+    _mm512_mask_loadu_epi32(_mm512_set1_epi32(fill as i32), ((1u32 << len) - 1) as __mmask16, p)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_store_first(p: *mut i32, len: usize, v: __m512i) {
+    _mm512_mask_storeu_epi32(p, ((1u32 << len) - 1) as __mmask16, v)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zd_gather(idx: [u32; 8], base: *const f64) -> __m512d {
+    _mm512_i32gather_pd::<8>(_mm256_loadu_si256(idx.as_ptr().cast()), base)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zd_gather_mask(src: __m512d, m: __mmask8, idx: [u32; 8], base: *const f64) -> __m512d {
+    _mm512_mask_i32gather_pd::<8>(src, m, _mm256_loadu_si256(idx.as_ptr().cast()), base)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn z_gather(idx: __m512i, base: *const f32) -> __m512 {
+    _mm512_i32gather_ps::<4>(idx, base)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn z_gather_mask(src: __m512, m: __mmask16, idx: __m512i, base: *const f32) -> __m512 {
+    _mm512_mask_i32gather_ps::<4>(src, m, idx, base)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zd_scatter(base: *mut f64, idx: [u32; 8], v: __m512d) {
+    _mm512_i32scatter_pd::<8>(base, _mm256_loadu_si256(idx.as_ptr().cast()), v)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zd_scatter_mask(base: *mut f64, m: __mmask8, idx: [u32; 8], v: __m512d) {
+    _mm512_mask_i32scatter_pd::<8>(base, m, _mm256_loadu_si256(idx.as_ptr().cast()), v)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn z_scatter(base: *mut f32, idx: __m512i, v: __m512) {
+    _mm512_i32scatter_ps::<4>(base, idx, v)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn z_scatter_mask(base: *mut f32, m: __mmask16, idx: __m512i, v: __m512) {
+    _mm512_mask_i32scatter_ps::<4>(base, m, idx, v)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_gather(idx: __m512i, base: *const i32) -> __m512i {
+    _mm512_i32gather_epi32::<4>(idx, base)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_gather_mask(src: __m512i, m: __mmask16, idx: __m512i, base: *const i32) -> __m512i {
+    _mm512_mask_i32gather_epi32::<4>(src, m, idx, base)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_scatter(base: *mut i32, idx: __m512i, v: __m512i) {
+    _mm512_i32scatter_epi32::<4>(base, idx, v)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_scatter_mask(base: *mut i32, m: __mmask16, idx: __m512i, v: __m512i) {
+    _mm512_mask_i32scatter_epi32::<4>(base, m, idx, v)
 }
 
 #[target_feature(enable = "avx512f")]
@@ -389,6 +601,41 @@ unsafe fn zi_sra(a: __m512i, k: u32) -> __m512i {
 }
 #[target_feature(enable = "avx512f")]
 #[inline]
+unsafe fn zi_shl_var(a: __m512i, counts: __m512i) -> __m512i {
+    _mm512_sllv_epi32(a, counts)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_shr_var(a: __m512i, counts: __m512i) -> __m512i {
+    _mm512_srlv_epi32(a, counts)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_sra_var(a: __m512i, counts: __m512i) -> __m512i {
+    _mm512_srav_epi32(a, counts)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_cvtt(v: __m512) -> __m512i {
+    _mm512_cvttps_epi32(v)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_cvt(v: __m512) -> __m512i {
+    _mm512_cvtps_epi32(v)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_cvt_i2f(v: __m512i) -> __m512 {
+    _mm512_cvtepi32_ps(v)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn zi_cvt_u2f(v: __m512i) -> __m512 {
+    _mm512_cvtepu32_ps(v)
+}
+#[target_feature(enable = "avx512f")]
+#[inline]
 unsafe fn zi_eq(a: __m512i, b: __m512i) -> __mmask16 {
     _mm512_cmpeq_epi32_mask(a, b)
 }
@@ -428,6 +675,11 @@ unsafe fn zi_neg(a: __m512i) -> __m512i {
 unsafe fn zi_abs(a: __m512i) -> __m512i {
     _mm512_abs_epi32(a)
 }
+#[target_feature(enable = "avx512cd")]
+#[inline]
+unsafe fn zi_lzcnt(a: __m512i) -> __m512i {
+    _mm512_lzcnt_epi32(a)
+}
 
 /// The 32-bit integer element backends: 16-lane `__m512i` with the `f32` impl's `__mmask16`
 /// convention. Arithmetic is wrapping; compares are native unsigned/signed k-mask ops.
@@ -441,6 +693,20 @@ macro_rules! avx512_int_backend {
             #[inline(always)]
             fn lanes(self) -> usize {
                 16
+            }
+            #[inline(always)]
+            fn load_first(self, s: &[$t], fill: $t) -> __m512i {
+                debug_assert!(s.len() < <Self as Backend<$t>>::lanes(self));
+                unsafe { zi_load_first(s.as_ptr().cast::<i32>(), s.len(), fill as u32) }
+            }
+            #[inline(always)]
+            fn mask_first(self, cnt: usize) -> __mmask16 {
+                ((1u32 << cnt) - 1) as __mmask16
+            }
+            #[inline(always)]
+            fn store_first(self, v: __m512i, s: &mut [$t]) {
+                debug_assert!(s.len() < <Self as Backend<$t>>::lanes(self));
+                unsafe { zi_store_first(s.as_mut_ptr().cast::<i32>(), s.len(), v) }
             }
             #[inline(always)]
             fn splat(self, v: $t) -> __m512i {
@@ -589,6 +855,48 @@ macro_rules! avx512_int_backend {
             fn from_bits(self, v: __m512i) -> __m512i {
                 v
             }
+
+            const NATIVE_GATHER: bool = true;
+            #[inline]
+            fn gather(self, base: &[$t], idx: __m512i) -> __m512i {
+                #[cfg(debug_assertions)]
+                assert_in_bounds(idx, base.len());
+                unsafe { zi_gather(idx, base.as_ptr().cast()) }
+            }
+            #[inline]
+            fn gather_masked(self, base: &[$t], idx: __m512i, m: __mmask16, fill: __m512i) -> __m512i {
+                unsafe { zi_gather_mask(fill, m, idx, base.as_ptr().cast()) }
+            }
+            #[inline]
+            fn scatter(self, out: &mut [$t], idx: __m512i, v: __m512i) {
+                #[cfg(debug_assertions)]
+                assert_in_bounds(idx, out.len());
+                unsafe { zi_scatter(out.as_mut_ptr().cast(), idx, v) }
+            }
+            #[inline]
+            fn scatter_masked(self, out: &mut [$t], idx: __m512i, v: __m512i, m: __mmask16) {
+                unsafe { zi_scatter_mask(out.as_mut_ptr().cast(), m, idx, v) }
+            }
+            #[inline]
+            fn igather(self, base: &[u32], idx: __m512i) -> __m512i {
+                #[cfg(debug_assertions)]
+                assert_in_bounds(idx, base.len());
+                unsafe { zi_gather(idx, base.as_ptr().cast()) }
+            }
+            #[inline]
+            fn igather_masked(self, base: &[u32], idx: __m512i, m: __mmask16, fill: __m512i) -> __m512i {
+                unsafe { zi_gather_mask(fill, m, idx, base.as_ptr().cast()) }
+            }
+            #[inline]
+            fn iscatter(self, out: &mut [u32], idx: __m512i, v: __m512i) {
+                #[cfg(debug_assertions)]
+                assert_in_bounds(idx, out.len());
+                unsafe { zi_scatter(out.as_mut_ptr().cast(), idx, v) }
+            }
+            #[inline]
+            fn iscatter_masked(self, out: &mut [u32], idx: __m512i, v: __m512i, m: __mmask16) {
+                unsafe { zi_scatter_mask(out.as_mut_ptr().cast(), m, idx, v) }
+            }
         }
     };
 }
@@ -639,9 +947,46 @@ impl Backend<f64> for Avx512 {
         out.copy_from_slice(&v);
     }
 
+    // `vgatherdpd` with eight 32-bit indices in a `ymm`; `scale = 8` turns the element index into
+    // the byte offset.
+    const NATIVE_GATHER: bool = true;
+    #[inline]
+    fn gather(self, base: &[f64], idx: [u32; 8]) -> __m512d {
+        debug_assert!(idx.iter().all(|&j| (j as usize) < base.len()));
+        unsafe { zd_gather(idx, base.as_ptr()) }
+    }
+    #[inline]
+    fn gather_masked(self, base: &[f64], idx: [u32; 8], m: __mmask8, fill: __m512d) -> __m512d {
+        unsafe { zd_gather_mask(fill, m, idx, base.as_ptr()) }
+    }
+    // `vscatterdpd` retires lanes low-to-high, so on duplicate indices the highest lane wins.
+    #[inline]
+    fn scatter(self, out: &mut [f64], idx: [u32; 8], v: __m512d) {
+        debug_assert!(idx.iter().all(|&j| (j as usize) < out.len()));
+        unsafe { zd_scatter(out.as_mut_ptr(), idx, v) }
+    }
+    #[inline]
+    fn scatter_masked(self, out: &mut [f64], idx: [u32; 8], v: __m512d, m: __mmask8) {
+        unsafe { zd_scatter_mask(out.as_mut_ptr(), m, idx, v) }
+    }
+
     #[inline(always)]
     fn lanes(self) -> usize {
         8
+    }
+    #[inline(always)]
+    fn load_first(self, s: &[f64], fill: f64) -> __m512d {
+        debug_assert!(s.len() < <Self as Backend<f64>>::lanes(self));
+        unsafe { zd_load_first(s.as_ptr(), s.len(), fill) }
+    }
+    #[inline(always)]
+    fn mask_first(self, cnt: usize) -> __mmask8 {
+        ((1u32 << cnt) - 1) as __mmask8
+    }
+    #[inline(always)]
+    fn store_first(self, v: __m512d, s: &mut [f64]) {
+        debug_assert!(s.len() < <Self as Backend<f64>>::lanes(self));
+        unsafe { zd_store_first(s.as_mut_ptr(), s.len(), v) }
     }
     #[inline(always)]
     fn splat(self, v: f64) -> __m512d {

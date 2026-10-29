@@ -310,6 +310,14 @@ pub trait GangGlamExt<S: Backend<f32>> {
     ) -> MatWide<S, R, C>;
 }
 
+const _: () = assert!(size_of::<Vec3>() == 12 && align_of::<Vec3>() == 4);
+
+/// Whether a `(Vec3, f32)` plane is sixteen contiguous bytes in `n.x, n.y, n.z, d` order. Rust
+/// doesn't fix tuple field order, so the row loads in [`GangGlamExt::gather_plane`] are gated on it.
+const PLANE_IS_XYZW: bool = size_of::<(Vec3, f32)>() == 16
+    && core::mem::offset_of!((Vec3, f32), 0) == 0
+    && core::mem::offset_of!((Vec3, f32), 1) == 12;
+
 impl<S: Backend<f32>> GangGlamExt<S> for Gang<S> {
     #[inline(always)]
     fn splat_vec3(self, v: Vec3) -> Vec3Wide<S> {
@@ -317,11 +325,19 @@ impl<S: Backend<f32>> GangGlamExt<S> for Gang<S> {
     }
     #[inline(always)]
     fn gather_vec3(self, s: &[Vec3], fill: f32) -> Vec3Wide<S> {
-        Vec3Wide(self.gather_n(s, [fill; 3], |v| [v.x, v.y, v.z]))
+        // SAFETY: glam's `Vec3` is `#[repr(C)] { x, y, z: f32 }`, so it has `[f32; 3]`'s layout.
+        let rows = unsafe { core::slice::from_raw_parts(s.as_ptr().cast::<[f32; 3]>(), s.len()) };
+        Vec3Wide(self.gather_rows(rows, [fill; 3]))
     }
     #[inline(always)]
     fn gather_plane(self, s: &[(Vec3, f32)], fill: f32) -> (Vec3Wide<S>, Varying<f32, S>) {
-        let [nx, ny, nz, d] = self.gather_n(s, [fill; 4], |&(n, dd)| [n.x, n.y, n.z, dd]);
+        let [nx, ny, nz, d] = if PLANE_IS_XYZW {
+            // SAFETY: `PLANE_IS_XYZW` pins each row to the four floats `n.x, n.y, n.z, d`.
+            let rows = unsafe { core::slice::from_raw_parts(s.as_ptr().cast::<[f32; 4]>(), s.len()) };
+            self.gather_rows(rows, [fill; 4])
+        } else {
+            self.gather_n(s, [fill; 4], |&(n, dd)| [n.x, n.y, n.z, dd])
+        };
         (Vec3Wide([nx, ny, nz]), d)
     }
     #[inline(always)]

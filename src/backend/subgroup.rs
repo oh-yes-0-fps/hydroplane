@@ -303,6 +303,49 @@ mod device {
                     cap_group_arithmetic();
                     spirv_std::arch::subgroup_f_max(v)
                 }
+
+                // One invocation per lane, so a varying-index gather is this invocation reading
+                // its own `base[idx]` — a single buffer access, no subgroup collective. Overriding
+                // the trait default keeps it a clean `OpAccessChain`+`OpLoad` instead of the
+                // default's dynamically-indexed stack array, which rust-gpu spills to memory.
+                // Cross-invocation duplicate scatter indices race (as any GPU scatter does); a
+                // histogram-style accumulation needs atomics, not this.
+                #[inline]
+                fn gather(self, base: &[$ty], idx: u32) -> $ty {
+                    base[idx as usize]
+                }
+                #[inline]
+                fn gather_masked(self, base: &[$ty], idx: u32, m: bool, fill: $ty) -> $ty {
+                    if m { base[idx as usize] } else { fill }
+                }
+                #[inline]
+                fn scatter(self, out: &mut [$ty], idx: u32, v: $ty) {
+                    out[idx as usize] = v;
+                }
+                #[inline]
+                fn scatter_masked(self, out: &mut [$ty], idx: u32, v: $ty, m: bool) {
+                    if m {
+                        out[idx as usize] = v;
+                    }
+                }
+                #[inline]
+                fn igather(self, base: &[u32], idx: u32) -> u32 {
+                    base[idx as usize]
+                }
+                #[inline]
+                fn igather_masked(self, base: &[u32], idx: u32, m: bool, fill: u32) -> u32 {
+                    if m { base[idx as usize] } else { fill }
+                }
+                #[inline]
+                fn iscatter(self, out: &mut [u32], idx: u32, v: u32) {
+                    out[idx as usize] = v;
+                }
+                #[inline]
+                fn iscatter_masked(self, out: &mut [u32], idx: u32, v: u32, m: bool) {
+                    if m {
+                        out[idx as usize] = v;
+                    }
+                }
             }
         };
     }
@@ -449,6 +492,44 @@ mod device {
                 #[inline]
                 fn bit_not(self, a: $ty) -> $ty {
                     !a
+                }
+
+                // Per-invocation indexed access; see the float macro for the rationale.
+                #[inline]
+                fn gather(self, base: &[$ty], idx: u32) -> $ty {
+                    base[idx as usize]
+                }
+                #[inline]
+                fn gather_masked(self, base: &[$ty], idx: u32, m: bool, fill: $ty) -> $ty {
+                    if m { base[idx as usize] } else { fill }
+                }
+                #[inline]
+                fn scatter(self, out: &mut [$ty], idx: u32, v: $ty) {
+                    out[idx as usize] = v;
+                }
+                #[inline]
+                fn scatter_masked(self, out: &mut [$ty], idx: u32, v: $ty, m: bool) {
+                    if m {
+                        out[idx as usize] = v;
+                    }
+                }
+                #[inline]
+                fn igather(self, base: &[u32], idx: u32) -> u32 {
+                    base[idx as usize]
+                }
+                #[inline]
+                fn igather_masked(self, base: &[u32], idx: u32, m: bool, fill: u32) -> u32 {
+                    if m { base[idx as usize] } else { fill }
+                }
+                #[inline]
+                fn iscatter(self, out: &mut [u32], idx: u32, v: u32) {
+                    out[idx as usize] = v;
+                }
+                #[inline]
+                fn iscatter_masked(self, out: &mut [u32], idx: u32, v: u32, m: bool) {
+                    if m {
+                        out[idx as usize] = v;
+                    }
                 }
             }
         };
@@ -615,6 +696,52 @@ mod device {
                 fn reduce_max(self, v: f32) -> $ty {
                     cap_group_arithmetic();
                     $narrow(spirv_std::arch::subgroup_f_max(v))
+                }
+
+                // 16-bit storage, f32 register: gather widens at the memory boundary, scatter
+                // narrows, matching this backend's `load`/`store`. See the float macro for the
+                // per-invocation rationale.
+                #[inline]
+                fn gather(self, base: &[$ty], idx: u32) -> f32 {
+                    cap_int16();
+                    $widen(base[idx as usize])
+                }
+                #[inline]
+                fn gather_masked(self, base: &[$ty], idx: u32, m: bool, fill: f32) -> f32 {
+                    if m {
+                        cap_int16();
+                        $widen(base[idx as usize])
+                    } else {
+                        fill
+                    }
+                }
+                #[inline]
+                fn scatter(self, out: &mut [$ty], idx: u32, v: f32) {
+                    out[idx as usize] = $narrow(v);
+                }
+                #[inline]
+                fn scatter_masked(self, out: &mut [$ty], idx: u32, v: f32, m: bool) {
+                    if m {
+                        out[idx as usize] = $narrow(v);
+                    }
+                }
+                #[inline]
+                fn igather(self, base: &[u32], idx: u32) -> u32 {
+                    base[idx as usize]
+                }
+                #[inline]
+                fn igather_masked(self, base: &[u32], idx: u32, m: bool, fill: u32) -> u32 {
+                    if m { base[idx as usize] } else { fill }
+                }
+                #[inline]
+                fn iscatter(self, out: &mut [u32], idx: u32, v: u32) {
+                    out[idx as usize] = v;
+                }
+                #[inline]
+                fn iscatter_masked(self, out: &mut [u32], idx: u32, v: u32, m: bool) {
+                    if m {
+                        out[idx as usize] = v;
+                    }
                 }
             }
         };

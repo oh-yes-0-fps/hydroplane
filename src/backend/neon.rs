@@ -27,6 +27,39 @@ impl Backend<f32> for Neon {
         4
     }
     #[inline(always)]
+    fn load_rows<const N: usize>(self, rows: &[[f32; N]]) -> Option<[float32x4_t; N]> {
+        debug_assert_eq!(rows.len(), <Self as Backend<f32>>::lanes(self));
+        let p = rows.as_ptr().cast::<f32>();
+        // SAFETY: a full register of rows is `lanes * N` contiguous elements, exactly what the
+        // `N`-way deinterleaving load reads.
+        let cols: [float32x4_t; 4] = unsafe {
+            match N {
+                2 => {
+                    let r = vld2q_f32(p);
+                    [r.0, r.1, r.1, r.1]
+                }
+                3 => {
+                    let r = vld3q_f32(p);
+                    [r.0, r.1, r.2, r.2]
+                }
+                4 => {
+                    let r = vld4q_f32(p);
+                    [r.0, r.1, r.2, r.3]
+                }
+                _ => return None,
+            }
+        };
+        let mut out = [cols[0]; N];
+        for (c, col) in out.iter_mut().enumerate() {
+            *col = cols[c];
+        }
+        Some(out)
+    }
+    #[inline(always)]
+    fn mask_first(self, cnt: usize) -> uint32x4_t {
+        unsafe { vcltq_u32(vld1q_u32([0u32, 1, 2, 3].as_ptr()), vdupq_n_u32(cnt as u32)) }
+    }
+    #[inline(always)]
     fn splat(self, v: f32) -> float32x4_t {
         unsafe { vdupq_n_f32(v) }
     }
@@ -204,6 +237,65 @@ impl Backend<f32> for Neon {
             vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(a), vdupq_n_s32(-(k as i32))))
         }
     }
+    // `vshl` takes a per-lane signed count: positive shifts left, negative shifts right, so a
+    // right shift negates the count vector.
+    #[inline(always)]
+    fn ishl_var(self, a: uint32x4_t, counts: uint32x4_t) -> uint32x4_t {
+        unsafe { vshlq_u32(a, vreinterpretq_s32_u32(counts)) }
+    }
+    #[inline(always)]
+    fn ishr_var(self, a: uint32x4_t, counts: uint32x4_t) -> uint32x4_t {
+        unsafe { vshlq_u32(a, vnegq_s32(vreinterpretq_s32_u32(counts))) }
+    }
+    #[inline(always)]
+    fn ishr_arith_var(self, a: uint32x4_t, counts: uint32x4_t) -> uint32x4_t {
+        unsafe {
+            vreinterpretq_u32_s32(vshlq_s32(
+                vreinterpretq_s32_u32(a),
+                vnegq_s32(vreinterpretq_s32_u32(counts)),
+            ))
+        }
+    }
+    #[inline(always)]
+    fn imin_u(self, a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+        unsafe { vminq_u32(a, b) }
+    }
+    #[inline(always)]
+    fn imax_u(self, a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+        unsafe { vmaxq_u32(a, b) }
+    }
+    #[inline(always)]
+    fn imin_s(self, a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+        unsafe { vreinterpretq_u32_s32(vminq_s32(vreinterpretq_s32_u32(a), vreinterpretq_s32_u32(b))) }
+    }
+    #[inline(always)]
+    fn imax_s(self, a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+        unsafe { vreinterpretq_u32_s32(vmaxq_s32(vreinterpretq_s32_u32(a), vreinterpretq_s32_u32(b))) }
+    }
+    #[inline(always)]
+    fn iabs(self, a: uint32x4_t) -> uint32x4_t {
+        unsafe { vreinterpretq_u32_s32(vabsq_s32(vreinterpretq_s32_u32(a))) }
+    }
+    #[inline(always)]
+    fn ileading_zeros(self, a: uint32x4_t) -> uint32x4_t {
+        unsafe { vclzq_u32(a) }
+    }
+    #[inline(always)]
+    fn trunc_to_i32(self, v: float32x4_t) -> uint32x4_t {
+        unsafe { vreinterpretq_u32_s32(vcvtq_s32_f32(v)) }
+    }
+    #[inline(always)]
+    fn round_to_i32(self, v: float32x4_t) -> uint32x4_t {
+        unsafe { vreinterpretq_u32_s32(vcvtnq_s32_f32(v)) }
+    }
+    #[inline(always)]
+    fn i32_to_float(self, v: uint32x4_t) -> float32x4_t {
+        unsafe { vcvtq_f32_s32(vreinterpretq_s32_u32(v)) }
+    }
+    #[inline(always)]
+    fn u32_to_float(self, v: uint32x4_t) -> float32x4_t {
+        unsafe { vcvtq_f32_u32(v) }
+    }
     #[inline(always)]
     fn ieq(self, a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
         unsafe { vceqq_u32(a, b) }
@@ -228,6 +320,167 @@ impl Backend<f32> for Neon {
     fn from_bits(self, v: uint32x4_t) -> float32x4_t {
         unsafe { vreinterpretq_f32_u32(v) }
     }
+
+    // AArch64 has no gather/scatter instruction, so the index register is extracted and each
+    // lane moves through a single-lane load/store. `vld1q_lane`/`vgetq_lane` keep the gathered
+    // values in the vector register instead of the default's stack round-trip. The ascending
+    // lane order of scatter is the highest-lane-wins contract.
+    #[inline]
+    fn gather(self, base: &[f32], idx: uint32x4_t) -> float32x4_t {
+        unsafe {
+            let mut ix = [0u32; 4];
+            vst1q_u32(ix.as_mut_ptr(), idx);
+            debug_assert!(ix.iter().all(|&j| (j as usize) < base.len()));
+            let p = base.as_ptr();
+            let mut v = vdupq_n_f32(0.0);
+            v = vld1q_lane_f32::<0>(p.add(ix[0] as usize), v);
+            v = vld1q_lane_f32::<1>(p.add(ix[1] as usize), v);
+            v = vld1q_lane_f32::<2>(p.add(ix[2] as usize), v);
+            v = vld1q_lane_f32::<3>(p.add(ix[3] as usize), v);
+            v
+        }
+    }
+    #[inline]
+    fn gather_masked(
+        self,
+        base: &[f32],
+        idx: uint32x4_t,
+        m: uint32x4_t,
+        fill: float32x4_t,
+    ) -> float32x4_t {
+        unsafe {
+            let mut ix = [0u32; 4];
+            vst1q_u32(ix.as_mut_ptr(), idx);
+            let p = base.as_ptr();
+            let mut v = fill;
+            if vgetq_lane_u32::<0>(m) != 0 {
+                debug_assert!((ix[0] as usize) < base.len());
+                v = vld1q_lane_f32::<0>(p.add(ix[0] as usize), v);
+            }
+            if vgetq_lane_u32::<1>(m) != 0 {
+                debug_assert!((ix[1] as usize) < base.len());
+                v = vld1q_lane_f32::<1>(p.add(ix[1] as usize), v);
+            }
+            if vgetq_lane_u32::<2>(m) != 0 {
+                debug_assert!((ix[2] as usize) < base.len());
+                v = vld1q_lane_f32::<2>(p.add(ix[2] as usize), v);
+            }
+            if vgetq_lane_u32::<3>(m) != 0 {
+                debug_assert!((ix[3] as usize) < base.len());
+                v = vld1q_lane_f32::<3>(p.add(ix[3] as usize), v);
+            }
+            v
+        }
+    }
+    #[inline]
+    fn scatter(self, out: &mut [f32], idx: uint32x4_t, v: float32x4_t) {
+        unsafe {
+            let mut ix = [0u32; 4];
+            vst1q_u32(ix.as_mut_ptr(), idx);
+            debug_assert!(ix.iter().all(|&j| (j as usize) < out.len()));
+            out[ix[0] as usize] = vgetq_lane_f32::<0>(v);
+            out[ix[1] as usize] = vgetq_lane_f32::<1>(v);
+            out[ix[2] as usize] = vgetq_lane_f32::<2>(v);
+            out[ix[3] as usize] = vgetq_lane_f32::<3>(v);
+        }
+    }
+    #[inline]
+    fn scatter_masked(self, out: &mut [f32], idx: uint32x4_t, v: float32x4_t, m: uint32x4_t) {
+        unsafe {
+            let mut ix = [0u32; 4];
+            vst1q_u32(ix.as_mut_ptr(), idx);
+            if vgetq_lane_u32::<0>(m) != 0 {
+                out[ix[0] as usize] = vgetq_lane_f32::<0>(v);
+            }
+            if vgetq_lane_u32::<1>(m) != 0 {
+                out[ix[1] as usize] = vgetq_lane_f32::<1>(v);
+            }
+            if vgetq_lane_u32::<2>(m) != 0 {
+                out[ix[2] as usize] = vgetq_lane_f32::<2>(v);
+            }
+            if vgetq_lane_u32::<3>(m) != 0 {
+                out[ix[3] as usize] = vgetq_lane_f32::<3>(v);
+            }
+        }
+    }
+    #[inline]
+    fn igather(self, base: &[u32], idx: uint32x4_t) -> uint32x4_t {
+        unsafe {
+            let mut ix = [0u32; 4];
+            vst1q_u32(ix.as_mut_ptr(), idx);
+            debug_assert!(ix.iter().all(|&j| (j as usize) < base.len()));
+            let p = base.as_ptr();
+            let mut v = vdupq_n_u32(0);
+            v = vld1q_lane_u32::<0>(p.add(ix[0] as usize), v);
+            v = vld1q_lane_u32::<1>(p.add(ix[1] as usize), v);
+            v = vld1q_lane_u32::<2>(p.add(ix[2] as usize), v);
+            v = vld1q_lane_u32::<3>(p.add(ix[3] as usize), v);
+            v
+        }
+    }
+    #[inline]
+    fn igather_masked(
+        self,
+        base: &[u32],
+        idx: uint32x4_t,
+        m: uint32x4_t,
+        fill: uint32x4_t,
+    ) -> uint32x4_t {
+        unsafe {
+            let mut ix = [0u32; 4];
+            vst1q_u32(ix.as_mut_ptr(), idx);
+            let p = base.as_ptr();
+            let mut v = fill;
+            if vgetq_lane_u32::<0>(m) != 0 {
+                debug_assert!((ix[0] as usize) < base.len());
+                v = vld1q_lane_u32::<0>(p.add(ix[0] as usize), v);
+            }
+            if vgetq_lane_u32::<1>(m) != 0 {
+                debug_assert!((ix[1] as usize) < base.len());
+                v = vld1q_lane_u32::<1>(p.add(ix[1] as usize), v);
+            }
+            if vgetq_lane_u32::<2>(m) != 0 {
+                debug_assert!((ix[2] as usize) < base.len());
+                v = vld1q_lane_u32::<2>(p.add(ix[2] as usize), v);
+            }
+            if vgetq_lane_u32::<3>(m) != 0 {
+                debug_assert!((ix[3] as usize) < base.len());
+                v = vld1q_lane_u32::<3>(p.add(ix[3] as usize), v);
+            }
+            v
+        }
+    }
+    #[inline]
+    fn iscatter(self, out: &mut [u32], idx: uint32x4_t, v: uint32x4_t) {
+        unsafe {
+            let mut ix = [0u32; 4];
+            vst1q_u32(ix.as_mut_ptr(), idx);
+            debug_assert!(ix.iter().all(|&j| (j as usize) < out.len()));
+            out[ix[0] as usize] = vgetq_lane_u32::<0>(v);
+            out[ix[1] as usize] = vgetq_lane_u32::<1>(v);
+            out[ix[2] as usize] = vgetq_lane_u32::<2>(v);
+            out[ix[3] as usize] = vgetq_lane_u32::<3>(v);
+        }
+    }
+    #[inline]
+    fn iscatter_masked(self, out: &mut [u32], idx: uint32x4_t, v: uint32x4_t, m: uint32x4_t) {
+        unsafe {
+            let mut ix = [0u32; 4];
+            vst1q_u32(ix.as_mut_ptr(), idx);
+            if vgetq_lane_u32::<0>(m) != 0 {
+                out[ix[0] as usize] = vgetq_lane_u32::<0>(v);
+            }
+            if vgetq_lane_u32::<1>(m) != 0 {
+                out[ix[1] as usize] = vgetq_lane_u32::<1>(v);
+            }
+            if vgetq_lane_u32::<2>(m) != 0 {
+                out[ix[2] as usize] = vgetq_lane_u32::<2>(v);
+            }
+            if vgetq_lane_u32::<3>(m) != 0 {
+                out[ix[3] as usize] = vgetq_lane_u32::<3>(v);
+            }
+        }
+    }
 }
 
 impl Backend<f64> for Neon {
@@ -237,6 +490,39 @@ impl Backend<f64> for Neon {
     #[inline(always)]
     fn lanes(self) -> usize {
         2
+    }
+    #[inline(always)]
+    fn load_rows<const N: usize>(self, rows: &[[f64; N]]) -> Option<[float64x2_t; N]> {
+        debug_assert_eq!(rows.len(), <Self as Backend<f64>>::lanes(self));
+        let p = rows.as_ptr().cast::<f64>();
+        // SAFETY: a full register of rows is `lanes * N` contiguous elements, exactly what the
+        // `N`-way deinterleaving load reads.
+        let cols: [float64x2_t; 4] = unsafe {
+            match N {
+                2 => {
+                    let r = vld2q_f64(p);
+                    [r.0, r.1, r.1, r.1]
+                }
+                3 => {
+                    let r = vld3q_f64(p);
+                    [r.0, r.1, r.2, r.2]
+                }
+                4 => {
+                    let r = vld4q_f64(p);
+                    [r.0, r.1, r.2, r.3]
+                }
+                _ => return None,
+            }
+        };
+        let mut out = [cols[0]; N];
+        for (c, col) in out.iter_mut().enumerate() {
+            *col = cols[c];
+        }
+        Some(out)
+    }
+    #[inline(always)]
+    fn mask_first(self, cnt: usize) -> uint64x2_t {
+        unsafe { vcltq_u64(vld1q_u64([0u64, 1].as_ptr()), vdupq_n_u64(cnt as u64)) }
     }
     #[inline(always)]
     fn splat(self, v: f64) -> float64x2_t {
@@ -768,7 +1054,7 @@ macro_rules! neon_int_backend {
      $le:ident, $lt:ident, $ge:ident, $gt:ident, $sel:ident,
      $rsum:ident, $rmin:ident, $rmax:ident,
      $shl:expr, $shr:expr, $and:ident, $orr:ident, $eor:ident, $not:expr,
-     $tobits:expr, $frombits:expr) => {
+     $tobits:expr, $frombits:expr, $ld2:ident, $ld3:ident, $ld4:ident) => {
         impl Backend<$t> for Neon {
             type Vector = $vec;
             type Mask = uint32x4_t;
@@ -776,6 +1062,39 @@ macro_rules! neon_int_backend {
             #[inline(always)]
             fn lanes(self) -> usize {
                 4
+            }
+            #[inline(always)]
+            fn load_rows<const N: usize>(self, rows: &[[$t; N]]) -> Option<[$vec; N]> {
+                debug_assert_eq!(rows.len(), <Self as Backend<$t>>::lanes(self));
+                let p = rows.as_ptr().cast::<$t>();
+                // SAFETY: a full register of rows is `lanes * N` contiguous elements, exactly what the
+                // `N`-way deinterleaving load reads.
+                let cols: [$vec; 4] = unsafe {
+                    match N {
+                        2 => {
+                            let r = $ld2(p);
+                            [r.0, r.1, r.1, r.1]
+                        }
+                        3 => {
+                            let r = $ld3(p);
+                            [r.0, r.1, r.2, r.2]
+                        }
+                        4 => {
+                            let r = $ld4(p);
+                            [r.0, r.1, r.2, r.3]
+                        }
+                        _ => return None,
+                    }
+                };
+                let mut out = [cols[0]; N];
+                for (c, col) in out.iter_mut().enumerate() {
+                    *col = cols[c];
+                }
+                Some(out)
+            }
+            #[inline(always)]
+            fn mask_first(self, cnt: usize) -> uint32x4_t {
+                unsafe { vcltq_u32(vld1q_u32([0u32, 1, 2, 3].as_ptr()), vdupq_n_u32(cnt as u32)) }
             }
             #[inline(always)]
             fn splat(self, v: $t) -> $vec {
@@ -941,7 +1260,8 @@ neon_int_backend!(
     vandq_u32, vorrq_u32, veorq_u32,
     |a| vmvnq_u32(a),
     |v| v,
-    |v| v
+    |v| v,
+    vld2q_u32, vld3q_u32, vld4q_u32
 );
 
 neon_int_backend!(
@@ -956,5 +1276,6 @@ neon_int_backend!(
     vandq_s32, vorrq_s32, veorq_s32,
     |a| vmvnq_s32(a),
     |v| vreinterpretq_u32_s32(v),
-    |v| vreinterpretq_s32_u32(v)
+    |v| vreinterpretq_s32_u32(v),
+    vld2q_s32, vld3q_s32, vld4q_s32
 );

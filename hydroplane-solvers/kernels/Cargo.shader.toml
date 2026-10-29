@@ -1,0 +1,22 @@
+[package]
+name = "hydroplane-solvers-kernels"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "rust-gpu compute kernels for hydroplane-solvers"
+repository = "https://github.com/oh-yes-0-fps/hydroplane"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+f64 = []
+ef64 = []
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(target_arch, values("spirv"))'] }
+
+[workspace]
+
+[dependencies]
+spirv-std = "0.10.0"

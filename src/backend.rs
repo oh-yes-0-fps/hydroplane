@@ -552,7 +552,7 @@ pub trait Backend<T: Scalar>: Copy {
         let mut u = [0u32; crate::MAX_LANES];
         let mut i = 0;
         while i < n {
-            u[i] = (f[i].into_f64().round_ties_even() as i32) as u32;
+            u[i] = (crate::scalar::round_ties_even_f64(f[i].into_f64()) as i32) as u32;
             i += 1;
         }
         self.iload(&u[..n])

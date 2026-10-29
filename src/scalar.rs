@@ -43,6 +43,20 @@ fn hw_sqrt_f64(x: f64) -> f64 {
     r
 }
 
+/// `x` rounded to the nearest integer, ties to even, using `core` alone. Below 2⁵² adding and
+/// then subtracting 2⁵² leaves the rounding to the FPU's default round-to-nearest-even; at or
+/// above it every `f64` is already an integer.
+#[inline(always)]
+pub(crate) fn round_ties_even_f64(x: f64) -> f64 {
+    const TWO_52: f64 = 4_503_599_627_370_496.0;
+    if x.abs() < TWO_52 {
+        let c = TWO_52.copysign(x);
+        (x + c) - c
+    } else {
+        x
+    }
+}
+
 /// Scalar `sqrt`. `std` lowers `x.sqrt()` to the hardware instruction; without `std` we reach the
 /// same instruction through [`hw_sqrt_f32`] on x86-64/aarch64, then `libm`, then as a last resort
 /// a software Newton loop.
@@ -536,5 +550,21 @@ mod hw_sqrt_tests {
         assert!(super::hw_sqrt_f64(-1.0).is_nan());
         assert_eq!(super::hw_sqrt_f32(-0.0).to_bits(), (-0.0f32).to_bits());
         assert_eq!(super::hw_sqrt_f64(-0.0).to_bits(), (-0.0f64).to_bits());
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    #[test]
+    fn round_ties_even_matches_std() {
+        let cases = [
+            0.0, -0.0, 0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 0.49999999999999994, 1e15 + 0.5, 4503599627370495.5,
+            4503599627370496.0, 9007199254740993.0, -9007199254740993.0, 1e300, f64::INFINITY,
+            f64::NEG_INFINITY, 2147483647.5, -2147483648.5, 123.456, -7.5,
+        ];
+        for x in cases {
+            assert_eq!(super::round_ties_even_f64(x), x.round_ties_even(), "{x}");
+        }
+        assert!(super::round_ties_even_f64(f64::NAN).is_nan());
     }
 }

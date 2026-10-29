@@ -83,15 +83,26 @@ fn maxabs_err(got: &[f32], want: &[f32]) -> f32 {
     got.iter().zip(want).fold(0.0f32, |m, (&g, &w)| m.max((g - w).abs()))
 }
 
+/// Whether an `M×N` tile fits the running streaming vector length, given each kernel's documented
+/// bound as a divisor of it (`M ≤ svl/dm`, `N ≤ svl/dn`); skips loudly when it does not.
+fn fits(what: &str, m: usize, n: usize, dm: usize, dn: usize) -> bool {
+    let svl = hydroplane::arch::sme1::streaming_vl_bytes();
+    let ok = m <= svl / dm && n <= svl / dn;
+    if !ok {
+        eprintln!("{what} {m}x{n} exceeds the {svl}-byte streaming vector length — skipping");
+    }
+    ok
+}
+
 #[test]
 fn sme_mma_f32() {
     if !sme_present() {
         eprintln!("SME absent — skipping sme_mma_f32");
         return;
     }
-    // svl/4 ≥ 4 (128-bit floor); use a non-square tile that fits the smallest plausible ZA.
-    const M: usize = 5;
-    const N: usize = 6;
+    // svl/4 ≥ 4 at the 128-bit floor; a non-square tile that fits the smallest legal ZA.
+    const M: usize = 4;
+    const N: usize = 3;
     const K: usize = 7;
     let a: Vec<f32> = (0..M * K).map(|i| i as f32 * 0.5 - 3.0).collect();
     let b: Vec<f32> = (0..K * N).map(|i| i as f32 * -0.25 + 1.0).collect();
@@ -106,6 +117,10 @@ fn sme_mma_f32() {
 
 /// Drives `mma_f32_wide` for one (M,N,K) against the scalar reference.
 fn check_wide<const M: usize, const N: usize, const K: usize>() {
+    if !fits("f32 wide", M, N, 2, 2) {
+        return;
+    }
+
     let a: Vec<f32> = (0..M * K).map(|i| (i as f32 % 11.0) * 0.5 - 2.0).collect();
     let b: Vec<f32> = (0..K * N).map(|i| (i as f32 % 7.0) * -0.25 + 1.0).collect();
     let mut c: Vec<f32> = (0..M * N).map(|i| (i as f32 % 5.0) * 0.1).collect();
@@ -132,6 +147,10 @@ fn sme_mma_f32_wide() {
 }
 
 fn check_wide_f64<const M: usize, const N: usize, const K: usize>() {
+    if !fits("f64 wide", M, N, 4, 4) {
+        return;
+    }
+
     let a: Vec<f64> = (0..M * K).map(|i| (i as f64 % 11.0) * 0.5 - 2.0).collect();
     let b: Vec<f64> = (0..K * N).map(|i| (i as f64 % 7.0) * -0.25 + 1.0).collect();
     let mut c: Vec<f64> = (0..M * N).map(|i| (i as f64 % 5.0) * 0.1).collect();
@@ -153,6 +172,10 @@ fn check_wide_f64<const M: usize, const N: usize, const K: usize>() {
 }
 
 fn check_wide_f16<const M: usize, const N: usize, const K: usize>() {
+    if !fits("f16 wide", M, N, 2, 1) {
+        return;
+    }
+
     let af: Vec<f32> = (0..M * K).map(|i| (i as f32 % 11.0) * 0.1 - 0.5).collect();
     let bf: Vec<f32> = (0..K * N).map(|i| (i as f32 % 7.0) * 0.1 - 0.3).collect();
     let a16: Vec<f16> = af.iter().map(|&x| f16::from_f32(x)).collect();
@@ -188,6 +211,10 @@ fn sme_mma_f16_wide() {
 }
 
 fn check_wide_bf16<const M: usize, const N: usize, const K: usize>() {
+    if !fits("bf16 wide", M, N, 2, 2) {
+        return;
+    }
+
     let af: Vec<f32> = (0..M * K).map(|i| (i as f32 % 11.0) * 0.25 - 1.0).collect();
     let bf: Vec<f32> = (0..K * N).map(|i| (i as f32 % 7.0) * 0.5 - 1.5).collect();
     let a: Vec<bf16> = af.iter().map(|&x| bf16::from_f32(x)).collect();
@@ -241,10 +268,13 @@ fn sme_mma_f64() {
         eprintln!("SME absent — skipping sme_mma_f64");
         return;
     }
-    // f64 ZA tile is svl/8 wide (needs FEAT_SME_F64F64); keep M,N ≤ 4 for the 256-bit-svl floor.
+    // f64 ZA tile is svl/8 wide (needs FEAT_SME_F64F64).
     const M: usize = 4;
     const N: usize = 3;
     const K: usize = 5;
+    if !fits("f64", M, N, 8, 8) {
+        return;
+    }
     let a: Vec<f64> = (0..M * K).map(|i| i as f64 * 0.5 - 3.0).collect();
     let b: Vec<f64> = (0..K * N).map(|i| i as f64 * -0.25 + 1.0).collect();
     let mut c: Vec<f64> = (0..M * N).map(|i| i as f64 * 0.1).collect();

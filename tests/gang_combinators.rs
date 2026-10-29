@@ -126,6 +126,34 @@ fn gather_n_matches_scalar() {
     }
 }
 
+/// Overlap count from `[x, y, z, r]` rows via `gather_rows`, NaN-filling the radius so a short
+/// tail self-rejects.
+#[kernel]
+fn gather_rows_count_k<'a>(ctx: Gang, pts: &'a [[f32; 4]], q: [f32; 4]) -> usize {
+    let [cx, cy, cz, sr] = ctx.splat_n(q);
+    let (one, zero) = (ctx.splat(1.0), ctx.splat(0.0));
+    let mut acc = zero;
+    ctx.for_each_chunk::<f32>(pts.len(), |off, cnt| {
+        let [x, y, z, r] = ctx.gather_rows(&pts[off..off + cnt], [0.0, 0.0, 0.0, f32::NAN]);
+        let (dx, dy, dz) = (cx - x, cy - y, cz - z);
+        let rsum = sr + r;
+        acc = acc + one.select((dx * dx + dy * dy + dz * dz).le(rsum * rsum), zero);
+    });
+    acc.reduce_sum() as usize
+}
+
+#[test]
+fn gather_rows_matches_scalar() {
+    for n in lengths() {
+        let (xs, ys, zs, rs) = spheres(n);
+        let pts: Vec<[f32; 4]> = (0..n).map(|i| [xs[i], ys[i], zs[i], rs[i]]).collect();
+        for q in QUERIES {
+            let want = (0..n).filter(|&i| overlaps(&xs, &ys, &zs, &rs, q, i)).count();
+            assert_eq!(gather_rows_count_k(&pts, q), want, "gather_rows n={n} q={q:?}");
+        }
+    }
+}
+
 #[kernel]
 fn load_roundtrip_k<'a>(ctx: Gang, xs: &'a [f32], ys: &'a [f32], zs: &'a [f32]) -> f32 {
     let n = ctx.lanes::<f32>();
@@ -158,19 +186,23 @@ impl hydroplane::Kernel<f32> for LanesProbe {
     }
 }
 
+/// Lane `i` is `1.0` where bit `i` of `pat` is set; returns the lane count with the bitmask, since
+/// a kernel touching integers may run on a different backend than a plain `f32` dispatch.
 #[kernel]
-fn bitmask_k<'a>(ctx: Gang, xs: &'a [f32], thresh: f32) -> u32 {
-    debug_assert!(xs.len() == ctx.lanes::<f32>());
-    ctx.load(xs).gt(ctx.splat(thresh)).to_bitmask()
+fn bitmask_k(ctx: Gang, pat: u64) -> (usize, u32) {
+    let n = ctx.lanes::<f32>();
+    let mut xs = [0.0f32; MAX_LANES];
+    for (i, x) in xs[..n].iter_mut().enumerate() {
+        *x = if (pat >> i) & 1 == 1 { 1.0 } else { -1.0 };
+    }
+    (n, ctx.load(&xs[..n]).gt(ctx.splat(0.0)).to_bitmask())
 }
 
 #[test]
 fn to_bitmask_matches_lane_predicate() {
-    let lanes = hydroplane::dispatch(LanesProbe);
     // A few distinct set patterns across the active lanes; bit `i` must track lane `i`.
     for pat in [0b0u64, 0b1, 0b10, 0b1010, 0xFFFF_FFFF] {
-        let xs: Vec<f32> = (0..lanes).map(|i| if (pat >> i) & 1 == 1 { 1.0 } else { -1.0 }).collect();
-        let got = bitmask_k(&xs, 0.0);
+        let (lanes, got) = bitmask_k(pat);
         let want = (pat as u32) & ((1u64 << lanes) - 1) as u32;
         assert_eq!(got, want, "lanes={lanes} pat={pat:#b}");
     }

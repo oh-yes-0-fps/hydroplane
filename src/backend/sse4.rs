@@ -9,7 +9,8 @@ use core::arch::x86_64::*;
 
 use crate::backend::Backend;
 
-/// SSE4.1 execution token. Construct only when the CPU supports `sse4.1`.
+/// SSE4 execution token: the x86-64-v2 tier ([`crate::isa`]). Construct only when the CPU has the
+/// whole bundle.
 #[derive(Clone, Copy, Debug)]
 pub struct Sse4(());
 
@@ -20,14 +21,10 @@ impl Sse4 {
     #[allow(dead_code)]
     #[inline]
     pub fn detect() -> Option<Self> {
-        if is_x86_feature_detected!("sse4.1") {
-            Some(Self(()))
-        } else {
-            None
-        }
+        if crate::__hp_isa!(detect SSE41) { Some(Self(())) } else { None }
     }
     /// # Safety
-    /// The CPU must support `sse4.1`.
+    /// The CPU must have the whole `SSE41` tier bundle ([`crate::isa`]).
     // Used only by the statically-pinned and no-std dispatch paths; std builds go through
     // runtime `detect`.
     #[allow(dead_code)]
@@ -38,6 +35,8 @@ impl Sse4 {
 }
 
 impl Backend<f32> for Sse4 {
+    crate::backend::enter_with_features!(SSE41);
+
     type Vector = __m128;
     type Mask = __m128;
 

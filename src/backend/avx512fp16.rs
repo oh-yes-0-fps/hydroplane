@@ -22,19 +22,10 @@ impl Avx512Fp16 {
     // Dead when the build statically pins `avx512fp16`; dispatch then uses `new_unchecked`.
     #[allow(dead_code)]
     pub fn detect() -> Option<Self> {
-        // `vpblendmw`/`vcmpph`+`kmovd` ride on AVX-512-BW; every `avx512fp16` part has BW, but
-        // the check keeps the primitives' `target_feature` set honest.
-        if is_x86_feature_detected!("avx512fp16")
-            && is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx512bw")
-        {
-            Some(Self(()))
-        } else {
-            None
-        }
+        if crate::__hp_isa!(detect AVX512FP16) { Some(Self(())) } else { None }
     }
     /// # Safety
-    /// The CPU must support `avx512fp16` (and `avx512f`/`avx512bw`).
+    /// The CPU must have the whole `AVX512FP16` tier bundle ([`crate::isa`]), BF16 included.
     #[allow(dead_code)]
     #[inline]
     pub const unsafe fn new_unchecked() -> Self {
@@ -184,15 +175,20 @@ impl Avx512Fp16 {
     }
 }
 
-// `avx512fp16` implies `avx512f`, so every non-f16 element rides the plain AVX-512 impls.
-crate::backend::delegate_float_element!(Avx512Fp16, f32, crate::backend::avx512::Avx512, unsafe {
-    crate::backend::avx512::Avx512::new_unchecked()
-});
+// The FP16 tier's bundle includes all of AVX-512 v4 and BF16, so `bf16` rides the native BF16
+// impls and every other element the plain AVX-512 ones.
+crate::backend::delegate_float_element!(
+    Avx512Fp16,
+    f32,
+    crate::backend::avx512::Avx512,
+    unsafe { crate::backend::avx512::Avx512::new_unchecked() },
+    enter = AVX512FP16
+);
 crate::backend::delegate_float_element!(Avx512Fp16, f64, crate::backend::avx512::Avx512, unsafe {
     crate::backend::avx512::Avx512::new_unchecked()
 });
-crate::backend::delegate_float_element!(Avx512Fp16, half::bf16, crate::backend::avx512::Avx512, unsafe {
-    crate::backend::avx512::Avx512::new_unchecked()
+crate::backend::delegate_float_element!(Avx512Fp16, half::bf16, crate::backend::avx512bf16::Avx512Bf16, unsafe {
+    crate::backend::avx512bf16::Avx512Bf16::new_unchecked()
 });
 crate::backend::delegate_int_element!(Avx512Fp16, u32, crate::backend::avx512::Avx512, unsafe {
     crate::backend::avx512::Avx512::new_unchecked()

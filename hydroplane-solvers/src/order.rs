@@ -37,6 +37,9 @@ pub struct NestedDissection {
     pub node_refine: bool,
     /// Moves a separator refinement pass makes past its best separator before giving up.
     pub patience: usize,
+    /// Offsets which vertices seed the greedy initial cuts: a different but equally good
+    /// ordering for each value.
+    pub seed: usize,
 }
 
 impl Default for NestedDissection {
@@ -51,6 +54,7 @@ impl Default for NestedDissection {
             tries: 1,
             node_refine: true,
             patience: 50,
+            seed: 0,
         }
     }
 }
@@ -301,7 +305,7 @@ fn initial_cut(g: &Graph, attempt: usize, p: &NestedDissection) -> Vec<u8> {
     let mut seeds: Vec<usize> = (0..n).collect();
     seeds.sort_by_key(|&v| g.xadj[v + 1] - g.xadj[v]);
     let step = (n / p.seeds).max(1);
-    for &seed in seeds.iter().skip(attempt % step.max(1)).step_by(step).take(p.seeds) {
+    for &seed in seeds.iter().skip((attempt + p.seed) % step.max(1)).step_by(step).take(p.seeds) {
         grow(g, seed, &mut part);
         refine(g, &mut part, p);
         let c = cut(g, &part);
@@ -447,6 +451,7 @@ impl core::str::FromStr for NestedDissection {
                 "tries" => p.tries = v.parse().map_err(|e| bad(&e))?,
                 "node_refine" => p.node_refine = v.parse().map_err(|e| bad(&e))?,
                 "patience" => p.patience = v.parse().map_err(|e| bad(&e))?,
+                "seed" => p.seed = v.parse().map_err(|e| bad(&e))?,
                 _ => return Err(format!("{k}: no such field")),
             }
         }

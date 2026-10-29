@@ -1,0 +1,25 @@
+[package]
+name = "hydroplane-whatcompute"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Identify the compute on a machine for hydroplane's tuning: CPU microarchitecture (Zen 5, Lion Cove, Firestorm, Neoverse V2, ...; no_std, dependency-free) and GPUs through Vulkan (architecture, shader/tensor/RT units, cooperative matrix shapes, unified memory, resizable BAR, shader features)."
+repository = "https://github.com/oh-yes-0-fps/hydroplane"
+documentation = "https://docs.rs/hydroplane-whatcompute"
+readme = "README.md"
+keywords = ["cpu", "gpu", "vulkan", "microarchitecture", "detection"]
+categories = ["hardware-support", "no-std"]
+
+[dependencies]
+ash = { version = "0.38.0", default-features = false, features = ["loaded", "std"], optional = true }
+
+[features]
+default = ["vulkan"]
+std = []
+# GPU detection through the system Vulkan loader (MoltenVK on macOS), loaded at runtime.
+vulkan = ["std", "dep:ash"]
+
+[[example]]
+name = "whatcompute"
+required-features = ["vulkan"]

@@ -46,7 +46,7 @@ macro_rules! impl_sve_backend {
      $add:ident, $sub:ident, $mul:ident, $divop:ident, $neg:ident, $fma:ident, $sqrt:ident,
      $min:ident, $max:ident,
      $le:ident, $lt:ident, $ge:ident, $gt:ident, $sel:ident,
-     $rsum:ident, $rmin:ident, $rmax:ident) => {
+     $rsum:ident, $rmin:ident, $rmax:ident, { $($extra:tt)* }) => {
         impl<const C: usize> Backend<$t> for Sve<C> {
             type Vector = SveVec<C>;
             type Mask = SveVec<C>;
@@ -162,6 +162,8 @@ macro_rules! impl_sve_backend {
                 unsafe { sve1::$rmax::<C>(&v) }
             }
 
+            $($extra)*
+
             // Scalable vector length, so the integer companion rides a fixed max-width array;
             // every op takes the trait's portable default.
             type IVector = [u32; crate::MAX_LANES];
@@ -183,25 +185,122 @@ macro_rules! impl_sve_backend {
 impl_sve_backend!(
     f32, 4, splat_f32, load_f32, store_f32, add_f32, sub_f32, mul_f32, div_f32, neg_f32, fma_f32,
     sqrt_f32, min_f32, max_f32, le_f32, lt_f32, ge_f32, gt_f32, select_f32, reduce_sum_f32,
-    reduce_min_f32, reduce_max_f32
+    reduce_min_f32, reduce_max_f32,
+    {
+        crate::backend::enter_with_features!(SVE);
+
+        const NATIVE_GATHER: bool = true;
+        #[inline]
+        fn gather(self, base: &[f32], idx: [u32; crate::MAX_LANES]) -> SveVec<C> {
+            #[cfg(debug_assertions)]
+            {
+                let n = <Self as Backend<f32>>::lanes(self);
+                debug_assert!(idx[..n].iter().all(|&j| (j as usize) < base.len()));
+            }
+            unsafe { sve1::gather_f32::<C>(base.as_ptr(), idx.as_ptr()) }
+        }
+        #[inline]
+        fn igather(self, base: &[u32], idx: [u32; crate::MAX_LANES]) -> [u32; crate::MAX_LANES] {
+            let n = <Self as Backend<f32>>::lanes(self);
+            #[cfg(debug_assertions)]
+            debug_assert!(idx[..n].iter().all(|&j| (j as usize) < base.len()));
+            let mut out = [0u32; crate::MAX_LANES];
+            unsafe { sve1::gather_u32(base.as_ptr(), idx.as_ptr(), out.as_mut_ptr(), n) };
+            out
+        }
+        #[inline]
+        fn load_first(self, s: &[f32], fill: f32) -> SveVec<C> {
+            debug_assert!(s.len() < <Self as Backend<f32>>::lanes(self));
+            unsafe { sve1::load_first_f32::<C>(s.as_ptr(), s.len(), fill) }
+        }
+        #[inline]
+        fn store_first(self, v: SveVec<C>, s: &mut [f32]) {
+            debug_assert!(s.len() < <Self as Backend<f32>>::lanes(self));
+            unsafe { sve1::store_first_f32::<C>(&v, s.as_mut_ptr(), s.len()) }
+        }
+        #[inline]
+        fn scatter(self, out: &mut [f32], idx: [u32; crate::MAX_LANES], v: SveVec<C>) {
+            let n = <Self as Backend<f32>>::lanes(self);
+            debug_assert!(idx[..n].iter().all(|&j| (j as usize) < out.len()));
+            unsafe { sve1::scatter_f32::<C>(out.as_mut_ptr(), idx.as_ptr(), &v) }
+        }
+        #[inline]
+        fn scatter_masked(self, out: &mut [f32], idx: [u32; crate::MAX_LANES], v: SveVec<C>, m: SveVec<C>) {
+            unsafe { sve1::scatter_mask_f32::<C>(out.as_mut_ptr(), idx.as_ptr(), &v, &m) }
+        }
+        #[inline]
+        fn iscatter(self, out: &mut [u32], idx: [u32; crate::MAX_LANES], v: [u32; crate::MAX_LANES]) {
+            let n = <Self as Backend<f32>>::lanes(self);
+            debug_assert!(idx[..n].iter().all(|&j| (j as usize) < out.len()));
+            unsafe { sve1::scatter_u32(out.as_mut_ptr(), idx.as_ptr(), v.as_ptr(), n) };
+        }
+    }
 );
 impl_sve_backend!(
     f64, 8, splat_f64, load_f64, store_f64, add_f64, sub_f64, mul_f64, div_f64, neg_f64, fma_f64,
     sqrt_f64, min_f64, max_f64, le_f64, lt_f64, ge_f64, gt_f64, select_f64, reduce_sum_f64,
-    reduce_min_f64, reduce_max_f64
+    reduce_min_f64, reduce_max_f64,
+    {
+        const NATIVE_GATHER: bool = true;
+        #[inline]
+        fn gather(self, base: &[f64], idx: [u32; crate::MAX_LANES]) -> SveVec<C> {
+            #[cfg(debug_assertions)]
+            {
+                let n = <Self as Backend<f64>>::lanes(self);
+                debug_assert!(idx[..n].iter().all(|&j| (j as usize) < base.len()));
+            }
+            unsafe { sve1::gather_f64::<C>(base.as_ptr(), idx.as_ptr()) }
+        }
+        #[inline]
+        fn igather(self, base: &[u32], idx: [u32; crate::MAX_LANES]) -> [u32; crate::MAX_LANES] {
+            let n = <Self as Backend<f64>>::lanes(self);
+            #[cfg(debug_assertions)]
+            debug_assert!(idx[..n].iter().all(|&j| (j as usize) < base.len()));
+            let mut out = [0u32; crate::MAX_LANES];
+            unsafe { sve1::gather_u32(base.as_ptr(), idx.as_ptr(), out.as_mut_ptr(), n) };
+            out
+        }
+        #[inline]
+        fn load_first(self, s: &[f64], fill: f64) -> SveVec<C> {
+            debug_assert!(s.len() < <Self as Backend<f64>>::lanes(self));
+            unsafe { sve1::load_first_f64::<C>(s.as_ptr(), s.len(), fill) }
+        }
+        #[inline]
+        fn store_first(self, v: SveVec<C>, s: &mut [f64]) {
+            debug_assert!(s.len() < <Self as Backend<f64>>::lanes(self));
+            unsafe { sve1::store_first_f64::<C>(&v, s.as_mut_ptr(), s.len()) }
+        }
+        #[inline]
+        fn scatter(self, out: &mut [f64], idx: [u32; crate::MAX_LANES], v: SveVec<C>) {
+            let n = <Self as Backend<f64>>::lanes(self);
+            debug_assert!(idx[..n].iter().all(|&j| (j as usize) < out.len()));
+            unsafe { sve1::scatter_f64::<C>(out.as_mut_ptr(), idx.as_ptr(), &v) }
+        }
+        #[inline]
+        fn scatter_masked(self, out: &mut [f64], idx: [u32; crate::MAX_LANES], v: SveVec<C>, m: SveVec<C>) {
+            unsafe { sve1::scatter_mask_f64::<C>(out.as_mut_ptr(), idx.as_ptr(), &v, &m) }
+        }
+        #[inline]
+        fn iscatter(self, out: &mut [u32], idx: [u32; crate::MAX_LANES], v: [u32; crate::MAX_LANES]) {
+            let n = <Self as Backend<f64>>::lanes(self);
+            debug_assert!(idx[..n].iter().all(|&j| (j as usize) < out.len()));
+            unsafe { sve1::scatter_u32(out.as_mut_ptr(), idx.as_ptr(), v.as_ptr(), n) };
+        }
+    }
 );
-// f16: native 16-bit lanes (C/2), full `.h` ALU.
+// f16: native 16-bit lanes (C/2), full `.h` ALU. Gather keeps the portable default (no native
+// 16-bit gather primitive).
 impl_sve_backend!(
     f16, 2, splat_f16, load_f16, store_f16, add_f16, sub_f16, mul_f16, div_f16, neg_f16, fma_f16,
     sqrt_f16, min_f16, max_f16, le_f16, lt_f16, ge_f16, gt_f16, select_f16, reduce_sum_f16,
-    reduce_min_f16, reduce_max_f16
+    reduce_min_f16, reduce_max_f16, {}
 );
 // bf16: 16-bit storage, f32 compute image (C/4 lanes). Arithmetic/compare/select are the `*_f32`
 // ops over the image; only the memory boundary (`*_bf16`) and reductions differ.
 impl_sve_backend!(
     bf16, 4, splat_bf16, load_bf16, store_bf16, add_f32, sub_f32, mul_f32, div_f32, neg_f32, fma_f32,
     sqrt_f32, min_f32, max_f32, le_f32, lt_f32, ge_f32, gt_f32, select_f32, reduce_sum_bf16,
-    reduce_min_bf16, reduce_max_bf16
+    reduce_min_bf16, reduce_max_bf16, {}
 );
 
 // Integer elements: no SVE integer asm primitives yet, so correctness-only emulation for

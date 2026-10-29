@@ -12,9 +12,10 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use ash::vk;
+use rayon::prelude::*;
 
-use super::{Buf, Context, Pipe, device_error};
-use crate::cholesky::{Analysis, Error, Real};
+use super::{Buf, Context, DeviceReal, Pipe, Precision, device_error};
+use crate::cholesky::{Analysis, Error};
 
 const TILE: usize = 32;
 /// `chol_step`'s marker for a diagonal-tile factorization item.
@@ -39,6 +40,7 @@ pub enum Kernel {
     SolveScatter,
 }
 
+#[derive(Clone, Copy)]
 struct Segment {
     kernel: Kernel,
     level: usize,
@@ -62,6 +64,51 @@ pub struct Stats {
     pub schur_flops: f64,
 }
 
+/// Size of the blocks of a supernode's update of its ancestors (`chol_schur`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SchurTile {
+    /// 32 × 32 blocks, a 1 × 4 strip of outputs per invocation: the most workgroups, best where
+    /// the update is limited by latency or a narrow double-precision unit.
+    #[default]
+    T32,
+    /// 64 × 64 blocks, a 4 × 4 block per invocation: fewer shared-memory loads per multiply-add,
+    /// best where the update is limited by throughput.
+    T64,
+}
+
+/// Settings of the Vulkan solvers.
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    /// The device: `None` (the default) is [`Context::shared`].
+    pub context: Option<Arc<Context>>,
+    /// `None` (the default) is the measured best for the precision ([`SchurTile::for_precision`]).
+    pub schur_tile: Option<SchurTile>,
+    /// [`super::VulkanPcg`]'s stopping rule.
+    pub pcg: crate::cholesky::PcgOptions,
+}
+
+impl Options {
+    pub(crate) fn context(&self) -> Result<Arc<Context>, Error> {
+        match &self.context {
+            Some(c) => Ok(c.clone()),
+            None => Context::shared(),
+        }
+    }
+}
+
+impl SchurTile {
+    /// The measured best for precision `T`: 64-wide Schur blocks in `f32` (6–8 % off the whole
+    /// factorization on an M5 Pro and on an RTX 5090), 32-wide in `f64` (8 % faster on the 5090,
+    /// whose narrow double-precision unit is busy either way and balances better over four times
+    /// the workgroups).
+    pub fn for_precision<T: DeviceReal>() -> Self {
+        match T::PRECISION {
+            Precision::F32 => SchurTile::T64,
+            Precision::F64 | Precision::Ef64 => SchurTile::T32,
+        }
+    }
+}
+
 /// What a factorization had to do to finish.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Info {
@@ -73,9 +120,9 @@ pub struct Info {
 
 /// A recorded command buffer with timestamps around it and, when profiling, after every
 /// dispatch.
-struct Recording {
-    cmd: vk::CommandBuffer,
-    queries: vk::QueryPool,
+pub(super) struct Recording {
+    pub(super) cmd: vk::CommandBuffer,
+    pub(super) queries: vk::QueryPool,
     stamps: Vec<(Kernel, usize)>,
 }
 
@@ -88,7 +135,7 @@ pub struct KernelTime {
     pub ms: f64,
 }
 
-struct Stamper<'a> {
+pub(super) struct Stamper<'a> {
     d: &'a ash::Device,
     queries: vk::QueryPool,
     on: bool,
@@ -104,24 +151,44 @@ impl Stamper<'_> {
     }
 }
 
-pub struct VulkanCholesky<T: Real> {
+pub struct VulkanCholesky<T: DeviceReal> {
     ctx: Arc<Context>,
     n: usize,
     a_len: usize,
     factor_len: usize,
     diag_src: Vec<(usize, usize)>,
     lval: Buf,
-    stage_a: Buf,
-    stage_a_ptr: *mut T,
+    /// Where a factorization's values (`a_len`) and diagonal (`n`) are written, where a solve's
+    /// right-hand side is written and its solution read: staging buffers copied by the recorded
+    /// commands, or on a unified-memory device the kernels' own buffers, mapped.
+    values_ptr: *mut T,
+    diag_ptr: *mut T,
+    rhs_ptr: *mut T,
+    solution_ptr: *const T,
     stage_status: Buf,
     stage_status_ptr: *const u32,
-    stage_b: Buf,
-    stage_b_ptr: *mut T,
+    mapped: Vec<Buf>,
     buffers: Vec<Buf>,
     pipes: Vec<Pipe>,
     module: vk::ShaderModule,
+    /// The right-hand side and the solution of the solve, in the matrix's own order.
+    bvec: Buf,
+    out: Buf,
+    solve_segments: Vec<Segment>,
+    tau: f32,
     factor_cmd: Recording,
     solve_cmd: Recording,
+    /// The diagonal-block inversions alone, for a factor made elsewhere ([`Self::load_factor`]).
+    inverse_cmd: Recording,
+    /// Each supernode's block offset, rows `f`, columns `k` and first column.
+    shapes: Vec<[usize; 4]>,
+    dinv: Buf,
+    /// The factor and inverted pivots as the host writes them for [`Self::load_factor`]: the
+    /// kernels' own buffers, mapped, on a unified-memory device; else a staging buffer made on
+    /// first use.
+    load_target: Option<LoadTarget<T>>,
+    xinv: Buf,
+    xinv_len: usize,
     stats: Stats,
     last_factor_ms: f64,
     last_solve_ms: f64,
@@ -129,11 +196,23 @@ pub struct VulkanCholesky<T: Real> {
 }
 
 // The mapped staging pointers are only touched through `&mut self`.
-unsafe impl<T: Real> Send for VulkanCholesky<T> {}
+unsafe impl<T: DeviceReal> Send for VulkanCholesky<T> {}
 
-impl<T: Real> VulkanCholesky<T> {
-    pub fn new(ctx: Arc<Context>, analysis: &Analysis) -> Result<Self, Error> {
-        let plan = Plan::new(analysis)?;
+impl<T: DeviceReal> VulkanCholesky<T> {
+    pub fn new(analysis: &Analysis) -> Result<Self, Error> {
+        Self::with_options(analysis, Options::default())
+    }
+
+    pub fn with_options(analysis: &Analysis, options: Options) -> Result<Self, Error> {
+        Self::build(analysis, options, None)
+    }
+
+    /// With `signs` (one per column, in the matrix's own order), the signed factorization
+    /// `A = L S Lᵀ` of [`super::VulkanLdlt`].
+    pub(super) fn build(analysis: &Analysis, options: Options, signs: Option<&[i8]>) -> Result<Self, Error> {
+        let ctx = options.context()?;
+        let schur_tile = options.schur_tile.unwrap_or_else(SchurTile::for_precision::<T>);
+        let plan = Plan::new(analysis, schur_tile, signs.is_some())?;
         let module = ctx.module::<T>()?;
         let real = size_of::<T>() as u64;
         let n = analysis.dim();
@@ -148,41 +227,57 @@ impl<T: Real> VulkanCholesky<T> {
         let dst = ctx.upload(&plan.dst)?;
         let pat = ctx.upload(&plan.pat)?;
         let perm = ctx.upload(&plan.perm)?;
-        let aval = ctx.device_buffer(a_len as u64 * real)?;
-        let lval = ctx.device_buffer((factor_len as u64 + 1) * real)?;
+        let sign = match signs {
+            Some(signs) => ctx.upload(&plan.perm.iter().map(|&old| (signs[old as usize] < 0) as u32).collect::<Vec<_>>())?,
+            None => ctx.upload(&[0u32])?,
+        };
+        let unified = ctx.unified_memory();
+        let io = |bytes: u64| if unified { ctx.shared_buffer(bytes) } else { ctx.device_buffer(bytes) };
+        let aval = io(a_len as u64 * real)?;
+        let lval = io((factor_len as u64 + 1) * real)?;
         let status = ctx.device_buffer(16)?;
-        let diag = ctx.device_buffer(n as u64 * real)?;
-        let dinv = ctx.device_buffer(n as u64 * real)?;
+        let diag = io(n as u64 * real)?;
+        let dinv = io(n as u64 * real)?;
         let x = ctx.device_buffer(n as u64 * real)?;
-        let xinv = ctx.device_buffer(plan.xinv_len as u64 * real)?;
+        let xinv = io(plan.xinv_len as u64 * real)?;
         let ytmp = ctx.device_buffer(n as u64 * real)?;
-        let bvec = ctx.device_buffer(n as u64 * real)?;
-        let out = ctx.device_buffer(n as u64 * real)?;
-        let stage_a = ctx.host_buffer((a_len + n) as u64 * real)?;
+        let bvec = io(n as u64 * real)?;
+        let out = io(n as u64 * real)?;
+        let stage_a = if unified { None } else { Some(ctx.host_buffer((a_len + n) as u64 * real)?) };
         let stage_status = ctx.host_buffer(16)?;
-        let stage_b = ctx.host_buffer(n as u64 * real)?;
+        let stage_b = if unified { None } else { Some(ctx.host_buffer(n as u64 * real)?) };
 
+        let variant = |name: &str| if signs.is_some() { format!("cholesky::{name}_signed") } else { format!("cholesky::{name}") };
         let pipes = vec![
             ctx.pipeline(module, "cholesky::chol_scatter", &[dst, aval, lval])?,
-            ctx.pipeline(module, "cholesky::chol_step", &[items, fronts, bounds, lval, status, diag, dinv])?,
-            ctx.pipeline(module, "cholesky::chol_trsm", &[items, fronts, bounds, lval, dinv])?,
-            ctx.pipeline(module, "cholesky::chol_schur", &[items, fronts, bounds, smap, rmap, lval])?,
+            ctx.pipeline(module, &variant("chol_step"), &[items, fronts, bounds, lval, status, diag, dinv, sign])?,
+            ctx.pipeline(module, &variant("chol_trsm"), &[items, fronts, bounds, lval, dinv, sign])?,
+            ctx.pipeline(
+                module,
+                &variant(match schur_tile {
+                    SchurTile::T32 => "chol_schur",
+                    SchurTile::T64 => "chol_schur64",
+                }),
+                &[items, fronts, bounds, smap, rmap, lval, sign],
+            )?,
             ctx.pipeline(module, "cholesky::chol_inv_diag", &[items, fronts, bounds, lval, dinv, xinv])?,
             ctx.pipeline(module, "cholesky::chol_inv_left", &[items, fronts, bounds, lval, xinv])?,
             ctx.pipeline(module, "cholesky::chol_inv_right", &[items, fronts, bounds, xinv])?,
             ctx.pipeline(module, "cholesky::solve_gather", &[perm, bvec, x])?,
             ctx.pipeline(module, "cholesky::solve_fgemv", &[items, fronts, xinv, x, ytmp])?,
             ctx.pipeline(module, "cholesky::solve_fpattern", &[items, fronts, pat, lval, ytmp, x])?,
-            ctx.pipeline(module, "cholesky::solve_bpattern", &[items, fronts, pat, lval, x, ytmp])?,
+            ctx.pipeline(module, &variant("solve_bpattern"), &[items, fronts, pat, lval, x, ytmp, sign])?,
             ctx.pipeline(module, "cholesky::solve_bgemv", &[items, fronts, xinv, ytmp, x])?,
             ctx.pipeline(module, "cholesky::solve_scatter", &[perm, x, out])?,
         ];
-        let tau = (100.0 * if T::F64 { f64::EPSILON } else { f32::EPSILON as f64 }) as f32;
+        let tau = (100.0 * T::EPSILON) as f32;
         let d = &ctx.dev;
         let profile = std::env::var_os("HYDROPLANE_SOLVERS_PROFILE").is_some();
         let factor_cmd = record(&ctx, profile, plan.factor.len() + 1, |cmd, st| unsafe {
-            d.cmd_copy_buffer(cmd, stage_a.buf, aval.buf, &[vk::BufferCopy::default().size(a_len as u64 * real)]);
-            d.cmd_copy_buffer(cmd, stage_a.buf, diag.buf, &[vk::BufferCopy::default().src_offset(a_len as u64 * real).size(n as u64 * real)]);
+            if let Some(stage_a) = stage_a {
+                d.cmd_copy_buffer(cmd, stage_a.buf, aval.buf, &[vk::BufferCopy::default().size(a_len as u64 * real)]);
+                d.cmd_copy_buffer(cmd, stage_a.buf, diag.buf, &[vk::BufferCopy::default().src_offset(a_len as u64 * real).size(n as u64 * real)]);
+            }
             d.cmd_fill_buffer(cmd, lval.buf, 0, vk::WHOLE_SIZE, 0);
             d.cmd_fill_buffer(cmd, status.buf, 0, vk::WHOLE_SIZE, 0);
             barrier(d, cmd, vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE, vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
@@ -200,24 +295,57 @@ impl<T: Real> VulkanCholesky<T> {
             d.cmd_copy_buffer(cmd, status.buf, stage_status.buf, &[vk::BufferCopy::default().size(4)]);
         })?;
         let solve_cmd = record(&ctx, profile, plan.solve.len() + 2, |cmd, st| unsafe {
-            d.cmd_copy_buffer(cmd, stage_b.buf, bvec.buf, &[vk::BufferCopy::default().size(n as u64 * real)]);
-            barrier(d, cmd, vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE, vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
-            dispatch(d, cmd, &pipes[Kernel::SolveGather as usize], [0, n as u32], n.div_ceil(256), tau);
-            compute_barrier(d, cmd);
-            st.stamp(cmd, Kernel::SolveGather, 0);
-            for seg in &plan.solve {
-                dispatch(d, cmd, &pipes[seg.kernel as usize], [seg.first, seg.count], seg.count as usize, tau);
-                compute_barrier(d, cmd);
-                st.stamp(cmd, seg.kernel, seg.level);
+            if let Some(stage_b) = stage_b {
+                d.cmd_copy_buffer(cmd, stage_b.buf, bvec.buf, &[vk::BufferCopy::default().size(n as u64 * real)]);
             }
-            dispatch(d, cmd, &pipes[Kernel::SolveScatter as usize], [0, n as u32], n.div_ceil(256), tau);
-            compute_barrier(d, cmd);
-            st.stamp(cmd, Kernel::SolveScatter, 0);
+            barrier(d, cmd, vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE, vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            solve_body(d, cmd, &pipes, &plan.solve, n, tau, st);
             barrier(d, cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_WRITE, vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_READ);
-            d.cmd_copy_buffer(cmd, out.buf, stage_b.buf, &[vk::BufferCopy::default().size(n as u64 * real)]);
+            match stage_b {
+                Some(stage_b) => d.cmd_copy_buffer(cmd, out.buf, stage_b.buf, &[vk::BufferCopy::default().size(n as u64 * real)]),
+                None => barrier(d, cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_WRITE, vk::PipelineStageFlags::HOST, vk::AccessFlags::HOST_READ),
+            }
+        })?;
+        let inverse_cmd = record(&ctx, false, 0, |cmd, _| unsafe {
+            barrier(d, cmd, vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::HOST_WRITE | vk::AccessFlags::TRANSFER_WRITE, vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_READ);
+            for stage in &plan.inverse {
+                for seg in stage {
+                    dispatch(d, cmd, &pipes[seg.kernel as usize], [seg.first, seg.count], seg.count as usize, tau);
+                }
+                compute_barrier(d, cmd);
+            }
         })?;
         let map = |b: Buf| unsafe { ctx.dev.map_memory(b.mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()).map_err(device_error) };
-        let (stage_a_ptr, stage_status_ptr, stage_b_ptr) = (map(stage_a)? as *mut T, map(stage_status)? as *const u32, map(stage_b)? as *mut T);
+        let stage_status_ptr = map(stage_status)? as *const u32;
+        let mut mapped = vec![stage_status];
+        let load_target = if unified {
+            mapped.extend([lval, dinv, xinv]);
+            Some(LoadTarget { lval: map(lval)? as *mut T, dinv: map(dinv)? as *mut T, xinv: map(xinv)? as *mut T, stage: None })
+        } else {
+            None
+        };
+        let (values_ptr, diag_ptr) = match stage_a {
+            Some(stage_a) => {
+                mapped.push(stage_a);
+                let p = map(stage_a)? as *mut T;
+                (p, unsafe { p.add(a_len) })
+            }
+            None => {
+                mapped.extend([aval, diag]);
+                (map(aval)? as *mut T, map(diag)? as *mut T)
+            }
+        };
+        let (rhs_ptr, solution_ptr) = match stage_b {
+            Some(stage_b) => {
+                mapped.push(stage_b);
+                let p = map(stage_b)? as *mut T;
+                (p, p as *const T)
+            }
+            None => {
+                mapped.extend([bvec, out]);
+                (map(bvec)? as *mut T, map(out)? as *const T)
+            }
+        };
 
         let mut inv = vec![0usize; n];
         for (new, &old) in plan.perm.iter().enumerate() {
@@ -240,17 +368,28 @@ impl<T: Real> VulkanCholesky<T> {
             factor_len,
             diag_src,
             lval,
-            stage_a,
-            stage_a_ptr,
+            values_ptr,
+            diag_ptr,
+            rhs_ptr,
+            solution_ptr,
             stage_status,
             stage_status_ptr,
-            stage_b,
-            stage_b_ptr,
-            buffers: vec![items, fronts, bounds, smap, rmap, dst, pat, perm, aval, status, diag, dinv, x, xinv, ytmp, bvec, out],
+            mapped,
+            buffers: [items, fronts, bounds, smap, rmap, dst, pat, perm, sign, aval, status, diag, x, ytmp].into_iter().chain(stage_a).chain(stage_b).collect(),
+            bvec,
+            out,
+            solve_segments: plan.solve,
+            tau,
             pipes,
             module,
             factor_cmd,
             solve_cmd,
+            inverse_cmd,
+            shapes: plan.shapes,
+            dinv,
+            load_target,
+            xinv,
+            xinv_len: plan.xinv_len,
             stats,
             last_factor_ms: 0.0,
             last_solve_ms: 0.0,
@@ -260,6 +399,65 @@ impl<T: Real> VulkanCholesky<T> {
 
     pub fn stats(&self) -> Stats {
         self.stats
+    }
+
+    /// Takes a factor made elsewhere, in the analysis's layout (`faer`'s, or
+    /// [`crate::sme::SmeCholesky`]'s), for this device's solves: writes it in `T`, inverts its
+    /// 32-wide diagonal tiles on the host (what this device's own factorization leaves behind),
+    /// and runs only the diagonal-block inversions here. Returns their device time (ms).
+    pub fn load_factor<S: crate::cholesky::Real>(&mut self, factor: &[S]) -> Result<f64, Error> {
+        use rayon::prelude::*;
+        assert_eq!(factor.len(), self.factor_len);
+        let target = self.load_target()?;
+        let (lval, dinv) = (Out(target.lval), Out(target.dinv));
+        convert(factor, target.lval);
+        self.shapes.par_iter().for_each(|&[offset, f, k, begin]| invert_tiles(factor, offset, f, k, begin, lval, dinv));
+        self.upload_loaded(&target, false)?;
+        self.run(&self.inverse_cmd)
+    }
+
+    /// As [`Self::load_factor`], with the diagonal-block inverses made elsewhere too
+    /// ([`crate::sme::SmeCholesky::with_inverses`]): `L₁₁⁻¹` of each supernode, lower, `k × k`
+    /// column-major, one after another. Nothing then runs on the device: its solves read only
+    /// the factor and these.
+    pub fn load_factor_and_inverse<S: crate::cholesky::Real>(&mut self, factor: &[S], inverse: &[S]) -> Result<(), Error> {
+        assert_eq!(factor.len(), self.factor_len);
+        assert_eq!(inverse.len(), self.xinv_len);
+        let target = self.load_target()?;
+        convert(factor, target.lval);
+        convert(inverse, target.xinv);
+        self.upload_loaded(&target, true)
+    }
+
+    /// Where loaded values are written: the kernels' buffers, mapped, on a unified-memory
+    /// device; else a staging buffer, made on first use.
+    fn load_target(&mut self) -> Result<LoadTarget<T>, Error> {
+        if let Some(t) = self.load_target {
+            return Ok(t);
+        }
+        let real = size_of::<T>();
+        let stage = self.ctx.host_buffer(((self.factor_len + self.n + self.xinv_len) * real) as u64)?;
+        let p = unsafe { self.ctx.dev.map_memory(stage.mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()).map_err(device_error)? } as *mut T;
+        let target = unsafe { LoadTarget { lval: p, dinv: p.add(self.factor_len), xinv: p.add(self.factor_len + self.n), stage: Some(stage) } };
+        self.load_target = Some(target);
+        Ok(target)
+    }
+
+    /// Copies a staged load to the kernels' buffers: the factor and pivots, or the factor and
+    /// inverses.
+    fn upload_loaded(&self, target: &LoadTarget<T>, inverse: bool) -> Result<(), Error> {
+        let Some(stage) = target.stage else { return Ok(()) };
+        let real = size_of::<T>() as u64;
+        let (lval_bytes, dinv_bytes, xinv_bytes) = (self.factor_len as u64 * real, self.n as u64 * real, self.xinv_len as u64 * real);
+        self.ctx.one_shot(|cmd| unsafe {
+            let d = &self.ctx.dev;
+            d.cmd_copy_buffer(cmd, stage.buf, self.lval.buf, &[vk::BufferCopy::default().size(lval_bytes)]);
+            if inverse {
+                d.cmd_copy_buffer(cmd, stage.buf, self.xinv.buf, &[vk::BufferCopy::default().src_offset(lval_bytes + dinv_bytes).size(xinv_bytes)]);
+            } else {
+                d.cmd_copy_buffer(cmd, stage.buf, self.dinv.buf, &[vk::BufferCopy::default().src_offset(lval_bytes).size(dinv_bytes)]);
+            }
+        })
     }
 
     /// Device time of the last factorization (ms), from timestamps around its command buffer.
@@ -277,11 +475,9 @@ impl<T: Real> VulkanCholesky<T> {
     pub fn factorize(&mut self, values: &[f64]) -> Result<Info, Error> {
         assert_eq!(values.len(), self.a_len);
         unsafe {
-            let stage = std::slice::from_raw_parts_mut(self.stage_a_ptr, self.a_len + self.n);
-            let (a, diag) = stage.split_at_mut(self.a_len);
-            for (s, &v) in a.iter_mut().zip(values) {
-                *s = T::from_f64(v);
-            }
+            let a = std::slice::from_raw_parts_mut(self.values_ptr, self.a_len);
+            let diag = std::slice::from_raw_parts_mut(self.diag_ptr, self.n);
+            a.par_iter_mut().zip(values).with_min_len(1 << 14).for_each(|(s, &v)| *s = T::from_f64(v));
             diag.fill(T::from_f64(0.0));
             for &(p, j) in &self.diag_src {
                 diag[j] = T::from_f64(values[p]);
@@ -294,22 +490,20 @@ impl<T: Real> VulkanCholesky<T> {
     /// `rhs ← A⁻¹ rhs` with the last factorization.
     pub fn solve_in_place(&mut self, rhs: &mut [f64]) -> Result<(), Error> {
         assert_eq!(rhs.len(), self.n);
-        let stage = unsafe { std::slice::from_raw_parts_mut(self.stage_b_ptr, self.n) };
-        for (s, &v) in stage.iter_mut().zip(rhs.iter()) {
+        let input = unsafe { std::slice::from_raw_parts_mut(self.rhs_ptr, self.n) };
+        for (s, &v) in input.iter_mut().zip(rhs.iter()) {
             *s = T::from_f64(v);
         }
         self.last_solve_ms = self.run(&self.solve_cmd)?;
-        for (r, s) in rhs.iter_mut().zip(stage.iter()) {
+        let solution = unsafe { std::slice::from_raw_parts(self.solution_ptr, self.n) };
+        for (r, s) in rhs.iter_mut().zip(solution) {
             *r = s.to_f64();
         }
         Ok(())
     }
 
     /// The factor in the analysis's (`faer`'s supernodal) layout.
-    pub fn factor(&self) -> Result<Vec<T>, Error>
-    where
-        T: Default,
-    {
+    pub fn factor(&self) -> Result<Vec<T>, Error> {
         self.ctx.download(self.lval, self.factor_len)
     }
 
@@ -369,6 +563,19 @@ impl<T: Real> VulkanCholesky<T> {
         Ok(ts)
     }
 
+    /// The solve's input and output buffers (`n` values of `T` each, in the matrix's order), for
+    /// recording [`Self::record_solve`] into another command buffer.
+    pub(super) fn solve_buffers(&self) -> (Buf, Buf) {
+        (self.bvec, self.out)
+    }
+
+    /// Records `out ← A⁻¹ bvec` with the last factorization into `cmd`, each dispatch followed by
+    /// a compute barrier.
+    pub(super) fn record_solve(&self, cmd: vk::CommandBuffer) {
+        let mut off = Stamper { d: &self.ctx.dev, queries: vk::QueryPool::null(), on: false, stamps: Vec::new() };
+        unsafe { solve_body(&self.ctx.dev, cmd, &self.pipes, &self.solve_segments, self.n, self.tau, &mut off) };
+    }
+
     fn run(&self, r: &Recording) -> Result<f64, Error> {
         self.ctx.submit_wait(r.cmd)?;
         let ts = self.timestamps(r)?;
@@ -376,15 +583,16 @@ impl<T: Real> VulkanCholesky<T> {
     }
 }
 
-impl<T: Real> Drop for VulkanCholesky<T> {
+impl<T: DeviceReal> Drop for VulkanCholesky<T> {
     fn drop(&mut self) {
         let ctx = &self.ctx;
+        let _queue = ctx.lock();
         unsafe {
             let _ = ctx.dev.device_wait_idle();
-            for b in [self.stage_a, self.stage_status, self.stage_b] {
+            for b in &self.mapped {
                 ctx.dev.unmap_memory(b.mem);
             }
-            for r in [&self.factor_cmd, &self.solve_cmd] {
+            for r in [&self.factor_cmd, &self.solve_cmd, &self.inverse_cmd] {
                 ctx.dev.free_command_buffers(ctx.cpool, &[r.cmd]);
                 ctx.dev.destroy_query_pool(r.queries, None);
             }
@@ -393,16 +601,76 @@ impl<T: Real> Drop for VulkanCholesky<T> {
             }
             ctx.dev.destroy_shader_module(self.module, None);
         }
-        for &b in self.buffers.iter().chain([&self.lval, &self.stage_a, &self.stage_status, &self.stage_b]) {
+        let load_stage = self.load_target.and_then(|t| t.stage);
+        if let Some(stage) = load_stage {
+            unsafe { ctx.dev.unmap_memory(stage.mem) };
+        }
+        for &b in self.buffers.iter().chain([&self.lval, &self.dinv, &self.xinv, &self.stage_status, &self.bvec, &self.out]).chain(load_stage.as_ref()) {
             ctx.free(b);
         }
     }
 }
 
 /// Records `body` with timestamps around it, and room for `dispatches` more when profiling.
-fn record(ctx: &Context, profile: bool, dispatches: usize, body: impl FnOnce(vk::CommandBuffer, &mut Stamper)) -> Result<Recording, Error> {
+/// Where [`VulkanCholesky::load_factor`] and its sibling write.
+#[derive(Clone, Copy)]
+struct LoadTarget<T> {
+    lval: *mut T,
+    dinv: *mut T,
+    xinv: *mut T,
+    stage: Option<Buf>,
+}
+
+/// `out[..src.len()] = src`, converted to `T`, in parallel.
+fn convert<S: crate::cholesky::Real, T: DeviceReal>(src: &[S], out: *mut T) {
+    use rayon::prelude::*;
+    unsafe { std::slice::from_raw_parts_mut(out, src.len()) }
+        .par_iter_mut()
+        .zip(src)
+        .with_min_len(1 << 16)
+        .for_each(|(t, s)| *t = T::from_f64(s.to_f64()));
+}
+
+/// A host pointer the tile inversions write through: each supernode's tiles and pivots are its
+/// own, so supernodes go in parallel.
+#[derive(Clone, Copy)]
+struct Out<T>(*mut T);
+
+unsafe impl<T> Send for Out<T> {}
+unsafe impl<T> Sync for Out<T> {}
+
+/// The 32-wide diagonal tiles of one supernode's block in `factor` (`f` rows, `k` columns, at
+/// `offset`): each tile's inverse, transposed, into the tile's upper triangle of `lval`, and its
+/// inverted pivots into `dinv` (at the supernode's first column `begin`), as `chol_step` leaves
+/// them for `chol_inv_diag`.
+#[allow(clippy::needless_range_loop, reason = "triangular index arithmetic reads clearer as indices")]
+fn invert_tiles<S: crate::cholesky::Real, T: DeviceReal>(factor: &[S], offset: usize, f: usize, k: usize, begin: usize, lval: Out<T>, dinv: Out<T>) {
+    let mut inv = [[0.0f64; TILE]; TILE];
+    for c0 in (0..k).step_by(TILE) {
+        let b = (k - c0).min(TILE);
+        let l = |i: usize, j: usize| factor[offset + (c0 + j) * f + c0 + i].to_f64();
+        for t in 0..b {
+            inv[t][t] = 1.0 / l(t, t);
+            for i in t + 1..b {
+                let s: f64 = (t..i).map(|p| l(i, p) * inv[p][t]).sum();
+                inv[i][t] = -s / l(i, i);
+            }
+        }
+        unsafe {
+            for c in 0..b {
+                *dinv.0.add(begin + c0 + c) = T::from_f64(inv[c][c]);
+                for r in 0..c {
+                    *lval.0.add(offset + (c0 + c) * f + c0 + r) = T::from_f64(inv[c][r]);
+                }
+            }
+        }
+    }
+}
+
+pub(super) fn record(ctx: &Context, profile: bool, dispatches: usize, body: impl FnOnce(vk::CommandBuffer, &mut Stamper)) -> Result<Recording, Error> {
     let d = &ctx.dev;
     let count = 2 + if profile { dispatches as u32 } else { 0 };
+    let _pool = ctx.lock();
     unsafe {
         let cmd = d
             .allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(ctx.cpool).command_buffer_count(1))
@@ -421,7 +689,25 @@ fn record(ctx: &Context, profile: bool, dispatches: usize, body: impl FnOnce(vk:
     }
 }
 
-unsafe fn barrier(
+/// The solve's dispatches: gather into the permuted order, the levels' forward and backward
+/// steps, scatter back.
+unsafe fn solve_body(d: &ash::Device, cmd: vk::CommandBuffer, pipes: &[Pipe], segments: &[Segment], n: usize, tau: f32, st: &mut Stamper) {
+    unsafe {
+        dispatch(d, cmd, &pipes[Kernel::SolveGather as usize], [0, n as u32], n.div_ceil(256), tau);
+        compute_barrier(d, cmd);
+        st.stamp(cmd, Kernel::SolveGather, 0);
+        for seg in segments {
+            dispatch(d, cmd, &pipes[seg.kernel as usize], [seg.first, seg.count], seg.count as usize, tau);
+            compute_barrier(d, cmd);
+            st.stamp(cmd, seg.kernel, seg.level);
+        }
+        dispatch(d, cmd, &pipes[Kernel::SolveScatter as usize], [0, n as u32], n.div_ceil(256), tau);
+        compute_barrier(d, cmd);
+        st.stamp(cmd, Kernel::SolveScatter, 0);
+    }
+}
+
+pub(super) unsafe fn barrier(
     d: &ash::Device,
     cmd: vk::CommandBuffer,
     src: vk::PipelineStageFlags,
@@ -433,7 +719,7 @@ unsafe fn barrier(
     unsafe { d.cmd_pipeline_barrier(cmd, src, dst, vk::DependencyFlags::empty(), &b, &[], &[]) };
 }
 
-unsafe fn compute_barrier(d: &ash::Device, cmd: vk::CommandBuffer) {
+pub(super) unsafe fn compute_barrier(d: &ash::Device, cmd: vk::CommandBuffer) {
     unsafe {
         barrier(
             d,
@@ -448,7 +734,7 @@ unsafe fn compute_barrier(d: &ash::Device, cmd: vk::CommandBuffer) {
 
 /// `groups` workgroups as a `stride × ⌈groups / stride⌉` grid, with the item range `[first,
 /// count]` and the pivot threshold as push constants.
-unsafe fn dispatch(d: &ash::Device, cmd: vk::CommandBuffer, pipe: &Pipe, [first, count]: [u32; 2], groups: usize, tau: f32) {
+pub(super) unsafe fn dispatch(d: &ash::Device, cmd: vk::CommandBuffer, pipe: &Pipe, [first, count]: [u32; 2], groups: usize, tau: f32) {
     let stride = groups.clamp(1, GRID);
     let prm = [first, count, stride as u32, tau.to_bits()];
     unsafe {
@@ -472,6 +758,10 @@ struct Plan {
     /// barrier separates stages.
     factor: Vec<Vec<Segment>>,
     solve: Vec<Segment>,
+    /// The diagonal-block inversions alone, every level's `i`th dispatch in stage `i` (levels
+    /// read and write disjoint blocks).
+    inverse: Vec<Vec<Segment>>,
+    shapes: Vec<[usize; 4]>,
     xinv_len: usize,
     stats: Stats,
 }
@@ -487,7 +777,7 @@ fn segment(items: &mut Vec<u32>, out: &mut Vec<Segment>, kernel: Kernel, level: 
 }
 
 impl Plan {
-    fn new(analysis: &Analysis) -> Result<Self, Error> {
+    fn new(analysis: &Analysis, schur_tile: SchurTile, signed: bool) -> Result<Self, Error> {
         let sn = analysis.supernodal();
         let n = analysis.dim();
         let ns = sn.n_supernodes();
@@ -511,7 +801,6 @@ impl Plan {
         let mut panels = vec![0usize; ns];
         let mut tiles = vec![0usize; ns];
         let mut parent = vec![usize::MAX; ns];
-        let mut level = vec![0usize; ns];
         let mut largest_front = 0;
         let mut xinv_len = 0usize;
         let (mut flops, mut schur_flops) = (0.0, 0.0);
@@ -526,6 +815,9 @@ impl Plan {
             bounds.extend((k..f).step_by(TILE).map(|b| b as u32));
             bounds.push(f as u32);
             tiles[s] = bounds.len() - b0 - 1;
+            if schur_tile == SchurTile::T64 && tiles[s] > u16::MAX as usize {
+                return Err(Error::Device("a supernode of more than 65535 tiles for 64-wide Schur blocks".into()));
+            }
             let p0 = pat.len();
             pat.extend(pattern.iter().map(|&r| r as u32));
             // The update's columns fall into runs of one ancestor each; a run starting at pattern
@@ -550,11 +842,7 @@ impl Plan {
             flops += 2.0 * kf * kf * kf / 3.0 + kf * kf * mf + kf * mf * mf;
             schur_flops += kf * mf * mf;
         }
-        for s in 0..ns {
-            if parent[s] != usize::MAX {
-                level[parent[s]] = level[parent[s]].max(level[s] + 1);
-            }
-        }
+        let level = analysis.levels().0;
         let levels = level.iter().max().map_or(0, |l| l + 1);
         let mut at_level: Vec<Vec<usize>> = vec![Vec::new(); levels];
         for s in 0..ns {
@@ -600,9 +888,22 @@ impl Plan {
             }
             segment(&mut items, &mut factor, Kernel::Schur, level, |it| {
                 for &s in group {
-                    for j in panels[s]..tiles[s] {
-                        for i in j..tiles[s] {
-                            it.extend([s as u32, i as u32, j as u32, 0]);
+                    match schur_tile {
+                        SchurTile::T32 => {
+                            for j in panels[s]..tiles[s] {
+                                for i in j..tiles[s] {
+                                    it.extend([s as u32, i as u32, j as u32, 0]);
+                                }
+                            }
+                        }
+                        // Pairs of 32-wide tiles, the last tile of each block packed with the first.
+                        SchurTile::T64 => {
+                            for j in (panels[s]..tiles[s]).step_by(2) {
+                                for i in (j..tiles[s]).step_by(2) {
+                                    let (ie, je) = ((i + 2).min(tiles[s]), (j + 2).min(tiles[s]));
+                                    it.extend([s as u32, i as u32, j as u32, ((ie as u32) << 16) | je as u32]);
+                                }
+                            }
                         }
                     }
                 }
@@ -644,6 +945,15 @@ impl Plan {
         // A level's inversion only reads its own finished blocks and the next level's panel work
         // touches neither them nor `xinv`, so the two share stages (no barrier between them): the
         // inversion fills the GPU while the panel steps wait on their critical path.
+        let mut inverse: Vec<Vec<Segment>> = Vec::new();
+        for level in &inverse_work {
+            for (i, &seg) in level.iter().enumerate() {
+                if inverse.len() <= i {
+                    inverse.push(Vec::new());
+                }
+                inverse[i].push(seg);
+            }
+        }
         let mut factor: Vec<Vec<Segment>> = Vec::new();
         let mut pending: std::collections::VecDeque<Segment> = std::collections::VecDeque::new();
         for (panels_l, inverse_l) in panel_work.into_iter().zip(inverse_work) {
@@ -678,7 +988,7 @@ impl Plan {
         }
         for (level, group) in at_level.iter().enumerate().rev() {
             segment(&mut items, &mut solve, Kernel::BackwardPattern, level, |it| {
-                for &s in group.iter().filter(|&&s| rows(s) > 0) {
+                for &s in group.iter().filter(|&&s| signed || rows(s) > 0) {
                     for chunk in 0..cols(s).div_ceil(8) {
                         it.extend([s as u32, chunk as u32, 0, 0]);
                     }
@@ -725,6 +1035,7 @@ impl Plan {
             schur_flops,
             ..Default::default()
         };
-        Ok(Self { fronts, bounds, smap, rmap, pat, perm, items, dst, factor, solve, xinv_len, stats })
+        let shapes = (0..ns).map(|s| [cpv[s], cols(s) + rows(s), cols(s), begin[s]]).collect();
+        Ok(Self { fronts, bounds, smap, rmap, pat, perm, items, dst, factor, solve, inverse, shapes, xinv_len, stats })
     }
 }

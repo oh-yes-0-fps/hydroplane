@@ -25,6 +25,8 @@ pub const MAX_LANES: usize = 32;
 pub const MAX_UNROLL: usize = 16;
 
 pub mod backend;
+#[doc(hidden)]
+pub mod isa;
 pub mod arch;
 pub mod dispatch;
 // The runtime unroll cache; gone when `build.rs` resolved the factor at compile time.
@@ -45,7 +47,7 @@ pub mod soa;
 #[cfg(feature = "glam")]
 pub mod glam_ext;
 
-pub use backend::{Backend, BackendAll, ScalarBackend};
+pub use backend::{Backend, BackendAll, Enter, ScalarBackend};
 pub use dispatch::{Kernel, SimdDispatch, dispatch, run_scalar};
 
 /// The on-device entry point (rust-gpu / SPIR-V target): mirrors [`dispatch`], but branches on
@@ -92,9 +94,14 @@ pub mod towers {
     pub use crate::ScalarBackend;
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     pub use crate::backend::{
-        avx1::Avx1, avx2::Avx2, avx512::Avx512, avx512bf16::Avx512Bf16, avx512fp16::Avx512Fp16,
-        sse4::Sse4,
+        avx2::Avx2, avx512::Avx512, avx512bf16::Avx512Bf16, avx512fp16::Avx512Fp16, sse4::Sse4,
     };
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "avx1"))]
+    pub use crate::backend::avx1::Avx1;
+    /// Without the `avx1` feature the AVX tier is never selected; its arm in a `#[kernel]` match
+    /// reuses the SSE4 instantiation rather than compiling another copy of the kernel.
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), not(feature = "avx1")))]
+    pub use crate::backend::sse4::Sse4 as Avx1;
     #[cfg(target_arch = "aarch64")]
     pub use crate::backend::neon::Neon;
     #[cfg(target_arch = "aarch64")]

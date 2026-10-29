@@ -33,6 +33,9 @@ fn report(name: &str, analysis: &Analysis, seconds: f64) {
         col_super[begin[s]..end[s]].fill(s);
     }
     let mut level = vec![0usize; ns];
+    // Longest chain of panel steps from a leaf through supernode s (its own included): what a
+    // schedule that starts each supernode as soon as its children finish would take.
+    let mut chain = vec![0usize; ns];
     let mut flops = 0.0;
     let mut largest = 0;
     for s in 0..ns {
@@ -40,12 +43,27 @@ fn report(name: &str, analysis: &Analysis, seconds: f64) {
         largest = largest.max(k);
         let (kf, mf) = (k as f64, m as f64);
         flops += kf * kf * kf / 3.0 + kf * kf * mf + kf * mf * mf;
+        chain[s] += (end[s] - begin[s]).div_ceil(32);
         if let Some(&first) = sn.supernode(s).pattern().first() {
             let p = col_super[first];
             level[p] = level[p].max(level[s] + 1);
+            chain[p] = chain[p].max(chain[s]);
         }
     }
     let levels = level.iter().max().map_or(0, |l| l + 1);
+    // As late as possible instead: one level below the parent (the root at the top level).
+    let mut late = vec![0usize; ns];
+    for s in (0..ns).rev() {
+        late[s] = match sn.supernode(s).pattern().first() {
+            Some(&first) => late[col_super[first]] - 1,
+            None => levels - 1,
+        };
+    }
+    let mut widest_late = vec![0usize; levels];
+    for s in 0..ns {
+        widest_late[late[s]] = widest_late[late[s]].max((end[s] - begin[s]).div_ceil(32));
+    }
+    let steps_late: usize = widest_late.iter().sum();
     if std::env::var_os("DETAIL").is_some() {
         for lv in 0..levels {
             let (mut count, mut cols, mut widest_k, mut gf) = (0, 0, 0, 0.0);
@@ -63,17 +81,20 @@ fn report(name: &str, analysis: &Analysis, seconds: f64) {
     for s in 0..ns {
         widest[level[s]] = widest[level[s]].max((end[s] - begin[s]).div_ceil(32));
     }
-    let steps = widest.iter().sum::<usize>();
+    let steps = analysis.levels().1;
     // Fitted on the RTX 5090 (f64) over four orderings of the slab tangent: a 32-column panel
     // step on the critical path costs about as much as 0.15 GFLOP.
     let estimate = 0.073 * steps as f64 + 0.48 * flops * 1e-9;
     println!(
-        "{name:<28} factor {:>6.2}M  {:>5.1} GFLOP  supernodes {:>5}  levels {:>2}  panel steps {:>4}  largest {:>5}  est {:>5.1} ms  ({:.2} s)",
+        "{name:<28} factor {:>6.2}M  {:>5.1} GFLOP  supernodes {:>5}  levels {:>2}  panel steps {:>4} (early {:>4}, late {:>4}, chain {:>4})  largest {:>5}  est {:>5.1} ms  ({:.2} s)",
         analysis.factor_len() as f64 * 1e-6,
         flops * 1e-9,
         ns,
         levels,
         steps,
+        widest.iter().sum::<usize>(),
+        steps_late,
+        chain.iter().max().copied().unwrap_or(0),
         largest,
         estimate,
         seconds
@@ -88,7 +109,7 @@ fn main() {
     println!("matrix: {n} rows, {} lower nonzeros", row_idx.len());
     let run = |name: &str, ordering: Ordering| {
         let t = Instant::now();
-        let analysis = Analysis::new(&col_ptr, &row_idx, ordering).expect("analysis");
+        let analysis = Analysis::with_ordering(&col_ptr, &row_idx, ordering).expect("analysis");
         report(name, &analysis, t.elapsed().as_secs_f64());
     };
     run("nested dissection", Ordering::NestedDissection { block });
@@ -98,10 +119,16 @@ fn main() {
         let t = Instant::now();
         let nodes = order::nested_dissection_with(&row_ptr, &col, &p);
         let perm: Vec<usize> = nodes.iter().flat_map(|&v| (0..block).map(move |c| block * v as usize + c)).collect();
-        let analysis = Analysis::new(&col_ptr, &row_idx, Ordering::Custom(perm)).expect("analysis");
+        let analysis = Analysis::with_ordering(&col_ptr, &row_idx, Ordering::Custom(perm)).expect("analysis");
         report(&format!("ND {spec}"), &analysis, t.elapsed().as_secs_f64());
     }
     run("AMD (faer)", Ordering::Amd);
+    if let Some(c) = std::env::var("CANDIDATES").ok().and_then(|c| c.parse::<usize>().ok()) {
+        let t = Instant::now();
+        let gpu_cost = |a: &Analysis| 0.073 * a.levels().1 as f64 + 0.48 * a.flops() * 1e-9;
+        let analysis = Analysis::best_of(&col_ptr, &row_idx, block, c, gpu_cost).expect("analysis");
+        report(&format!("ND best of {c}"), &analysis, t.elapsed().as_secs_f64());
+    }
     for path in args.iter().skip(3) {
         let bytes = std::fs::read(path).expect("reading a permutation");
         let nodes: Vec<usize> = bytes.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap()) as usize).collect();

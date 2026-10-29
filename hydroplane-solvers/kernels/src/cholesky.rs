@@ -22,10 +22,7 @@
 use spirv_std::glam::UVec3;
 use spirv_std::spirv;
 
-#[cfg(target_arch = "spirv")]
-use spirv_std::num_traits::Float;
-
-use crate::{Real, Shared, barrier, ld, st};
+use crate::{Real, Scalar, Shared, barrier, ld, st};
 
 pub const TILE: usize = 32;
 
@@ -56,6 +53,18 @@ pub struct Range {
     pub tau: u32,
 }
 
+/// `−v` if column `c` is signed negative under a signed factorization, else `v`.
+///
+/// The `_signed` entry points factor `A = L S Lᵀ`, `S = diag(±1)` given per column in `sign`
+/// (non-zero: −1): a quasi-definite matrix in an order whose pivot signs are known (a saddle point
+/// in the KKT ordering). Every product `L Lᵀ` over a block's columns becomes `L S Lᵀ`, and the
+/// pivots' roots are of their magnitudes. The plain ones are the same code with `SIGNED` false,
+/// which never reads `sign`.
+#[inline(always)]
+fn flip<const SIGNED: bool>(v: Real, sign: &[u32], c: usize) -> Real {
+    if SIGNED && ld(sign, c) != 0 { -v } else { v }
+}
+
 fn item(wid: UVec3, r: &Range) -> (bool, usize) {
     let g = wid.y * r.stride + wid.x;
     (g < r.count, (r.first + g) as usize * 4)
@@ -70,21 +79,6 @@ fn tile(fronts: &[u32], bounds: &[u32], s: usize, t: usize) -> (usize, usize) {
     let b = word(fronts, s, BOUNDS);
     let lo = ld(bounds, b + t) as usize;
     (lo, ld(bounds, b + t + 1) as usize - lo)
-}
-
-/// `v[i] −= d`, atomically.
-fn atomic_sub(v: &mut [Real], i: usize, d: Real) {
-    #[cfg(target_arch = "spirv")]
-    unsafe {
-        spirv_std::arch::atomic_f_add::<Real, { spirv_std::memory::Scope::Device as u32 }, 0>(
-            spirv_std::arch::IndexUnchecked::index_unchecked_mut(v, i),
-            -d,
-        );
-    }
-    #[cfg(not(target_arch = "spirv"))]
-    {
-        v[i] -= d;
-    }
 }
 
 /// `lval[dst[g]] = aval[g]`: the matrix's lower triangle into the supernode blocks.
@@ -123,11 +117,58 @@ pub fn chol_step(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] status: &mut [u32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] diag: &[Real],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] dinv: &mut [Real],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 7)] sign: &[u32],
     #[spirv(workgroup)] ta: &mut Shared<1024>,
     #[spirv(workgroup)] tb: &mut Shared<1024>,
     #[spirv(workgroup)] root: &mut Shared<32>,
     #[spirv(workgroup)] rd: &mut Shared<32>,
     #[spirv(workgroup)] floor: &mut Shared<32>,
+    #[spirv(workgroup)] negative: &mut Shared<32, u32>,
+) {
+    step::<false>(wid, lid, prm, items, fronts, bounds, lval, status, diag, dinv, sign, ta, tb, root, rd, floor, negative);
+}
+
+#[spirv(compute(threads(256)))]
+pub fn chol_step_signed(
+    #[spirv(workgroup_id)] wid: UVec3,
+    #[spirv(local_invocation_id)] lid: UVec3,
+    #[spirv(push_constant)] prm: &Range,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] items: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] fronts: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] bounds: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] lval: &mut [Real],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] status: &mut [u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] diag: &[Real],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] dinv: &mut [Real],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 7)] sign: &[u32],
+    #[spirv(workgroup)] ta: &mut Shared<1024>,
+    #[spirv(workgroup)] tb: &mut Shared<1024>,
+    #[spirv(workgroup)] root: &mut Shared<32>,
+    #[spirv(workgroup)] rd: &mut Shared<32>,
+    #[spirv(workgroup)] floor: &mut Shared<32>,
+    #[spirv(workgroup)] negative: &mut Shared<32, u32>,
+) {
+    step::<true>(wid, lid, prm, items, fronts, bounds, lval, status, diag, dinv, sign, ta, tb, root, rd, floor, negative);
+}
+
+fn step<const SIGNED: bool>(
+    wid: UVec3,
+    lid: UVec3,
+    prm: &Range,
+    items: &[u32],
+    fronts: &[u32],
+    bounds: &[u32],
+    lval: &mut [Real],
+    status: &mut [u32],
+    diag: &[Real],
+    dinv: &mut [Real],
+    sign: &[u32],
+    ta: &mut Shared<1024>,
+    tb: &mut Shared<1024>,
+    root: &mut Shared<32>,
+    rd: &mut Shared<32>,
+    floor: &mut Shared<32>,
+    negative: &mut Shared<32, u32>,
 ) {
     let (ok, base) = item(wid, prm);
     if !ok {
@@ -138,20 +179,21 @@ pub fn chol_step(
     let j = ld(items, base + 2);
     let t = lid.x as usize;
     if j == POTRF {
-        potrf(fronts, bounds, lval, status, diag, dinv, ta, tb, root, rd, floor, prm.tau, s, i, t);
+        potrf::<SIGNED>(fronts, bounds, lval, status, diag, dinv, sign, ta, tb, root, rd, floor, negative, prm.tau, s, i, t);
     } else {
-        update(fronts, bounds, lval, ta, tb, s, i, j as usize, ld(items, base + 3) as usize, t);
+        update::<SIGNED>(fronts, bounds, lval, sign, ta, tb, s, i, j as usize, ld(items, base + 3) as usize, t);
     }
 }
 
-fn update(fronts: &[u32], bounds: &[u32], lval: &mut [Real], ta: &mut Shared<1024>, tb: &mut Shared<1024>, s: usize, i: usize, j: usize, kb: usize, t: usize) {
+fn update<const SIGNED: bool>(fronts: &[u32], bounds: &[u32], lval: &mut [Real], sign: &[u32], ta: &mut Shared<1024>, tb: &mut Shared<1024>, s: usize, i: usize, j: usize, kb: usize, t: usize) {
     let f = word(fronts, s, ORDER);
     let l = word(fronts, s, L_OFF);
+    let col = word(fronts, s, BEGIN);
     let (c0, b) = tile(fronts, bounds, s, kb);
     let (r0, rb) = tile(fronts, bounds, s, i);
     let (q0, qb) = tile(fronts, bounds, s, j);
     each_entry!(t, rb, b, |r, c| {
-            ta[c * TILE + r] = ld(lval, l + (c0 + c) * f + r0 + r);
+            ta[c * TILE + r] = flip::<SIGNED>(ld(lval, l + (c0 + c) * f + r0 + r), sign, col + c0 + c);
     });
     each_entry!(t, qb, b, |r, c| {
             tb[c * TILE + r] = ld(lval, l + (c0 + c) * f + q0 + r);
@@ -161,7 +203,7 @@ fn update(fronts: &[u32], bounds: &[u32], lval: &mut [Real], ta: &mut Shared<102
     let mut c = t / TILE;
     while c < TILE {
         if r < rb && c < qb && (i != j || r >= c) {
-            let mut acc: Real = 0.0;
+            let mut acc: Real = Real::ZERO;
             let mut p = 0;
             while p < b {
                 acc = ta[p * TILE + r].mul_add(tb[p * TILE + c], acc);
@@ -179,19 +221,23 @@ fn update(fronts: &[u32], bounds: &[u32], lval: &mut [Real], ta: &mut Shared<102
 /// `L_pp⁻¹`, transposed, into the tile's unused upper triangle, so `chol_trsm` is a
 /// multiplication. A pivot below `τ |A_jj|` (`diag` is the permuted matrix's diagonal), or not a
 /// number, is replaced by `τ |A_jj|` and sets `status[0]`: static pivoting, so a matrix at the
-/// edge of the working precision still yields a usable (perturbed) factor.
-fn potrf(
+/// edge of the working precision still yields a usable (perturbed) factor. When `SIGNED`, the
+/// pivot's sign is the column's, its root that of its magnitude, and a pivot of the wrong sign is
+/// floored the same way.
+fn potrf<const SIGNED: bool>(
     fronts: &[u32],
     bounds: &[u32],
     lval: &mut [Real],
     status: &mut [u32],
     diag: &[Real],
     dinv: &mut [Real],
+    sign: &[u32],
     a: &mut Shared<1024>,
     inv: &mut Shared<1024>,
     root: &mut Shared<32>,
     rd: &mut Shared<32>,
     floor: &mut Shared<32>,
+    negative: &mut Shared<32, u32>,
     tau: u32,
     s: usize,
     p: usize,
@@ -205,7 +251,10 @@ fn potrf(
             a[c * TILE + r] = ld(lval, l + (c0 + c) * f + c0 + r);
     });
     if t < b {
-        floor[t] = f32::from_bits(tau) as Real * ld(diag, col + c0 + t).abs();
+        floor[t] = Real::from_f32(f32::from_bits(tau)) * ld(diag, col + c0 + t).abs();
+        if SIGNED {
+            negative[t] = ld(sign, col + c0 + t);
+        }
     }
     if p > 0 {
         let (k0, kw) = tile(fronts, bounds, s, p - 1);
@@ -215,10 +264,10 @@ fn potrf(
         barrier();
         each_entry!(t, b, b, |r, c| {
                 if r >= c {
-                    let mut acc: Real = 0.0;
+                    let mut acc: Real = Real::ZERO;
                     let mut e = 0;
                     while e < kw {
-                        acc = inv[e * TILE + r].mul_add(inv[e * TILE + c], acc);
+                        acc = flip::<SIGNED>(inv[e * TILE + r], sign, col + k0 + e).mul_add(inv[e * TILE + c], acc);
                         e += 1;
                     }
                     a[c * TILE + r] -= acc;
@@ -228,14 +277,14 @@ fn potrf(
     }
     let mut q = t;
     while q < b * b {
-        inv[q] = 0.0;
+        inv[q] = Real::ZERO;
         q += 256;
     }
     barrier();
     // The invocation that applies the last update to pivot `c + 1` takes its root straight away,
     // so each column costs one barrier; the columns themselves are scaled at the end.
     if t == 0 {
-        pivot(a, root, rd, floor, status, 0);
+        pivot::<SIGNED>(a, root, rd, floor, negative, status, 0);
     }
     barrier();
     let mut c = 0;
@@ -246,13 +295,14 @@ fn potrf(
         let (i, g) = (t % TILE, t / TILE);
         if i > c && i < b {
             let lic = a[c * TILE + i] * rc * rc;
+            let lic = if SIGNED && negative[c] != 0 { -lic } else { lic };
             let mut j = c + 1 + g;
             while j <= i {
                 a[j * TILE + i] = (-lic).mul_add(a[c * TILE + j], a[j * TILE + i]);
                 j += 8;
             }
             if i == c + 1 && g == 0 {
-                pivot(a, root, rd, floor, status, c + 1);
+                pivot::<SIGNED>(a, root, rd, floor, negative, status, c + 1);
             }
         }
         barrier();
@@ -260,7 +310,8 @@ fn potrf(
     }
     each_entry!(t, b, b, |r, c| {
             if r > c {
-                a[c * TILE + r] *= rd[c];
+                let v = a[c * TILE + r] * rd[c];
+                a[c * TILE + r] = if SIGNED && negative[c] != 0 { -v } else { v };
             } else if r == c {
                 a[c * TILE + c] = root[c];
             }
@@ -273,7 +324,7 @@ fn potrf(
         inv[t * TILE + t] = rd[t];
         let mut i = t + 1;
         while i < b {
-            let (mut s0, mut s1, mut s2, mut s3): (Real, Real, Real, Real) = (0.0, 0.0, 0.0, 0.0);
+            let (mut s0, mut s1, mut s2, mut s3): (Real, Real, Real, Real) = (Real::ZERO, Real::ZERO, Real::ZERO, Real::ZERO);
             let mut e = t;
             while e + 4 <= i {
                 s0 = a[e * TILE + i].mul_add(inv[e * TILE + t], s0);
@@ -301,38 +352,21 @@ fn potrf(
     }
 }
 
-/// Root and inverted root of pivot `c`, floored as `potrf` says.
-fn pivot(a: &Shared<1024>, root: &mut Shared<32>, rd: &mut Shared<32>, floor: &Shared<32>, status: &mut [u32], c: usize) {
+/// Root and inverted root of pivot `c` (of its magnitude, its sign the column's when `SIGNED`),
+/// floored as `potrf` says.
+fn pivot<const SIGNED: bool>(a: &Shared<1024>, root: &mut Shared<32>, rd: &mut Shared<32>, floor: &Shared<32>, negative: &Shared<32, u32>, status: &mut [u32], c: usize) {
     let d = a[c * TILE + c];
+    let d = if SIGNED && negative[c] != 0 { -d } else { d };
     let fl = floor[c];
     let v = if d > fl {
         d
     } else {
         st(status, 0, 1);
-        if fl > 0.0 { fl } else { 1.0 }
+        if fl > Real::ZERO { fl } else { Real::ONE }
     };
-    let y = rsqrt(v);
+    let y = v.rsqrt();
     root[c] = v * y;
     rd[c] = y;
-}
-
-/// `1 / √v`. In `f64`, from the `f32` hardware estimate and two Newton steps (each squares the
-/// relative error: 1e-7 → 1e-14 → below `f64` precision), where `v` is within `f32`'s range;
-/// `f64` square root and division are long software sequences on most GPUs.
-#[cfg(feature = "f64")]
-fn rsqrt(v: Real) -> Real {
-    if v > 1e-30 && v < 1e30 {
-        let mut y = (1.0 / (v as f32).sqrt()) as Real;
-        y = y * (1.5 - 0.5 * v * y * y);
-        y * (1.5 - 0.5 * v * y * y)
-    } else {
-        1.0 / v.sqrt()
-    }
-}
-
-#[cfg(not(feature = "f64"))]
-fn rsqrt(v: Real) -> Real {
-    1.0 / v.sqrt()
 }
 
 /// Tile `(i, kb)` of the panel: `X = B L_kk⁻ᵀ`, from the inverse `chol_step` left in the diagonal
@@ -347,8 +381,42 @@ pub fn chol_trsm(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] bounds: &[u32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] lval: &mut [Real],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] dinv: &[Real],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] sign: &[u32],
     #[spirv(workgroup)] ui: &mut Shared<1024>,
     #[spirv(workgroup)] x: &mut Shared<1024>,
+) {
+    trsm::<false>(wid, lid, prm, items, fronts, bounds, lval, dinv, sign, ui, x);
+}
+
+#[spirv(compute(threads(256)))]
+pub fn chol_trsm_signed(
+    #[spirv(workgroup_id)] wid: UVec3,
+    #[spirv(local_invocation_id)] lid: UVec3,
+    #[spirv(push_constant)] prm: &Range,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] items: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] fronts: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] bounds: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] lval: &mut [Real],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] dinv: &[Real],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] sign: &[u32],
+    #[spirv(workgroup)] ui: &mut Shared<1024>,
+    #[spirv(workgroup)] x: &mut Shared<1024>,
+) {
+    trsm::<true>(wid, lid, prm, items, fronts, bounds, lval, dinv, sign, ui, x);
+}
+
+fn trsm<const SIGNED: bool>(
+    wid: UVec3,
+    lid: UVec3,
+    prm: &Range,
+    items: &[u32],
+    fronts: &[u32],
+    bounds: &[u32],
+    lval: &mut [Real],
+    dinv: &[Real],
+    sign: &[u32],
+    ui: &mut Shared<1024>,
+    x: &mut Shared<1024>,
 ) {
     let (ok, base) = item(wid, prm);
     if !ok {
@@ -370,7 +438,7 @@ pub fn chol_trsm(
             } else if r == c {
                 ld(dinv, col + c0 + c)
             } else {
-                0.0
+                Real::ZERO
             };
     });
     each_entry!(t, rb, b, |r, c| {
@@ -379,7 +447,7 @@ pub fn chol_trsm(
     barrier();
     let r = t % TILE;
     let c = t / TILE;
-    let (mut a0, mut a1, mut a2, mut a3): (Real, Real, Real, Real) = (0.0, 0.0, 0.0, 0.0);
+    let (mut a0, mut a1, mut a2, mut a3): (Real, Real, Real, Real) = (Real::ZERO, Real::ZERO, Real::ZERO, Real::ZERO);
     if r < rb {
         let mut p = 0;
         while p < b {
@@ -394,17 +462,18 @@ pub fn chol_trsm(
     barrier();
     if r < rb {
         let base = l + c0 * f + r0 + r;
+        let at = col + c0 + c;
         if c < b {
-            st(lval, base + c * f, a0);
+            st(lval, base + c * f, flip::<SIGNED>(a0, sign, at));
         }
         if c + 8 < b {
-            st(lval, base + (c + 8) * f, a1);
+            st(lval, base + (c + 8) * f, flip::<SIGNED>(a1, sign, at + 8));
         }
         if c + 16 < b {
-            st(lval, base + (c + 16) * f, a2);
+            st(lval, base + (c + 16) * f, flip::<SIGNED>(a2, sign, at + 16));
         }
         if c + 24 < b {
-            st(lval, base + (c + 24) * f, a3);
+            st(lval, base + (c + 24) * f, flip::<SIGNED>(a3, sign, at + 24));
         }
     }
 }
@@ -422,8 +491,44 @@ pub fn chol_schur(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] smap: &[u32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] rmap: &[u32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] lval: &mut [Real],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] sign: &[u32],
     #[spirv(workgroup)] ta: &mut Shared<1024>,
     #[spirv(workgroup)] tb: &mut Shared<1024>,
+) {
+    schur32::<false>(wid, lid, prm, items, fronts, bounds, smap, rmap, lval, sign, ta, tb);
+}
+
+#[spirv(compute(threads(256)))]
+pub fn chol_schur_signed(
+    #[spirv(workgroup_id)] wid: UVec3,
+    #[spirv(local_invocation_id)] lid: UVec3,
+    #[spirv(push_constant)] prm: &Range,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] items: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] fronts: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] bounds: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] smap: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] rmap: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] lval: &mut [Real],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] sign: &[u32],
+    #[spirv(workgroup)] ta: &mut Shared<1024>,
+    #[spirv(workgroup)] tb: &mut Shared<1024>,
+) {
+    schur32::<true>(wid, lid, prm, items, fronts, bounds, smap, rmap, lval, sign, ta, tb);
+}
+
+fn schur32<const SIGNED: bool>(
+    wid: UVec3,
+    lid: UVec3,
+    prm: &Range,
+    items: &[u32],
+    fronts: &[u32],
+    bounds: &[u32],
+    smap: &[u32],
+    rmap: &[u32],
+    lval: &mut [Real],
+    sign: &[u32],
+    ta: &mut Shared<1024>,
+    tb: &mut Shared<1024>,
 ) {
     let (ok, base) = item(wid, prm);
     if !ok {
@@ -436,17 +541,18 @@ pub fn chol_schur(
     let k = word(fronts, s, COLS);
     let l = word(fronts, s, L_OFF);
     let po = word(fronts, s, PAT);
+    let col = word(fronts, s, BEGIN);
     let (r0, rb) = tile(fronts, bounds, s, i);
     let (q0, qb) = tile(fronts, bounds, s, j);
     let t = lid.x as usize;
     let r = t % TILE;
     let c = t / TILE;
-    let (mut a0, mut a1, mut a2, mut a3): (Real, Real, Real, Real) = (0.0, 0.0, 0.0, 0.0);
+    let (mut a0, mut a1, mut a2, mut a3): (Real, Real, Real, Real) = (Real::ZERO, Real::ZERO, Real::ZERO, Real::ZERO);
     let mut c0 = 0;
     while c0 < k {
         let b = if k - c0 < TILE { k - c0 } else { TILE };
         each_entry!(t, rb, b, |rr, cc| {
-                ta[cc * TILE + rr] = ld(lval, l + (c0 + cc) * f + r0 + rr);
+                ta[cc * TILE + rr] = flip::<SIGNED>(ld(lval, l + (c0 + cc) * f + r0 + rr), sign, col + c0 + cc);
         });
         each_entry!(t, qb, b, |rr, cc| {
                 tb[cc * TILE + rr] = ld(lval, l + (c0 + cc) * f + q0 + rr);
@@ -485,10 +591,125 @@ pub fn chol_schur(
             let target = ld(smap, sm) as usize;
             let row = ld(rmap, (ld(smap, sm + 2).wrapping_add(pi as u32)) as usize) as usize;
             let at = word(fronts, target, L_OFF) + ld(smap, sm + 1) as usize * word(fronts, target, ORDER) + row;
-            atomic_sub(lval, at, acc);
+            Real::atomic_sub(lval, at, acc);
         }
         u += 1;
     }
+}
+
+/// `chol_schur` over a 64 × 64 block of the pattern (rows from tile `i` up to tile `ie`, columns
+/// from `j` up to `je`; item `(s, i, j, ie << 16 | je)`). Each invocation accumulates a 4 × 4 block
+/// of outputs in registers, so a 16-wide slice of the panel costs 8 shared loads per 16
+/// multiply-adds instead of 5 per 4: worth it where the update is throughput-bound (smaller GPUs,
+/// `f32`), not where a quarter as many workgroups balances worse (a large GPU in `f64`).
+#[spirv(compute(threads(256)))]
+pub fn chol_schur64(
+    #[spirv(workgroup_id)] wid: UVec3,
+    #[spirv(local_invocation_id)] lid: UVec3,
+    #[spirv(push_constant)] prm: &Range,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] items: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] fronts: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] bounds: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] smap: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] rmap: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] lval: &mut [Real],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] sign: &[u32],
+    #[spirv(workgroup)] sa: &mut Shared<1024>,
+    #[spirv(workgroup)] sb: &mut Shared<1024>,
+) {
+    schur64::<false>(wid, lid, prm, items, fronts, bounds, smap, rmap, lval, sign, sa, sb);
+}
+
+#[spirv(compute(threads(256)))]
+pub fn chol_schur64_signed(
+    #[spirv(workgroup_id)] wid: UVec3,
+    #[spirv(local_invocation_id)] lid: UVec3,
+    #[spirv(push_constant)] prm: &Range,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] items: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] fronts: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] bounds: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] smap: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] rmap: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] lval: &mut [Real],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] sign: &[u32],
+    #[spirv(workgroup)] sa: &mut Shared<1024>,
+    #[spirv(workgroup)] sb: &mut Shared<1024>,
+) {
+    schur64::<true>(wid, lid, prm, items, fronts, bounds, smap, rmap, lval, sign, sa, sb);
+}
+
+fn schur64<const SIGNED: bool>(
+    wid: UVec3,
+    lid: UVec3,
+    prm: &Range,
+    items: &[u32],
+    fronts: &[u32],
+    bounds: &[u32],
+    smap: &[u32],
+    rmap: &[u32],
+    lval: &mut [Real],
+    sign: &[u32],
+    sa: &mut Shared<1024>,
+    sb: &mut Shared<1024>,
+) {
+    let (ok, base) = item(wid, prm);
+    if !ok {
+        return;
+    }
+    let s = ld(items, base) as usize;
+    let i = ld(items, base + 1) as usize;
+    let j = ld(items, base + 2) as usize;
+    let ends = ld(items, base + 3);
+    let (ie, je) = ((ends >> 16) as usize, (ends & 0xffff) as usize);
+    let f = word(fronts, s, ORDER);
+    let k = word(fronts, s, COLS);
+    let l = word(fronts, s, L_OFF);
+    let po = word(fronts, s, PAT);
+    let bo = word(fronts, s, BOUNDS);
+    let col = word(fronts, s, BEGIN);
+    let r0 = ld(bounds, bo + i) as usize;
+    let rn = ld(bounds, bo + ie) as usize - r0;
+    let q0 = ld(bounds, bo + j) as usize;
+    let qn = ld(bounds, bo + je) as usize - q0;
+    let t = lid.x as usize;
+    let (tr, tc) = (t % 16, t / 16);
+    let mut acc: [Real; 16] = [Real::ZERO; 16];
+    let mut c0 = 0;
+    while c0 < k {
+        let b = if k - c0 < 16 { k - c0 } else { 16 };
+        unroll4!(w, {
+            let q = t + 256 * w;
+            let (rr, e) = (q % 64, q / 64);
+            sa[q] = if rr < rn && e < b { flip::<SIGNED>(ld(lval, l + (c0 + e) * f + r0 + rr), sign, col + c0 + e) } else { Real::ZERO };
+            sb[q] = if rr < qn && e < b { ld(lval, l + (c0 + e) * f + q0 + rr) } else { Real::ZERO };
+        });
+        barrier();
+        let mut e = 0;
+        while e < b {
+            let av: [Real; 4] = [sa[e * 64 + tr], sa[e * 64 + tr + 16], sa[e * 64 + tr + 32], sa[e * 64 + tr + 48]];
+            let bv: [Real; 4] = [sb[e * 64 + tc], sb[e * 64 + tc + 16], sb[e * 64 + tc + 32], sb[e * 64 + tc + 48]];
+            unroll4!(u, {
+                unroll4!(v, {
+                    acc[u * 4 + v] = av[u].mul_add(bv[v], acc[u * 4 + v]);
+                });
+            });
+            e += 1;
+        }
+        barrier();
+        c0 += 16;
+    }
+    unroll4!(u, {
+        unroll4!(v, {
+            let (rr, cc) = (tr + 16 * u, tc + 16 * v);
+            if rr < rn && cc < qn && (i != j || r0 + rr >= q0 + cc) {
+                let sm = 3 * (po + q0 + cc - k);
+                let target = ld(smap, sm) as usize;
+                let row = ld(rmap, (ld(smap, sm + 2).wrapping_add((r0 + rr - k) as u32)) as usize) as usize;
+                let at = word(fronts, target, L_OFF) + ld(smap, sm + 1) as usize * word(fronts, target, ORDER) + row;
+                Real::atomic_sub(lval, at, acc[u * 4 + v]);
+            }
+        });
+    });
 }
 
 /// Diagonal tile `i` of supernode `s`'s block inverse: the tile inverse `chol_step` left in the
@@ -524,7 +745,7 @@ pub fn chol_inv_diag(
         } else if r == c {
             ld(dinv, col + c0 + r)
         } else {
-            0.0
+            Real::ZERO
         };
         st(xinv, xo + (c0 + c) * k + c0 + r, v);
     });
@@ -565,7 +786,7 @@ pub fn chol_inv_left(
     let t = lid.x as usize;
     let r = t % TILE;
     let c = t / TILE;
-    let (mut a0, mut a1, mut a2, mut a3): (Real, Real, Real, Real) = (0.0, 0.0, 0.0, 0.0);
+    let (mut a0, mut a1, mut a2, mut a3): (Real, Real, Real, Real) = (Real::ZERO, Real::ZERO, Real::ZERO, Real::ZERO);
     let mut p = j;
     while p < a_end {
         let (cp, pb) = tile(fronts, bounds, s, p);
@@ -635,7 +856,7 @@ pub fn chol_inv_right(
     let t = lid.x as usize;
     let r = t % TILE;
     let c = t / TILE;
-    let (mut a0, mut a1, mut a2, mut a3): (Real, Real, Real, Real) = (0.0, 0.0, 0.0, 0.0);
+    let (mut a0, mut a1, mut a2, mut a3): (Real, Real, Real, Real) = (Real::ZERO, Real::ZERO, Real::ZERO, Real::ZERO);
     let mut p = c_begin;
     while p <= i {
         let (cp, pb) = tile(fronts, bounds, s, p);
@@ -693,7 +914,7 @@ pub fn solve_gather(
 
 /// `m[at + q · stride]` for `q` in 0 ‥ 32, all 32 loads issued before any is used.
 fn load32(m: &[Real], at: usize, stride: usize) -> [Real; 32] {
-    let mut r: [Real; 32] = [0.0; 32];
+    let mut r: [Real; 32] = [Real::ZERO; 32];
     unroll32!(q, {
         r[q] = ld(m, at + q * stride);
     });
@@ -702,7 +923,7 @@ fn load32(m: &[Real], at: usize, stride: usize) -> [Real; 32] {
 
 /// `Σ_{q < 32} r[q] y[o + q]` in four independent chains.
 fn dot_reg<const N: usize>(r: &[Real; 32], y: &Shared<N>, o: usize) -> Real {
-    let mut s: [Real; 4] = [0.0; 4];
+    let mut s: [Real; 4] = [Real::ZERO; 4];
     unroll32!(q, {
         s[q % 4] = r[q].mul_add(y[o + q], s[q % 4]);
     });
@@ -711,7 +932,7 @@ fn dot_reg<const N: usize>(r: &[Real; 32], y: &Shared<N>, o: usize) -> Real {
 
 /// `Σ_{q < n} m[at + q · stride] y[o + q]`, 32 independent loads at a time.
 fn dot32<const N: usize>(m: &[Real], at: usize, stride: usize, y: &Shared<N>, o: usize, n: usize) -> Real {
-    let mut acc: Real = 0.0;
+    let mut acc: Real = Real::ZERO;
     let mut q = 0;
     while q + 32 <= n {
         acc += dot_reg(&load32(m, at + q * stride, stride), y, o + q);
@@ -724,7 +945,7 @@ fn dot32<const N: usize>(m: &[Real], at: usize, stride: usize, y: &Shared<N>, o:
 /// overlap.
 fn dot8<const N: usize>(m: &[Real], at: usize, stride: usize, y: &Shared<N>, o: usize, n: usize) -> Real {
     let (mut s0, mut s1, mut s2, mut s3, mut s4, mut s5, mut s6, mut s7): (Real, Real, Real, Real, Real, Real, Real, Real) =
-        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        (Real::ZERO, Real::ZERO, Real::ZERO, Real::ZERO, Real::ZERO, Real::ZERO, Real::ZERO, Real::ZERO);
     let mut q = 0;
     while q + 8 <= n {
         let p = at + q * stride;
@@ -773,7 +994,7 @@ pub fn solve_fgemv(
     let t = lid.x as usize;
     let r = chunk * 256 + t;
     let last = if k < chunk * 256 + 256 { k } else { chunk * 256 + 256 };
-    let mut acc: Real = 0.0;
+    let mut acc: Real = Real::ZERO;
     let mut qc = 0;
     while qc < last {
         if qc + t < k {
@@ -818,7 +1039,7 @@ pub fn solve_fpattern(
     let col = word(fronts, s, BEGIN);
     let t = lid.x as usize;
     let i = chunk * 256 + t;
-    let mut acc: Real = 0.0;
+    let mut acc: Real = Real::ZERO;
     let mut qc = 0;
     while qc < k {
         if qc + t < k {
@@ -833,12 +1054,13 @@ pub fn solve_fpattern(
         qc += 256;
     }
     if k + i < f {
-        atomic_sub(x, ld(pat, word(fronts, s, PAT) + i) as usize, acc);
+        Real::atomic_sub(x, ld(pat, word(fronts, s, PAT) + i) as usize, acc);
     }
 }
 
 /// Backward, supernode `s`, columns `8 chunk ..`: `v_j = y_j − Σ_i L_(k+i) j x[pattern_i]` in
-/// `ytmp`, from the ancestors' finished unknowns. A warp-sized group per column, its lanes reading
+/// `ytmp` (`s_j y_j` when signed, the `S` between the two substitutions), from the
+/// ancestors' finished unknowns. A warp-sized group per column, its lanes reading
 /// the column's pattern part contiguously.
 #[spirv(compute(threads(256)))]
 pub fn solve_bpattern(
@@ -851,7 +1073,41 @@ pub fn solve_bpattern(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] lval: &[Real],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] x: &[Real],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] ytmp: &mut [Real],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] sign: &[u32],
     #[spirv(workgroup)] part: &mut Shared<256>,
+) {
+    bpattern::<false>(wid, lid, prm, items, fronts, pat, lval, x, ytmp, sign, part);
+}
+
+#[spirv(compute(threads(256)))]
+pub fn solve_bpattern_signed(
+    #[spirv(workgroup_id)] wid: UVec3,
+    #[spirv(local_invocation_id)] lid: UVec3,
+    #[spirv(push_constant)] prm: &Range,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] items: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] fronts: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] pat: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] lval: &[Real],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] x: &[Real],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] ytmp: &mut [Real],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] sign: &[u32],
+    #[spirv(workgroup)] part: &mut Shared<256>,
+) {
+    bpattern::<true>(wid, lid, prm, items, fronts, pat, lval, x, ytmp, sign, part);
+}
+
+fn bpattern<const SIGNED: bool>(
+    wid: UVec3,
+    lid: UVec3,
+    prm: &Range,
+    items: &[u32],
+    fronts: &[u32],
+    pat: &[u32],
+    lval: &[Real],
+    x: &[Real],
+    ytmp: &mut [Real],
+    sign: &[u32],
+    part: &mut Shared<256>,
 ) {
     let (ok, base) = item(wid, prm);
     if !ok {
@@ -868,7 +1124,7 @@ pub fn solve_bpattern(
     let t = lid.x as usize;
     let (g, lane) = (t / 32, t % 32);
     let j = chunk * 8 + g;
-    let mut acc: Real = 0.0;
+    let mut acc: Real = Real::ZERO;
     if j < k {
         let mut i = lane;
         while i < m {
@@ -879,13 +1135,13 @@ pub fn solve_bpattern(
     part[t] = acc;
     barrier();
     if lane == 0 && j < k {
-        let mut sum: Real = 0.0;
+        let mut sum: Real = Real::ZERO;
         let mut q = 0;
         while q < 32 {
             sum += part[g * 32 + q];
             q += 1;
         }
-        st(ytmp, col + j, ld(ytmp, col + j) - sum);
+        st(ytmp, col + j, flip::<SIGNED>(ld(ytmp, col + j), sign, col + j) - sum);
     }
 }
 
@@ -915,7 +1171,7 @@ pub fn solve_bgemv(
     let t = lid.x as usize;
     let (g, lane) = (t / 32, t % 32);
     let r = chunk * 8 + g;
-    let mut acc: Real = 0.0;
+    let mut acc: Real = Real::ZERO;
     if r < k {
         let mut q = r + lane;
         while q < k {
@@ -926,7 +1182,7 @@ pub fn solve_bgemv(
     part[t] = acc;
     barrier();
     if lane == 0 && r < k {
-        let mut sum: Real = 0.0;
+        let mut sum: Real = Real::ZERO;
         let mut q = 0;
         while q < 32 {
             sum += part[g * 32 + q];

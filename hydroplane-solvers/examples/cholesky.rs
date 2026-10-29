@@ -8,11 +8,13 @@
 //! the nested dissection. A third argument `SHIFT` scales the diagonal by `1 + SHIFT`, for a
 //! better-conditioned variant. `ORDERING` picks the fill-reducing order: a nested-dissection spec
 //! (`nd:leaf=120,node_refine=true`, see `order::NestedDissection`'s `FromStr`) or a node
-//! permutation file (`perm:PATH`, `u32` per node, `perm[new] = old`).
+//! permutation file (`perm:PATH`, `u32` per node, `perm[new] = old`). `SCHUR_TILE=32` or `64`
+//! overrides the Schur block size `SchurTile::for_precision` picks. `CANDIDATES=4` tries four
+//! nested-dissection seeds and keeps the cheapest by `vulkan::ordering_cost`.
 
 use std::time::Instant;
 
-use hydroplane_solvers::cholesky::{Analysis, CpuCholesky, Ordering, Real};
+use hydroplane_solvers::cholesky::{Analysis, CpuCholesky, CpuPcg, Ordering, Real};
 use hydroplane_solvers::order;
 
 struct Matrix {
@@ -86,17 +88,16 @@ fn best_of(reps: usize, mut f: impl FnMut() -> f64) -> f64 {
 }
 
 fn cpu<T: Real>(analysis: &Analysis, a: &Matrix, b: &[f64]) -> Vec<T> {
-    let values: Vec<T> = a.val.iter().map(|&v| T::from_f64(v)).collect();
     let mut chol = CpuCholesky::<T>::new(analysis);
     let ms = best_of(3, || {
         let t = Instant::now();
-        chol.factorize(analysis, &values).expect("CPU factorization");
+        chol.factorize(&a.val).expect("CPU factorization");
         t.elapsed().as_secs_f64() * 1e3
     });
-    let mut x: Vec<T> = b.iter().map(|&v| T::from_f64(v)).collect();
+    let mut x = b.to_vec();
     let solve = best_of(5, || {
         let t = Instant::now();
-        chol.solve_in_place(analysis, &mut x);
+        chol.solve_in_place(&mut x);
         t.elapsed().as_secs_f64() * 1e3
     });
     let name = if T::F64 { "f64" } else { "f32" };
@@ -108,11 +109,17 @@ fn cpu<T: Real>(analysis: &Analysis, a: &Matrix, b: &[f64]) -> Vec<T> {
 }
 
 #[cfg(feature = "vulkan")]
-fn gpu<T: Real + Default>(ctx: &std::sync::Arc<hydroplane_solvers::vulkan::Context>, analysis: &Analysis, a: &Matrix, b: &[f64], reference: &[f64]) {
+fn gpu<T: hydroplane_solvers::vulkan::DeviceReal>(analysis: &Analysis, a: &Matrix, b: &[f64], reference: &[f64]) {
     use hydroplane_solvers::vulkan::VulkanCholesky;
-    let name = if T::F64 { "f64" } else { "f32" };
+    let name = format!("{:?}", T::PRECISION).to_lowercase();
     let t = Instant::now();
-    let mut chol = match VulkanCholesky::<T>::new(ctx.clone(), analysis) {
+    let mut options = hydroplane_solvers::vulkan::Options::default();
+    match std::env::var("SCHUR_TILE").as_deref() {
+        Ok("32") => options.schur_tile = Some(hydroplane_solvers::vulkan::SchurTile::T32),
+        Ok("64") => options.schur_tile = Some(hydroplane_solvers::vulkan::SchurTile::T64),
+        _ => {}
+    }
+    let mut chol = match VulkanCholesky::<T>::with_options(analysis, options) {
         Ok(c) => c,
         Err(e) => {
             println!("vulkan {name}: {e:?}");
@@ -130,7 +137,7 @@ fn gpu<T: Real + Default>(ctx: &std::sync::Arc<hydroplane_solvers::vulkan::Conte
         status = chol.factorize(&a.val);
         chol.last_factor_ms()
     });
-    let factor = chol.factor().expect("downloading the factor");
+    let factor: Vec<f64> = chol.factor().expect("downloading the factor").iter().map(|v| v.to_f64()).collect();
     println!(
         "vulkan {name}: setup {setup:.0} ms, factor {gpu:.1} ms on the device ({wall:.1} ms wall), {status:?}, factor vs cpu f64 {:.2e}, cpu solve residual {:.2e}",
         factor_difference(analysis, &factor, reference),
@@ -179,6 +186,93 @@ fn gpu<T: Real + Default>(ctx: &std::sync::Arc<hydroplane_solvers::vulkan::Conte
     let stats = chol.stats();
     println!("    {stats:?}");
     println!("    {:.1} GFLOP, {:.0} GFLOP/s", stats.flops * 1e-9, stats.flops / gpu * 1e-6);
+}
+
+/// `f64` conjugate gradient preconditioned by the `f32` factor, to a few tolerances.
+#[cfg(feature = "vulkan")]
+fn pcg<T: hydroplane_solvers::vulkan::DeviceReal>(analysis: &Analysis, a: &Matrix, b: &[f64]) {
+    use hydroplane_solvers::vulkan::VulkanPcg;
+    let name = format!("{:?}", T::PRECISION).to_lowercase();
+    let t = Instant::now();
+    let mut pcg = match VulkanPcg::<T>::new(analysis) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("pcg {name}: {e:?}");
+            return;
+        }
+    };
+    let setup = t.elapsed().as_secs_f64() * 1e3;
+    let factor = best_of(5, || {
+        let t = Instant::now();
+        pcg.factorize(&a.val).expect("factorization");
+        t.elapsed().as_secs_f64() * 1e3
+    });
+    println!(
+        "pcg ({name} CG, f32 Cholesky preconditioner): setup {setup:.0} ms, factor {:.1} ms on the device ({factor:.1} ms wall)",
+        pcg.cholesky().map_or(0.0, |c| c.last_factor_ms())
+    );
+    for tol in [1e-6, 1e-8, 1e-10] {
+        let mut x = b.to_vec();
+        let mut report = None;
+        let wall = best_of(5, || {
+            x.copy_from_slice(b);
+            let t = Instant::now();
+            pcg.options.tolerance = tol;
+            report = Some(pcg.solve_in_place(&mut x).expect("solve"));
+            t.elapsed().as_secs_f64() * 1e3
+        });
+        let r = report.unwrap();
+        println!(
+            "    tol {tol:.0e}: {} iterations, {:.2} ms on the device ({wall:.2} ms wall), tracked residual {:.2e}, true residual {:.2e}",
+            r.iterations,
+            pcg.last_solve_ms(),
+            r.relative_residual,
+            residual(a, b, &x)
+        );
+    }
+}
+
+/// `f64` conjugate gradient on the CPU preconditioned by the GPU's `f32` factor: the arrangement
+/// for GPUs without `f64` (Apple's), the iteration's matrix-vector product and dot products on the
+/// CPU and each preconditioner solve on the GPU.
+#[cfg(feature = "vulkan")]
+fn split_pcg(analysis: &Analysis, a: &Matrix, b: &[f64]) {
+    use hydroplane_solvers::vulkan::VulkanCholesky;
+    let Ok(mut chol) = VulkanCholesky::<f32>::new(analysis) else { return };
+    let mut pcg = CpuPcg::new(analysis);
+    let factor = best_of(3, || {
+        let t = Instant::now();
+        chol.factorize(&a.val).expect("GPU factorization");
+        pcg.set_values(&a.val);
+        t.elapsed().as_secs_f64() * 1e3
+    });
+    println!("split pcg (f64 CG on the CPU, f32 factor on the GPU): factor {factor:.1} ms wall");
+    for tol in [1e-6, 1e-8, 1e-10] {
+        let mut x = b.to_vec();
+        let mut report = None;
+        let mut in_gpu = f64::INFINITY;
+        let ms = best_of(3, || {
+            x.copy_from_slice(b);
+            let mut gpu = 0.0;
+            let t = Instant::now();
+            pcg.options.tolerance = tol;
+            report = Some(pcg.solve_with(&mut x, |r, z| {
+                let t = Instant::now();
+                z.copy_from_slice(r);
+                chol.solve_in_place(z).expect("GPU solve");
+                gpu += t.elapsed().as_secs_f64() * 1e3;
+            }));
+            in_gpu = in_gpu.min(gpu);
+            t.elapsed().as_secs_f64() * 1e3
+        });
+        let r = report.unwrap();
+        println!(
+            "    tol {tol:.0e}: {} iterations, {ms:.1} ms wall ({in_gpu:.1} in the GPU preconditioner), tracked residual {:.2e}, true residual {:.2e}",
+            r.iterations,
+            r.relative_residual,
+            residual(a, b, &x)
+        );
+    }
 }
 
 #[cfg(feature = "vulkan")]
@@ -245,6 +339,168 @@ fn print_shapes(analysis: &Analysis) {
     }
 }
 
+/// `f64` conjugate gradient on the CPU preconditioned by the `f32` factor, to a few tolerances.
+/// This crate's supernodal factorization on the SME units (Accelerate's dense kernels).
+#[cfg(target_os = "macos")]
+fn sme<T: hydroplane_solvers::sme::SmeReal>(analysis: &Analysis, a: &Matrix, b: &[f64], reference: &[f64]) {
+    use hydroplane_solvers::sme::SmeCholesky;
+    let t = Instant::now();
+    let mut chol = match SmeCholesky::<T>::new(analysis) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("sme: {e:?}");
+            return;
+        }
+    };
+    let setup = t.elapsed().as_secs_f64() * 1e3;
+    chol.factorize(&a.val).expect("factorization");
+    let factor = best_of(5, || {
+        let t = Instant::now();
+        chol.factorize(&a.val).expect("factorization");
+        t.elapsed().as_secs_f64() * 1e3
+    });
+    let mut x = b.to_vec();
+    let solve = best_of(3, || {
+        x.copy_from_slice(b);
+        let t = Instant::now();
+        chol.solve_in_place(&mut x);
+        t.elapsed().as_secs_f64() * 1e3
+    });
+    println!(
+        "sme {}: setup {setup:.0} ms, factor {factor:.1} ms ({:.0} GFLOP/s), solve {solve:.2} ms, residual {:.2e}, factor vs cpu f64 {:.2e}",
+        std::any::type_name::<T>(),
+        analysis.flops() * 1e-6 / factor,
+        residual(a, b, &x),
+        factor_difference(analysis, chol.factor(), reference)
+    );
+    #[cfg(feature = "vulkan")]
+    {
+        use hydroplane_solvers::vulkan::{Context, VulkanCholesky};
+        let Ok(ctx) = Context::shared() else { return };
+        if T::PRECISION == hydroplane_solvers::Precision::F32 {
+            gpu_solve::<f32, T>(analysis, &chol, a, b);
+        } else if ctx.supports_f64() {
+            gpu_solve::<f64, T>(analysis, &chol, a, b);
+        } else {
+            gpu_solve::<hydroplane_solvers::Ef64, T>(analysis, &chol, a, b);
+        }
+
+        /// The SME factor loaded into the GPU (`P` there) and solved with.
+        fn gpu_solve<P: hydroplane_solvers::vulkan::DeviceReal, T: hydroplane_solvers::sme::SmeReal>(
+            analysis: &Analysis,
+            chol: &hydroplane_solvers::sme::SmeCholesky<T>,
+            a: &Matrix,
+            b: &[f64],
+        ) {
+            let mut gpu = VulkanCholesky::<P>::new(analysis).expect("a GPU solver");
+            gpu.load_factor(chol.factor()).expect("load");
+            let mut device = 0.0;
+            let load = best_of(5, || {
+                let t = Instant::now();
+                device = gpu.load_factor(chol.factor()).expect("load");
+                t.elapsed().as_secs_f64() * 1e3
+            });
+            let mut x = b.to_vec();
+            let solve = best_of(5, || {
+                x.copy_from_slice(b);
+                let t = Instant::now();
+                gpu.solve_in_place(&mut x).expect("solve");
+                t.elapsed().as_secs_f64() * 1e3
+            });
+            println!(
+                "    loaded into the GPU as {:?}: load {load:.1} ms ({device:.1} ms of it inverting on the device), solve {solve:.2} ms, residual {:.2e}",
+                P::PRECISION,
+                residual(a, b, &x)
+            );
+            let mut with_inverses = hydroplane_solvers::sme::SmeCholesky::<T>::new(analysis).expect("SME").with_inverses();
+            with_inverses.factorize(&a.val).expect("factorization");
+            let factor = best_of(5, || {
+                let t = Instant::now();
+                with_inverses.factorize(&a.val).expect("factorization");
+                t.elapsed().as_secs_f64() * 1e3
+            });
+            let inverse = with_inverses.inverse().expect("inverses");
+            let load = best_of(5, || {
+                let t = Instant::now();
+                gpu.load_factor_and_inverse(with_inverses.factor(), inverse).expect("load");
+                t.elapsed().as_secs_f64() * 1e3
+            });
+            x.copy_from_slice(b);
+            gpu.solve_in_place(&mut x).expect("solve");
+            println!("    with the inverses made on the CPU: factor {factor:.1} ms, load {load:.1} ms, residual {:.2e}", residual(a, b, &x));
+            if P::PRECISION == hydroplane_solvers::Precision::F32 {
+                let mut pcg = hydroplane_solvers::vulkan::VulkanPcg::<hydroplane_solvers::Ef64>::new(analysis).expect("a GPU PCG");
+                let factor32: Vec<f32> = chol.factor().iter().map(|v| v.to_f64() as f32).collect();
+                pcg.load_preconditioner(&a.val, &factor32).expect("load");
+                for tol in [1e-6, 1e-8] {
+                    x.copy_from_slice(b);
+                    pcg.options.tolerance = tol;
+                    let report = pcg.solve_in_place(&mut x).expect("solve");
+                    println!("    as the preconditioner of Ef64 PCG to {tol:.0e}: {} iterations, true residual {:.2e}", report.iterations, residual(a, b, &x));
+                }
+                pcg.factorize(&a.val).expect("factorization");
+                for tol in [1e-6, 1e-8] {
+                    x.copy_from_slice(b);
+                    pcg.options.tolerance = tol;
+                    let report = pcg.solve_in_place(&mut x).expect("solve");
+                    println!("    against the GPU's own f32 factor, to {tol:.0e}: {} iterations, true residual {:.2e}", report.iterations, residual(a, b, &x));
+                }
+            }
+        }
+    }
+}
+
+/// Accelerate's sparse Cholesky (its own METIS ordering).
+#[cfg(target_os = "macos")]
+fn accelerate<T: hydroplane_solvers::accelerate::AccelerateReal>(analysis: &Analysis, a: &Matrix, b: &[f64]) {
+    use hydroplane_solvers::accelerate::AccelerateCholesky;
+    let t = Instant::now();
+    let mut chol = AccelerateCholesky::<T>::new(analysis).expect("symbolic factorization");
+    let symbolic = t.elapsed().as_secs_f64() * 1e3;
+    chol.factorize(&a.val).expect("factorization");
+    let factor = best_of(5, || {
+        let t = Instant::now();
+        chol.factorize(&a.val).expect("factorization");
+        t.elapsed().as_secs_f64() * 1e3
+    });
+    let mut x = b.to_vec();
+    let solve = best_of(5, || {
+        x.copy_from_slice(b);
+        let t = Instant::now();
+        chol.solve_in_place(&mut x).expect("solve");
+        t.elapsed().as_secs_f64() * 1e3
+    });
+    println!("accelerate {:?}: symbolic {symbolic:.0} ms, factor {factor:.1} ms, solve {solve:.2} ms, residual {:.2e}", T::PRECISION, residual(a, b, &x));
+}
+
+fn cpu_pcg(analysis: &Analysis, a: &Matrix, b: &[f64]) {
+    let mut pcg = CpuPcg::new(analysis);
+    let factor = best_of(3, || {
+        let t = Instant::now();
+        pcg.factorize(&a.val).expect("CPU factorization");
+        t.elapsed().as_secs_f64() * 1e3
+    });
+    println!("cpu pcg (f64 CG, f32 Cholesky preconditioner): factor {factor:.1} ms");
+    for tol in [1e-6, 1e-8, 1e-10] {
+        let mut x = b.to_vec();
+        let mut report = None;
+        let ms = best_of(3, || {
+            x.copy_from_slice(b);
+            let t = Instant::now();
+            pcg.options.tolerance = tol;
+            report = Some(pcg.solve_in_place(&mut x));
+            t.elapsed().as_secs_f64() * 1e3
+        });
+        let r = report.unwrap();
+        println!(
+            "    tol {tol:.0e}: {} iterations, {ms:.1} ms, tracked residual {:.2e}, true residual {:.2e}",
+            r.iterations,
+            r.relative_residual,
+            residual(a, b, &x)
+        );
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut a = load(&args[1]);
@@ -275,7 +531,16 @@ fn main() {
         }
         _ => Ordering::NestedDissection { block },
     };
-    let analysis = Analysis::new(&a.col_ptr, &a.row_idx, ordering).expect("analysis");
+    let candidates: usize = std::env::var("CANDIDATES").map_or(1, |c| c.parse().expect("a count"));
+    let analysis = if candidates > 1 {
+        #[cfg(feature = "vulkan")]
+        let cost = hydroplane_solvers::vulkan::ordering_cost;
+        #[cfg(not(feature = "vulkan"))]
+        let cost = Analysis::flops;
+        Analysis::best_of(&a.col_ptr, &a.row_idx, block, candidates, cost).expect("analysis")
+    } else {
+        Analysis::with_ordering(&a.col_ptr, &a.row_idx, ordering).expect("analysis")
+    };
     println!(
         "analysis: {:.0} ms, {} supernodes, factor {} nonzeros",
         t.elapsed().as_secs_f64() * 1e3,
@@ -287,19 +552,33 @@ fn main() {
     }
     let b: Vec<f64> = (0..n).map(|i| (0.37 * i as f64).sin() + 0.1).collect();
     let reference = cpu::<f64>(&analysis, &a, &b);
-    cpu::<f32>(&analysis, &a, &b);
+    let factor32 = cpu::<f32>(&analysis, &a, &b);
+    println!("    cpu f32 factor vs cpu f64 {:.2e}", factor_difference(&analysis, &factor32, &reference));
+    cpu_pcg(&analysis, &a, &b);
+    #[cfg(target_os = "macos")]
+    {
+        accelerate::<f32>(&analysis, &a, &b);
+        accelerate::<f64>(&analysis, &a, &b);
+        sme::<f32>(&analysis, &a, &b, &reference);
+        sme::<f64>(&analysis, &a, &b, &reference);
+    }
     #[cfg(feature = "vulkan")]
     {
-        let ctx = std::sync::Arc::new(hydroplane_solvers::vulkan::Context::new().expect("Vulkan device"));
+        let ctx = hydroplane_solvers::vulkan::Context::shared().expect("Vulkan device");
         println!(
-            "vulkan device: {} (f64: {}, f64 atomic add: {}, shared memory {} KiB)",
+            "vulkan device: {} (f64: {}, f64 atomic add: {}, unified memory: {}, shared memory {} KiB)",
             ctx.name(),
             ctx.supports_f64(),
             ctx.supports_atomic_f64(),
+            ctx.unified_memory(),
             ctx.shared_bytes() / 1024
         );
-        gpu::<f64>(&ctx, &analysis, &a, &b, &reference);
-        gpu::<f32>(&ctx, &analysis, &a, &b, &reference);
+        gpu::<f64>(&analysis, &a, &b, &reference);
+        gpu::<hydroplane_solvers::Ef64>(&analysis, &a, &b, &reference);
+        gpu::<f32>(&analysis, &a, &b, &reference);
+        pcg::<f64>(&analysis, &a, &b);
+        pcg::<hydroplane_solvers::Ef64>(&analysis, &a, &b);
+        split_pcg(&analysis, &a, &b);
     }
     let _ = &reference;
 }

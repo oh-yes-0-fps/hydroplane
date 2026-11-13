@@ -352,6 +352,7 @@ impl Bvh {
 
     /// Nearest hit along `origin + t * dir` for `0 <= t < t_max`, as found by `leaves`, which
     /// sees the leaves the ray enters roughly nearest first.
+    #[inline]
     pub fn ray<L: RayLeaves>(
         &self,
         origin: [f32; 3],
@@ -359,9 +360,22 @@ impl Bvh {
         t_max: f32,
         leaves: &mut L,
     ) -> Option<f32> {
-        if self.is_empty() {
+        if self.is_empty() || !ray_meets(&self.bounds, origin, dir, t_max) {
             return None;
         }
+        self.ray_traverse(origin, dir, t_max, leaves)
+    }
+
+    /// The traversal behind [`ray`](Self::ray), kept out of line so a ray that misses the whole
+    /// tree returns without paying for the traversal's stack frame.
+    #[inline(never)]
+    fn ray_traverse<L: RayLeaves>(
+        &self,
+        origin: [f32; 3],
+        dir: [f32; 3],
+        t_max: f32,
+        leaves: &mut L,
+    ) -> Option<f32> {
         with_nodes!(&self.tree, nodes => dispatch(RayQuery { nodes, origin, dir, t_max, leaves }))
     }
 
@@ -375,18 +389,42 @@ impl Bvh {
     }
 
     /// Visits every leaf whose box meets `query`, until `leaves` breaks.
+    #[inline]
     pub fn overlapping<L: OverlapLeaves>(&self, query: &Aabb, leaves: &mut L) -> ControlFlow<()> {
         if self.is_empty() || !self.bounds.overlaps(query) {
             return ControlFlow::Continue(());
         }
-        let query = *query;
+        self.overlap_traverse(*query, leaves)
+    }
+
+    /// The traversal behind [`overlapping`](Self::overlapping), out of line for the reason
+    /// [`ray_traverse`](Self::ray_traverse) is.
+    #[inline(never)]
+    fn overlap_traverse<L: OverlapLeaves>(&self, query: Aabb, leaves: &mut L) -> ControlFlow<()> {
         with_nodes!(&self.tree, nodes => dispatch(OverlapQuery { nodes, query, leaves }))
     }
 
     /// Visits every leaf whose box contains `p`, until `leaves` breaks.
+    #[inline]
     pub fn containing<L: OverlapLeaves>(&self, p: [f32; 3], leaves: &mut L) -> ControlFlow<()> {
         self.overlapping(&Aabb::point(p), leaves)
     }
+}
+
+/// Scalar slab test of the ray against the whole tree's box, so a ray that misses everything
+/// skips the dispatch and the first node visit.
+#[inline(always)]
+fn ray_meets(b: &Aabb, origin: [f32; 3], dir: [f32; 3], t_max: f32) -> bool {
+    let inv = wide::safe_inv_dir(dir);
+    let mut near = 0.0f32;
+    let mut far = t_max;
+    for a in 0..3 {
+        let t0 = (b.min[a] - origin[a]) * inv[a];
+        let t1 = (b.max[a] - origin[a]) * inv[a];
+        near = near.max(t0.min(t1));
+        far = far.min(t0.max(t1) * wide::SLAB_EXIT_SCALE);
+    }
+    near <= far
 }
 
 /// LIFO traversal stack: an inline array covers any realistic depth, spilling to the heap only

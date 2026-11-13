@@ -12,7 +12,7 @@ use super::{Aabb, NearestLeaves, OverlapLeaves, RayLeaves, Stack};
 /// Widening of the slab exit that absorbs the rounding of `(bound - origin) * inv_dir`
 /// (Ize, *Robust BVH Ray Traversal*: `1 + 2γ₃`), so a ray grazing a box corner or face is
 /// never culled from a primitive it touches.
-const SLAB_EXIT_SCALE: f32 =
+pub(super) const SLAB_EXIT_SCALE: f32 =
     1.0 + 2.0 * (3.0 * f32::EPSILON * 0.5) / (1.0 - 3.0 * f32::EPSILON * 0.5);
 
 /// `W` child boxes in SoA form (`min[axis]` holds that axis for every child). Children fill
@@ -152,12 +152,6 @@ fn splat3<S: Backend<f32>>(g: Gang<S>, v: [f32; 3]) -> [Varying<f32, S>; 3] {
     [g.splat(v[0]), g.splat(v[1]), g.splat(v[2])]
 }
 
-/// Bits `0..n` set.
-#[inline(always)]
-fn low_bits(n: usize) -> u32 {
-    if n >= 32 { u32::MAX } else { (1 << n) - 1 }
-}
-
 /// The best-first order of a node's children: one register of child lanes, starting at lane
 /// `c`, to a key per lane (entry `t`, squared distance), `+∞` for a child to skip. A trait with an
 /// `#[inline(always)]` method rather than a closure, so it is sure to inline into the
@@ -166,64 +160,52 @@ trait ChildKey<S: Backend<f32>, const W: usize> {
     fn key(&self, n: &Node<W>, c: usize, bound: f32) -> Varying<f32, S>;
 }
 
-/// The node's children whose key comes out below `bound`, nearest first.
+/// A child a query enters: its node index (internal) or first slot (leaf), its primitive count
+/// (`0` for internal), and its key.
+#[derive(Clone, Copy)]
+struct Hit {
+    child: u32,
+    count: u32,
+    key: f32,
+}
+
+/// The node's children whose key comes out below `bound`, nearest first in `out[..n]` (`n`
+/// returned). `keys` and `out` live in the caller's frame across visits, so nothing is zeroed or
+/// copied per node. The hits are picked out by scalar compares rather than a vector bitmask: the
+/// mask's horizontal reduction sits on the visit's critical path, where the compares overlap.
 #[inline(always)]
 fn sorted_below<S: Backend<f32>, const W: usize, K: ChildKey<S, W>>(
     g: Gang<S>,
     node: &Node<W>,
     bound: f32,
     key: &K,
-) -> Sorted<W> {
+    keys: &mut [f32; W],
+    out: &mut [Hit; W],
+) -> usize {
     let lanes = g.lanes::<f32>();
-    let len = node.len as usize;
-    let b = g.splat(bound);
-    let mut keys = [0.0f32; W];
-    let mut hits = Sorted::new();
+    let len = (node.len as usize).min(W);
     let mut c = 0;
     while c < len {
-        let n = (len - c).min(lanes);
-        let k = key.key(node, c, bound);
-        let mut bits = k.lt(b).to_bitmask() & low_bits(n);
-        if bits != 0 {
-            k.store_partial(&mut keys[c..(c + lanes).min(W)]);
-            while bits != 0 {
-                let lane = c + bits.trailing_zeros() as usize;
-                hits.insert(lane, keys[lane]);
-                bits &= bits - 1;
-            }
-        }
+        key.key(node, c, bound).store_partial(&mut keys[c..(c + lanes).min(W)]);
         c += lanes;
     }
-    hits
-}
-
-/// Lanes ordered by key, nearest first: `(lane, key)`.
-struct Sorted<const W: usize> {
-    items: [(u32, f32); W],
-    len: usize,
-}
-
-impl<const W: usize> Sorted<W> {
-    #[inline(always)]
-    fn new() -> Self {
-        Self { items: [(0, 0.0); W], len: 0 }
-    }
-
-    #[inline(always)]
-    fn insert(&mut self, lane: usize, key: f32) {
-        let mut p = self.len;
-        while p > 0 && self.items[p - 1].1 > key {
-            self.items[p] = self.items[p - 1];
-            p -= 1;
+    let mut n = 0;
+    for (lane, &k) in keys[..len].iter().enumerate() {
+        if k < bound {
+            let mut p = n % W;
+            while p > 0 && out[p - 1].key > k {
+                out[p] = out[p - 1];
+                p -= 1;
+            }
+            out[p] = Hit {
+                child: node.child[lane],
+                count: node.count[lane],
+                key: k,
+            };
+            n += 1;
         }
-        self.items[p] = (lane as u32, key);
-        self.len += 1;
     }
-
-    #[inline(always)]
-    fn as_slice(&self) -> &[(u32, f32)] {
-        &self.items[..self.len]
-    }
+    n
 }
 
 /// Best-first descent shared by the ray and nearest-point queries: visit the node's leaves
@@ -240,16 +222,18 @@ fn best_first<S: Backend<f32>, const W: usize, K: ChildKey<S, W>>(
 ) -> bool {
     let mut improved = false;
     let mut stack: Stack<(u32, f32)> = Stack::new();
+    let mut keys = [0.0f32; W];
+    let mut hits = [Hit { child: 0, count: 0, key: 0.0 }; W];
     let mut ni = 0u32;
     loop {
         let node = &nodes[ni as usize];
-        let hits = sorted_below(g, node, *best, key);
+        let n = sorted_below(g, node, *best, key, &mut keys, &mut hits);
+        let hits = &hits[..n];
 
-        for &(lane, k) in hits.as_slice() {
-            let lane = lane as usize;
-            if node.count[lane] > 0
-                && k < *best
-                && let Some(v) = leaf(node.slots(lane), *best)
+        for h in hits {
+            if h.count > 0
+                && h.key < *best
+                && let Some(v) = leaf(h.child as usize..(h.child + h.count) as usize, *best)
                 && v < *best
             {
                 *best = v;
@@ -258,11 +242,10 @@ fn best_first<S: Backend<f32>, const W: usize, K: ChildKey<S, W>>(
         }
 
         let mut next = None;
-        for &(lane, k) in hits.as_slice().iter().rev() {
-            let lane = lane as usize;
-            if node.count[lane] == 0
-                && k < *best
-                && let Some(deferred) = next.replace((node.child[lane], k))
+        for h in hits.iter().rev() {
+            if h.count == 0
+                && h.key < *best
+                && let Some(deferred) = next.replace((h.child, h.key))
             {
                 stack.push(deferred);
             }
@@ -288,7 +271,7 @@ fn best_first<S: Backend<f32>, const W: usize, K: ChildKey<S, W>>(
 /// box's face plane yields `0 · big = 0` instead of a NaN the vector `min`/`max` would turn
 /// into a spurious miss.
 #[inline]
-fn safe_inv_dir(dir: [f32; 3]) -> [f32; 3] {
+pub(super) fn safe_inv_dir(dir: [f32; 3]) -> [f32; 3] {
     dir.map(|d| if d.abs() < 1e-30 { 1e30f32.copysign(d) } else { 1.0 / d })
 }
 
@@ -416,11 +399,13 @@ impl<const W: usize, L: OverlapLeaves> Kernel<f32> for OverlapQuery<'_, W, L> {
         let lanes = g.lanes::<f32>();
         let qmin = splat3(g, self.query.min);
         let qmax = splat3(g, self.query.max);
+        let (one, zero) = (g.splat(1.0), g.splat(0.0));
+        let mut meets = [0.0f32; W];
         let mut stack: Stack<u32> = Stack::new();
         let mut ni = 0u32;
         loop {
             let node = &self.nodes[ni as usize];
-            let len = node.len as usize;
+            let len = (node.len as usize).min(W);
             let mut c = 0;
             while c < len {
                 let mut m = row(g, &node.min[0], c, lanes).le(qmax[0])
@@ -430,17 +415,19 @@ impl<const W: usize, L: OverlapLeaves> Kernel<f32> for OverlapQuery<'_, W, L> {
                         & row(g, &node.min[a], c, lanes).le(qmax[a])
                         & row(g, &node.max[a], c, lanes).ge(qmin[a]);
                 }
-                let mut bits = m.to_bitmask() & low_bits(len - c);
-                while bits != 0 {
-                    let lane = c + bits.trailing_zeros() as usize;
+                // Stored as floats and read back lane by lane rather than through a bitmask,
+                // for the same reason as in `sorted_below`.
+                one.select(m, zero).store_partial(&mut meets[c..(c + lanes).min(W)]);
+                c += lanes;
+            }
+            for (lane, &meets) in meets[..len].iter().enumerate() {
+                if meets != 0.0 {
                     if node.count[lane] > 0 {
                         self.leaves.visit(g, node.slots(lane))?;
                     } else {
                         stack.push(node.child[lane]);
                     }
-                    bits &= bits - 1;
                 }
-                c += lanes;
             }
             match stack.pop() {
                 Some(n) => ni = n,

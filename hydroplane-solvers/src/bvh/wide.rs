@@ -344,7 +344,7 @@ pub(super) struct RayQuery<'a, const W: usize, L> {
 impl<const W: usize, L: RayLeaves> Kernel<f32> for RayQuery<'_, W, L> {
     type Output = Option<f32>;
 
-    #[inline]
+    #[inline(always)]
     fn run<S: BackendAll + Backend<f32>>(self, g: Gang<S>) -> Option<f32> {
         let entry = Entry {
             g,
@@ -370,7 +370,7 @@ pub(super) struct NearestQuery<'a, const W: usize, L> {
 impl<const W: usize, L: NearestLeaves> Kernel<f32> for NearestQuery<'_, W, L> {
     type Output = Option<f32>;
 
-    #[inline]
+    #[inline(always)]
     fn run<S: BackendAll + Backend<f32>>(self, g: Gang<S>) -> Option<f32> {
         let dist2 = Dist2 {
             g,
@@ -394,7 +394,7 @@ pub(super) struct OverlapQuery<'a, const W: usize, L> {
 impl<const W: usize, L: OverlapLeaves> Kernel<f32> for OverlapQuery<'_, W, L> {
     type Output = ControlFlow<()>;
 
-    #[inline]
+    #[inline(always)]
     fn run<S: BackendAll + Backend<f32>>(self, g: Gang<S>) -> ControlFlow<()> {
         let lanes = g.lanes::<f32>();
         let qmin = splat3(g, self.query.min);

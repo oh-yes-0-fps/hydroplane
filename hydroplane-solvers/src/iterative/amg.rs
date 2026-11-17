@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering::Relaxed;
 
 use rayon::prelude::*;
 
-use super::{Preconditioner, estimate_spectrum};
+use super::{PAR_MIN, Preconditioner, estimate_spectrum};
 use crate::cholesky::{Analysis, CpuCholesky, Error, Ordering};
 use crate::dense::DenseCholesky;
 
@@ -112,9 +112,14 @@ impl Mat {
     /// `y = A x`.
     fn multiply(&self, x: &[f64], y: &mut [f64]) {
         let (ptr, col, val) = (&self.ptr, &self.col, &self.val);
-        y.par_iter_mut().enumerate().with_min_len(1024).for_each(|(i, y)| {
+        let row = |(i, y): (usize, &mut f64)| {
             *y = (ptr[i]..ptr[i + 1]).map(|k| val[k] * x[col[k] as usize]).sum();
-        });
+        };
+        if self.nnz() < PAR_MIN {
+            y.iter_mut().enumerate().for_each(row);
+        } else {
+            y.par_iter_mut().enumerate().with_min_len(1024).for_each(row);
+        }
     }
 
     fn diagonal(&self) -> Vec<f64> {
@@ -533,19 +538,37 @@ fn chebyshev(lv: &mut Level, degree: usize) {
     let sigma = theta / delta;
     let mut rho = 1.0 / sigma;
     lv.a.multiply(&lv.x, &mut lv.t);
-    lv.res.par_iter_mut().zip(&lv.b).zip(&lv.t).with_min_len(4096).for_each(|((r, b), t)| *r = b - t);
-    lv.d.par_iter_mut().zip(&lv.res).zip(&lv.dinv).with_min_len(4096).for_each(|((d, r), di)| *d = r * di / theta);
+    each2(&mut lv.res, &lv.b, &lv.t, |r, b, t| *r = b - t);
+    each2(&mut lv.d, &lv.res, &lv.dinv, |d, r, di| *d = r * di / theta);
     for step in 0..degree {
-        lv.x.par_iter_mut().zip(&lv.d).with_min_len(4096).for_each(|(x, d)| *x += d);
+        each(&mut lv.x, &lv.d, |x, d| *x += d);
         if step + 1 == degree {
             break;
         }
         lv.a.multiply(&lv.d, &mut lv.t);
-        lv.res.par_iter_mut().zip(&lv.t).with_min_len(4096).for_each(|(r, t)| *r -= t);
+        each(&mut lv.res, &lv.t, |r, t| *r -= t);
         let rho_new = 1.0 / (2.0 * sigma - rho);
         let (c1, c2) = (rho_new * rho, 2.0 * rho_new / delta);
-        lv.d.par_iter_mut().zip(&lv.res).zip(&lv.dinv).with_min_len(4096).for_each(|((d, r), di)| *d = c1 * *d + c2 * r * di);
+        each2(&mut lv.d, &lv.res, &lv.dinv, |d, r, di| *d = c1 * *d + c2 * r * di);
         rho = rho_new;
+    }
+}
+
+/// `f(out[i], a[i])` for every `i`, on the calling thread for a coarse level's short vectors.
+fn each(out: &mut [f64], a: &[f64], f: impl Fn(&mut f64, f64) + Sync + Send) {
+    if out.len() < PAR_MIN {
+        out.iter_mut().zip(a).for_each(|(o, &a)| f(o, a));
+    } else {
+        out.par_iter_mut().zip(a).with_min_len(4096).for_each(|(o, &a)| f(o, a));
+    }
+}
+
+/// [`each`] over two inputs.
+fn each2(out: &mut [f64], a: &[f64], b: &[f64], f: impl Fn(&mut f64, f64, f64) + Sync + Send) {
+    if out.len() < PAR_MIN {
+        out.iter_mut().zip(a).zip(b).for_each(|((o, &a), &b)| f(o, a, b));
+    } else {
+        out.par_iter_mut().zip(a).zip(b).with_min_len(4096).for_each(|((o, &a), &b)| f(o, a, b));
     }
 }
 

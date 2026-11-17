@@ -10,6 +10,8 @@
 use faer::{Mat, Side};
 use rayon::prelude::*;
 
+use crate::iterative::Vector;
+
 /// When [`Lobpcg`] stops.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LobpcgOptions {
@@ -107,7 +109,7 @@ impl Lobpcg {
                 for (s, v) in set.iter().enumerate().skip(from) {
                     let coef = c[(s, col)];
                     if coef != 0.0 {
-                        out.par_iter_mut().zip(v.par_iter()).with_min_len(4096).for_each(|(o, v)| *o += coef * v);
+                        out[..].axpy(coef, &v[..]);
                     }
                 }
                 out
@@ -176,7 +178,8 @@ fn norm_estimate(n: usize, a: &mut impl FnMut(&[f64], &mut [f64])) -> f64 {
         if !(stretched > 0.0 && stretched.is_finite()) {
             break;
         }
-        v.par_iter_mut().zip(&av).with_min_len(4096).for_each(|(v, a)| *v = a / stretched);
+        v.copy_from_slice(&av);
+        v[..].scale(1.0 / stretched);
     }
     estimate
 }
@@ -188,11 +191,11 @@ fn stretch(v: &[Vec<f64>], av: &[Vec<f64>]) -> f64 {
 }
 
 fn norm(v: &[f64]) -> f64 {
-    v.par_iter().with_min_len(4096).map(|x| x * x).sum::<f64>().sqrt()
+    Vector::dot(v, v).sqrt()
 }
 
 fn dot(a: &[f64], b: &[f64]) -> f64 {
-    a.par_iter().zip(b).with_min_len(4096).map(|(a, b)| a * b).sum()
+    Vector::dot(a, b)
 }
 
 /// The `k` lowest Ritz pairs on the span of `basis`: their values into `theta`, and the

@@ -25,7 +25,7 @@ pub fn transform_hp<'a>(
 ) {
     // Twelve input columns into three outputs. `map_cols` drives the full-register pass, masked
     // tail, and ILP; the closure is just the math.
-    ctx.map_cols::<f32, 12, 3>(
+    ctx.map_cols(
         [m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], vx, vy, vz],
         [ox, oy, oz],
         0.0,

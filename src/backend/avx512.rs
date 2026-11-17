@@ -265,6 +265,10 @@ impl Backend<f32> for Avx512 {
         unsafe { z_cmp::<_CMP_GE_OQ>(a, b) }
     }
     #[inline(always)]
+    fn eq(self, a: __m512, b: __m512) -> __mmask16 {
+        unsafe { z_cmp::<_CMP_EQ_OQ>(a, b) }
+    }
+    #[inline(always)]
     fn gt(self, a: __m512, b: __m512) -> __mmask16 {
         unsafe { z_cmp::<_CMP_GT_OQ>(a, b) }
     }
@@ -1059,6 +1063,10 @@ impl Backend<f64> for Avx512 {
         unsafe { zd_cmp::<_CMP_GE_OQ>(a, b) }
     }
     #[inline(always)]
+    fn eq(self, a: __m512d, b: __m512d) -> __mmask8 {
+        unsafe { zd_cmp::<_CMP_EQ_OQ>(a, b) }
+    }
+    #[inline(always)]
     fn gt(self, a: __m512d, b: __m512d) -> __mmask8 {
         unsafe { zd_cmp::<_CMP_GT_OQ>(a, b) }
     }
@@ -1309,6 +1317,10 @@ mod bf16_impl {
             unsafe { z_cmp::<_CMP_GE_OQ>(a, b) }
         }
         #[inline(always)]
+        fn eq(self, a: __m512, b: __m512) -> __mmask16 {
+            unsafe { z_cmp::<_CMP_EQ_OQ>(a, b) }
+        }
+        #[inline(always)]
         fn gt(self, a: __m512, b: __m512) -> __mmask16 {
             unsafe { z_cmp::<_CMP_GT_OQ>(a, b) }
         }
@@ -1463,6 +1475,10 @@ mod f16_impl {
         #[inline(always)]
         fn ge(self, a: __m512, b: __m512) -> __mmask16 {
             unsafe { z_cmp::<_CMP_GE_OQ>(a, b) }
+        }
+        #[inline(always)]
+        fn eq(self, a: __m512, b: __m512) -> __mmask16 {
+            unsafe { z_cmp::<_CMP_EQ_OQ>(a, b) }
         }
         #[inline(always)]
         fn gt(self, a: __m512, b: __m512) -> __mmask16 {

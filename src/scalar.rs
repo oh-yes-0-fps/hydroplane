@@ -57,12 +57,16 @@ pub(crate) fn round_ties_even_f64(x: f64) -> f64 {
     }
 }
 
-/// Scalar `sqrt`. `std` lowers `x.sqrt()` to the hardware instruction; without `std` we reach the
-/// same instruction through [`hw_sqrt_f32`] on x86-64/aarch64, then `libm`, then as a last resort
-/// a software Newton loop.
+/// Scalar `sqrt`. SPIR-V uses GLSL.std.450 `Sqrt`; `std` lowers `x.sqrt()` to the hardware
+/// instruction; without `std` we reach the same instruction through [`hw_sqrt_f32`] on
+/// x86-64/aarch64, then `libm`, then as a last resort a software Newton loop.
 #[inline(always)]
 fn sqrt_f32(x: f32) -> f32 {
-    #[cfg(feature = "std")]
+    #[cfg(target_arch = "spirv")]
+    {
+        crate::backend::subgroup::device::gpu_sqrt(x)
+    }
+    #[cfg(all(not(target_arch = "spirv"), feature = "std"))]
     {
         x.sqrt()
     }
@@ -72,7 +76,7 @@ fn sqrt_f32(x: f32) -> f32 {
     }
     #[cfg(all(
         not(feature = "std"),
-        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "spirv")),
         feature = "libm"
     ))]
     {
@@ -80,7 +84,7 @@ fn sqrt_f32(x: f32) -> f32 {
     }
     #[cfg(all(
         not(feature = "std"),
-        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "spirv")),
         not(feature = "libm")
     ))]
     {
@@ -90,7 +94,11 @@ fn sqrt_f32(x: f32) -> f32 {
 
 #[inline(always)]
 fn sqrt_f64(x: f64) -> f64 {
-    #[cfg(feature = "std")]
+    #[cfg(target_arch = "spirv")]
+    {
+        crate::backend::subgroup::device::gpu_sqrt(x)
+    }
+    #[cfg(all(not(target_arch = "spirv"), feature = "std"))]
     {
         x.sqrt()
     }
@@ -100,7 +108,7 @@ fn sqrt_f64(x: f64) -> f64 {
     }
     #[cfg(all(
         not(feature = "std"),
-        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "spirv")),
         feature = "libm"
     ))]
     {
@@ -108,7 +116,7 @@ fn sqrt_f64(x: f64) -> f64 {
     }
     #[cfg(all(
         not(feature = "std"),
-        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "spirv")),
         not(feature = "libm")
     ))]
     {
@@ -116,11 +124,10 @@ fn sqrt_f64(x: f64) -> f64 {
     }
 }
 
-// Newton fallback for no-`std`, no-`libm` targets without hardware sqrt (the SPIR-V backend
-// lowers `sqrt` via spirv-std and never reaches here). `NaN` for negatives; `0`/`inf` pass through.
+// Newton fallback for no-`std`, no-`libm` targets without hardware sqrt. `NaN` for negatives; `0`/`inf` pass through.
 #[cfg(all(
     not(feature = "std"),
-    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "spirv")),
     not(feature = "libm")
 ))]
 #[inline]
@@ -142,7 +149,7 @@ fn software_sqrt_f32(x: f32) -> f32 {
 
 #[cfg(all(
     not(feature = "std"),
-    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "spirv")),
     not(feature = "libm")
 ))]
 #[inline]
@@ -214,6 +221,63 @@ pub trait Scalar:
     fn abs(self) -> Self;
     /// Family-correct negation: IEEE sign flip for floats, wrapping for integers.
     fn neg(self) -> Self;
+
+    /// The SPIR-V scalar this element is held as inside a cooperative matrix. Differs from
+    /// `Self` only for `f16`, whose Rust type is a `u16` newtype but whose matrix component must
+    /// be a real 16-bit float.
+    #[cfg(target_arch = "spirv")]
+    #[doc(hidden)]
+    type Spirv: Copy;
+    #[cfg(target_arch = "spirv")]
+    #[doc(hidden)]
+    fn to_spirv(self) -> Self::Spirv;
+    #[cfg(target_arch = "spirv")]
+    #[doc(hidden)]
+    fn from_spirv(v: Self::Spirv) -> Self;
+}
+
+/// IEEE half bits to `f32`, exactly: move the exponent and mantissa into place and rebias, then
+/// fix up Inf/NaN (all-ones exponent) and zero/subnormals (renormalized through a float
+/// subtraction). Fabian Giesen's branch-light conversion; the branches become selects.
+#[allow(dead_code)]
+#[inline(always)]
+pub(crate) fn f16_bits_to_f32(h: u16) -> f32 {
+    const MAGIC: f32 = f32::from_bits(113 << 23);
+    const SHIFTED_EXP: u32 = 0x7c00 << 13;
+    let mut o = ((h & 0x7fff) as u32) << 13;
+    let exp = SHIFTED_EXP & o;
+    o += (127 - 15) << 23;
+    if exp == SHIFTED_EXP {
+        o += (128 - 16) << 23;
+    }
+    let f = if exp == 0 {
+        f32::from_bits(o + (1 << 23)) - MAGIC
+    } else {
+        f32::from_bits(o)
+    };
+    f32::from_bits(f.to_bits() | (((h & 0x8000) as u32) << 16))
+}
+
+/// The primitive 16-bit float, named here where `half::f16` does not shadow it.
+#[cfg(target_arch = "spirv")]
+type PrimitiveF16 = f16;
+
+/// `Scalar::Spirv` and its conversions for an element held as itself.
+macro_rules! spirv_identity {
+    () => {
+        #[cfg(target_arch = "spirv")]
+        type Spirv = Self;
+        #[cfg(target_arch = "spirv")]
+        #[inline(always)]
+        fn to_spirv(self) -> Self {
+            self
+        }
+        #[cfg(target_arch = "spirv")]
+        #[inline(always)]
+        fn from_spirv(v: Self) -> Self {
+            v
+        }
+    };
 }
 
 /// A float element: everything in [`Scalar`], plus IEEE classification/constants (via
@@ -252,6 +316,7 @@ macro_rules! impl_float_core_scalar {
         fn wadd(self, o: Self) -> Self {
             self + o
         }
+
         #[inline(always)]
         fn wsub(self, o: Self) -> Self {
             self - o
@@ -317,6 +382,7 @@ impl Scalar for f32 {
         f32::from_bits(v)
     }
     impl_float_core_scalar!(f32);
+    spirv_identity!();
 }
 
 impl FloatScalar for f32 {
@@ -332,6 +398,11 @@ impl FloatScalar for f32 {
     #[inline(always)]
     fn sqrt(self) -> Self {
         sqrt_f32(self)
+    }
+    #[cfg(target_arch = "spirv")]
+    #[inline(always)]
+    fn fma(self, b: Self, c: Self) -> Self {
+        crate::backend::subgroup::device::gpu_fma(self, b, c)
     }
 }
 
@@ -356,6 +427,7 @@ impl Scalar for f64 {
         f64::from_bits(v as u64)
     }
     impl_float_core_scalar!(f64);
+    spirv_identity!();
 }
 
 impl FloatScalar for f64 {
@@ -371,6 +443,11 @@ impl FloatScalar for f64 {
     #[inline(always)]
     fn sqrt(self) -> Self {
         sqrt_f64(self)
+    }
+    #[cfg(target_arch = "spirv")]
+    #[inline(always)]
+    fn fma(self, b: Self, c: Self) -> Self {
+        crate::backend::subgroup::device::gpu_fma(self, b, c)
     }
 }
 
@@ -425,6 +502,7 @@ macro_rules! impl_int_scalar {
             fn neg(self) -> Self {
                 self.wrapping_neg()
             }
+            spirv_identity!();
         }
 
         impl IntScalar for $ty {}
@@ -439,7 +517,7 @@ mod half_impls {
     use half::{bf16, f16};
 
     macro_rules! impl_half {
-        ($ty:ident, $bits:expr) => {
+        ($ty:ident, $bits:expr, $spirv:ty) => {
             impl Scalar for $ty {
                 const ZERO: Self = $ty::from_f32_const(0.0);
                 const ONE: Self = $ty::from_f32_const(1.0);
@@ -504,6 +582,18 @@ mod half_impls {
                 fn neg(self) -> Self {
                     -self
                 }
+                #[cfg(target_arch = "spirv")]
+                type Spirv = $spirv;
+                #[cfg(target_arch = "spirv")]
+                #[inline(always)]
+                fn to_spirv(self) -> $spirv {
+                    <$spirv>::from_bits(self.to_bits())
+                }
+                #[cfg(target_arch = "spirv")]
+                #[inline(always)]
+                fn from_spirv(v: $spirv) -> Self {
+                    $ty::from_bits(v.to_bits())
+                }
             }
 
             // Math happens in f32: most targets have no native f16/bf16 ALU. Storage stays
@@ -512,10 +602,33 @@ mod half_impls {
                 type Compute = f32;
                 #[inline(always)]
                 fn widen(self) -> f32 {
-                    self.to_f32()
+                    #[cfg(target_arch = "spirv")]
+                    {
+                        GpuConvert::widen_gpu(self)
+                    }
+                    #[cfg(all(
+                        any(target_arch = "x86", target_arch = "x86_64"),
+                        not(target_feature = "f16c")
+                    ))]
+                    {
+                        FastWiden::widen_fast(self)
+                    }
+                    #[cfg(not(any(
+                        target_arch = "spirv",
+                        all(
+                            any(target_arch = "x86", target_arch = "x86_64"),
+                            not(target_feature = "f16c")
+                        )
+                    )))]
+                    {
+                        self.to_f32()
+                    }
                 }
                 #[inline(always)]
                 fn narrow(c: f32) -> Self {
+                    #[cfg(target_arch = "spirv")]
+                    return GpuConvert::narrow_gpu(c);
+                    #[cfg(not(target_arch = "spirv"))]
                     $ty::from_f32(c)
                 }
                 #[inline(always)]
@@ -526,8 +639,75 @@ mod half_impls {
         };
     }
 
-    impl_half!(f16, 4);
-    impl_half!(bf16, 8);
+    /// `f16 → f32` where `half` would fall back to its branchy software conversion (x86 without
+    /// F16C at compile time): exact, a handful of integer ops, and vectorizable, so widening a
+    /// tile costs a fraction of multiplying it. bf16 widens by a shift either way.
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        not(target_feature = "f16c")
+    ))]
+    trait FastWiden {
+        fn widen_fast(self) -> f32;
+    }
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        not(target_feature = "f16c")
+    ))]
+    impl FastWiden for f16 {
+        #[inline(always)]
+        fn widen_fast(self) -> f32 {
+            super::f16_bits_to_f32(self.to_bits())
+        }
+    }
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        not(target_feature = "f16c")
+    ))]
+    impl FastWiden for bf16 {
+        #[inline(always)]
+        fn widen_fast(self) -> f32 {
+            self.to_f32()
+        }
+    }
+
+    /// The `f32` conversions on the GPU. `half`'s have no SPIR-V intrinsic and fall back to bit
+    /// manipulation; `f16` converts with GLSL.std.450 `UnpackHalf2x16` / `PackHalf2x16`, which
+    /// need no `Float16` capability.
+    #[cfg(target_arch = "spirv")]
+    trait GpuConvert {
+        fn widen_gpu(self) -> f32;
+        fn narrow_gpu(c: f32) -> Self;
+    }
+    #[cfg(target_arch = "spirv")]
+    impl GpuConvert for f16 {
+        #[inline(always)]
+        fn widen_gpu(self) -> f32 {
+            spirv_std::float::f16_to_f32(self.to_bits() as u32)
+        }
+        #[inline(always)]
+        fn narrow_gpu(c: f32) -> Self {
+            f16::from_bits(spirv_std::float::f32_to_f16(c) as u16)
+        }
+    }
+    #[cfg(target_arch = "spirv")]
+    impl GpuConvert for bf16 {
+        #[inline(always)]
+        fn widen_gpu(self) -> f32 {
+            self.to_f32()
+        }
+        #[inline(always)]
+        fn narrow_gpu(c: f32) -> Self {
+            bf16::from_f32(c)
+        }
+    }
+
+    // bf16 has no SPIR-V float form rust-gpu can emit (`SPV_KHR_bfloat16`), so it stays a
+    // 16-bit integer component.
+    #[cfg(target_arch = "spirv")]
+    impl_half!(f16, 4, super::PrimitiveF16);
+    #[cfg(not(target_arch = "spirv"))]
+    impl_half!(f16, 4, ());
+    impl_half!(bf16, 8, bf16);
 }
 
 #[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -550,6 +730,22 @@ mod hw_sqrt_tests {
         assert!(super::hw_sqrt_f64(-1.0).is_nan());
         assert_eq!(super::hw_sqrt_f32(-0.0).to_bits(), (-0.0f32).to_bits());
         assert_eq!(super::hw_sqrt_f64(-0.0).to_bits(), (-0.0f64).to_bits());
+    }
+}
+
+#[cfg(test)]
+mod f16_widen_tests {
+    #[test]
+    fn matches_half_for_every_value() {
+        for bits in 0..=u16::MAX {
+            let want = half::f16::from_bits(bits).to_f32();
+            let got = super::f16_bits_to_f32(bits);
+            if want.is_nan() {
+                assert!(got.is_nan(), "{bits:#06x}");
+            } else {
+                assert_eq!(got.to_bits(), want.to_bits(), "{bits:#06x}");
+            }
+        }
     }
 }
 

@@ -196,7 +196,7 @@ pub trait RayLeaves {
 }
 
 impl<F: FnMut(Range<usize>, f32) -> Option<f32>> RayLeaves for F {
-    #[inline]
+    #[inline(always)]
     fn hit<S: BackendAll + Backend<f32>>(
         &mut self,
         _: Gang<S>,
@@ -221,7 +221,7 @@ pub trait NearestLeaves {
 }
 
 impl<F: FnMut(Range<usize>, f32) -> Option<f32>> NearestLeaves for F {
-    #[inline]
+    #[inline(always)]
     fn nearest<S: BackendAll + Backend<f32>>(
         &mut self,
         _: Gang<S>,
@@ -244,7 +244,7 @@ pub trait OverlapLeaves {
 }
 
 impl<F: FnMut(Range<usize>) -> ControlFlow<()>> OverlapLeaves for F {
-    #[inline]
+    #[inline(always)]
     fn visit<S: BackendAll + Backend<f32>>(
         &mut self,
         _: Gang<S>,

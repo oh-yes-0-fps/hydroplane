@@ -14,6 +14,6 @@ fn dot<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
 let s = dot(&a, &b); // runtime ISA dispatch
 ```
 
-Attribute options: `scalar = U` (pin the element type), `tiny` / `noalias` (inlining vs aliasing boundary), and `unroll = N`. With [hydroplane-auto](https://crates.io/crates/hydroplane-auto) wired into the consumer's `build.rs`, these are chosen per kernel from build-time MIR metrics instead of defaults.
+Attribute options: `scalar = U` (pin the element type), and `unroll = N` (`tiny` / `noalias` are accepted but no longer change the generated code). With [hydroplane-auto](https://crates.io/crates/hydroplane-auto) wired into the consumer's `build.rs`, the dispatched element types are taken from build-time MIR metrics.
 
 Use through the `hydroplane` crate, which re-exports the macro as `hydroplane::kernel`; this crate is not intended to be depended on directly.

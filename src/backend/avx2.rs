@@ -281,6 +281,10 @@ impl Backend<f32> for Avx2 {
         unsafe { f32_cmp::<_CMP_GE_OQ>(a, b) }
     }
     #[inline(always)]
+    fn eq(self, a: __m256, b: __m256) -> __m256 {
+        unsafe { f32_cmp::<_CMP_EQ_OQ>(a, b) }
+    }
+    #[inline(always)]
     fn gt(self, a: __m256, b: __m256) -> __m256 {
         unsafe { f32_cmp::<_CMP_GT_OQ>(a, b) }
     }
@@ -1084,6 +1088,10 @@ impl Backend<f64> for Avx2 {
         unsafe { f64_cmp::<_CMP_GE_OQ>(a, b) }
     }
     #[inline(always)]
+    fn eq(self, a: __m256d, b: __m256d) -> __m256d {
+        unsafe { f64_cmp::<_CMP_EQ_OQ>(a, b) }
+    }
+    #[inline(always)]
     fn gt(self, a: __m256d, b: __m256d) -> __m256d {
         unsafe { f64_cmp::<_CMP_GT_OQ>(a, b) }
     }
@@ -1353,6 +1361,10 @@ mod f16_impl {
             unsafe { f32_cmp::<_CMP_GE_OQ>(a, b) }
         }
         #[inline(always)]
+        fn eq(self, a: __m256, b: __m256) -> __m256 {
+            unsafe { f32_cmp::<_CMP_EQ_OQ>(a, b) }
+        }
+        #[inline(always)]
         fn gt(self, a: __m256, b: __m256) -> __m256 {
             unsafe { f32_cmp::<_CMP_GT_OQ>(a, b) }
         }
@@ -1526,6 +1538,10 @@ mod bf16_impl {
         #[inline(always)]
         fn ge(self, a: __m256, b: __m256) -> __m256 {
             unsafe { f32_cmp::<_CMP_GE_OQ>(a, b) }
+        }
+        #[inline(always)]
+        fn eq(self, a: __m256, b: __m256) -> __m256 {
+            unsafe { f32_cmp::<_CMP_EQ_OQ>(a, b) }
         }
         #[inline(always)]
         fn gt(self, a: __m256, b: __m256) -> __m256 {

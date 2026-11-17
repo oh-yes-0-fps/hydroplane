@@ -15,8 +15,12 @@
 //! becomes a struct field carried across the dispatch boundary, so borrows need explicit
 //! lifetimes. The dispatch element is the generic bound by `Scalar`/`FloatScalar`/`IntScalar` (or
 //! the one named `T`), inferred for concrete kernels; attribute overrides: `scalar = U`, extra
-//! element names (OR'd into the dispatch type-combo), `tiny`/`noalias` (mutually exclusive), and
-//! `unroll = N` — the manual knobs over what the `hydroplane-auto` build-time analysis picks.
+//! element names (OR'd into the dispatch type-combo), and `unroll = N`, which caps the ILP unroll
+//! factor for this kernel. `tiny` and `noalias` are still accepted but no
+//! longer change the generated code: the body always runs in an inlined `_on`.
+//!
+//! Inside the body, `a * b + c` and `c + a * b` on varyings compile to a fused multiply-add, as
+//! `.fma` would; on anything else they stay the two operators.
 
 use hydroplane_auto::analysis;
 
@@ -52,12 +56,13 @@ struct KernelOpts {
     /// work too).
     matrix: bool,
     scalar: Option<Ident>,
-    /// Run the body in `_on`, whose slice parameters are `noalias`. On by default; `tiny` turns it off.
+    /// Whether the build-time analysis measures this kernel (its body is the `_on` companion);
+    /// `tiny` turns it off.
     noalias: bool,
     /// `tiny` or `noalias` was written explicitly; build-time analysis must not override it.
     explicit_boundary: bool,
-    /// Explicit ILP unroll cap, overriding the build-time estimate. Escape hatch for kernels whose
-    /// register pressure the analysis under-counts (e.g. varyings kept in a combinator closure).
+    /// Explicit ILP unroll cap. The combinators already fit their chains to the accumulator's
+    /// registers; this is for steps that keep many other varyings live.
     unroll: Option<usize>,
     /// Element names listed in the attribute (`#[kernel(u32, f32)]`): OR'd into the type-combo
     /// bitmask unconditionally, even over MIR-measured sets. The first listed doubles as the
@@ -165,8 +170,9 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         attrs,
         vis,
         sig,
-        block,
+        mut block,
     } = func;
+    syn::visit_mut::VisitMut::visit_block_mut(&mut FuseMulAdd, &mut block);
 
     if let Some(a) = sig.asyncness {
         return Err(syn::Error::new_spanned(a, "a kernel cannot be `async`"));
@@ -361,7 +367,7 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         Some(m) if !opts.explicit_boundary => m.noalias(),
         _ => opts.noalias,
     };
-    let k_cap = opts.unroll.or_else(|| metrics.map(|m| m.k_cap()));
+    let k_cap = opts.unroll;
 
     // Under the default `noalias` boundary the real body lives in `_on`, which is what the analysis
     // driver measures; explicit-`tiny` and matrix kernels aren't measured. The metrics attribute is
@@ -775,4 +781,67 @@ fn detect_scalar(generics: &Generics) -> syn::Result<Option<Ident>> {
     }
 
     Ok(scalar_bound.or(named_t))
+}
+
+/// Rewrites `a * b + c` and `c + a * b` in a kernel body into a `::hydroplane::__fuse` call,
+/// which is a fused multiply-add when the operands are varyings and the same two operators
+/// otherwise, so kernels written with plain operators get the FMA throughput of `.fma`.
+/// Operands keep their evaluation order. Constant contexts (types, array lengths, `const`
+/// items and blocks, generic arguments, patterns) are left alone, since the rewrite is a
+/// method call.
+struct FuseMulAdd;
+
+fn peel(e: &syn::Expr) -> &syn::Expr {
+    match e {
+        syn::Expr::Paren(p) => peel(&p.expr),
+        _ => e,
+    }
+}
+
+fn as_mul(e: &syn::Expr) -> Option<(syn::Expr, syn::Expr)> {
+    match peel(e) {
+        syn::Expr::Binary(b) if matches!(b.op, syn::BinOp::Mul(_)) => Some((peel(&b.left).clone(), peel(&b.right).clone())),
+        _ => None,
+    }
+}
+
+impl syn::visit_mut::VisitMut for FuseMulAdd {
+    fn visit_expr_mut(&mut self, e: &mut syn::Expr) {
+        match e {
+            syn::Expr::Const(_) => return,
+            syn::Expr::Repeat(r) => {
+                self.visit_expr_mut(&mut r.expr);
+                return;
+            }
+            _ => {}
+        }
+        syn::visit_mut::visit_expr_mut(self, e);
+        let syn::Expr::Binary(b) = e else { return };
+        if !matches!(b.op, syn::BinOp::Add(_)) {
+            return;
+        }
+        let (x, y, c, c_first) = if let Some((x, y)) = as_mul(&b.right) {
+            (x, y, peel(&b.left).clone(), true)
+        } else if let Some((x, y)) = as_mul(&b.left) {
+            (x, y, peel(&b.right).clone(), false)
+        } else {
+            return;
+        };
+        let bind = if c_first {
+            quote! { let __hp_c = #c; let __hp_a = #x; let __hp_b = #y; }
+        } else {
+            quote! { let __hp_a = #x; let __hp_b = #y; let __hp_c = #c; }
+        };
+        *e = syn::parse_quote!({
+            #[allow(unused_imports)]
+            use ::hydroplane::__fuse::{ViaFma as _, ViaOps as _};
+            #bind
+            (&::hydroplane::__fuse::Fuse::new(__hp_a, __hp_b, __hp_c)).__hp_fuse()
+        });
+    }
+    fn visit_type_mut(&mut self, _: &mut syn::Type) {}
+    fn visit_pat_mut(&mut self, _: &mut syn::Pat) {}
+    fn visit_generic_argument_mut(&mut self, _: &mut syn::GenericArgument) {}
+    fn visit_item_const_mut(&mut self, _: &mut syn::ItemConst) {}
+    fn visit_item_static_mut(&mut self, _: &mut syn::ItemStatic) {}
 }

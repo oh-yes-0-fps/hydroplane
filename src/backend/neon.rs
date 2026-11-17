@@ -56,6 +56,38 @@ impl Backend<f32> for Neon {
         Some(out)
     }
     #[inline(always)]
+    fn load_first(self, s: &[f32], fill: f32) -> float32x4_t {
+        let p = s.as_ptr();
+        // SAFETY: each arm reads exactly the `s.len()` elements of `s`.
+        unsafe {
+            let f = vdup_n_f32(fill);
+            match s.len() {
+                0 => vdupq_n_f32(fill),
+                1 => vcombine_f32(vld1_lane_f32::<0>(p, f), f),
+                2 => vcombine_f32(vld1_f32(p), f),
+                3 => vcombine_f32(vld1_f32(p), vld1_lane_f32::<0>(p.add(2), f)),
+                _ => vld1q_f32(p),
+            }
+        }
+    }
+    #[inline(always)]
+    fn store_first(self, v: float32x4_t, s: &mut [f32]) {
+        let p = s.as_mut_ptr();
+        // SAFETY: each arm writes exactly the `s.len()` elements of `s`.
+        unsafe {
+            match s.len() {
+                0 => {}
+                1 => vst1q_lane_f32::<0>(p, v),
+                2 => vst1_f32(p, vget_low_f32(v)),
+                3 => {
+                    vst1_f32(p, vget_low_f32(v));
+                    vst1q_lane_f32::<2>(p.add(2), v);
+                }
+                _ => vst1q_f32(p, v),
+            }
+        }
+    }
+    #[inline(always)]
     fn mask_first(self, cnt: usize) -> uint32x4_t {
         unsafe { vcltq_u32(vld1q_u32([0u32, 1, 2, 3].as_ptr()), vdupq_n_u32(cnt as u32)) }
     }
@@ -129,6 +161,10 @@ impl Backend<f32> for Neon {
     #[inline(always)]
     fn ge(self, a: float32x4_t, b: float32x4_t) -> uint32x4_t {
         unsafe { vcgeq_f32(a, b) }
+    }
+    #[inline(always)]
+    fn eq(self, a: float32x4_t, b: float32x4_t) -> uint32x4_t {
+        unsafe { vceqq_f32(a, b) }
     }
     #[inline(always)]
     fn gt(self, a: float32x4_t, b: float32x4_t) -> uint32x4_t {
@@ -521,6 +557,28 @@ impl Backend<f64> for Neon {
         Some(out)
     }
     #[inline(always)]
+    fn load_first(self, s: &[f64], fill: f64) -> float64x2_t {
+        // SAFETY: each arm reads exactly the `s.len()` elements of `s`.
+        unsafe {
+            match s.len() {
+                0 => vdupq_n_f64(fill),
+                1 => vld1q_lane_f64::<0>(s.as_ptr(), vdupq_n_f64(fill)),
+                _ => vld1q_f64(s.as_ptr()),
+            }
+        }
+    }
+    #[inline(always)]
+    fn store_first(self, v: float64x2_t, s: &mut [f64]) {
+        // SAFETY: each arm writes exactly the `s.len()` elements of `s`.
+        unsafe {
+            match s.len() {
+                0 => {}
+                1 => vst1q_lane_f64::<0>(s.as_mut_ptr(), v),
+                _ => vst1q_f64(s.as_mut_ptr(), v),
+            }
+        }
+    }
+    #[inline(always)]
     fn mask_first(self, cnt: usize) -> uint64x2_t {
         unsafe { vcltq_u64(vld1q_u64([0u64, 1].as_ptr()), vdupq_n_u64(cnt as u64)) }
     }
@@ -593,6 +651,10 @@ impl Backend<f64> for Neon {
     #[inline(always)]
     fn ge(self, a: float64x2_t, b: float64x2_t) -> uint64x2_t {
         unsafe { vcgeq_f64(a, b) }
+    }
+    #[inline(always)]
+    fn eq(self, a: float64x2_t, b: float64x2_t) -> uint64x2_t {
+        unsafe { vceqq_f64(a, b) }
     }
     #[inline(always)]
     fn gt(self, a: float64x2_t, b: float64x2_t) -> uint64x2_t {
@@ -750,6 +812,10 @@ mod bf16_impl {
         #[inline(always)]
         fn ge(self, a: float32x4_t, b: float32x4_t) -> uint32x4_t {
             unsafe { vcgeq_f32(a, b) }
+        }
+        #[inline(always)]
+        fn eq(self, a: float32x4_t, b: float32x4_t) -> uint32x4_t {
+            unsafe { vceqq_f32(a, b) }
         }
         #[inline(always)]
         fn gt(self, a: float32x4_t, b: float32x4_t) -> uint32x4_t {

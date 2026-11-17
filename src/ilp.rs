@@ -10,17 +10,22 @@ mod imp {
 
     static UNROLL: AtomicU8 = AtomicU8::new(0);
 
-    /// `0` means unresolved; once resolved it is one of `{1,2,4,8,12,16}` and immutable for the
+    /// `0` means unresolved; once resolved it is one of `{1,2,4,8,16}` and immutable for the
     /// life of the process.
     #[inline]
     pub(crate) fn cached() -> u8 {
         UNROLL.load(Ordering::Relaxed)
     }
 
-    /// Idempotent: racing threads re-measure the same machine and store the same factor.
+    /// Records `k` unless another thread got there first, and returns the factor that stands.
+    /// Racing sweeps can measure different factors on a loaded machine; the first one recorded
+    /// is the one every thread then uses, so results do not change part way through a process.
     #[inline]
-    pub(crate) fn store(k: u8) {
-        UNROLL.store(k, Ordering::Relaxed);
+    pub(crate) fn store(k: u8) -> u8 {
+        match UNROLL.compare_exchange(0, k, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => k,
+            Err(first) => first,
+        }
     }
 }
 

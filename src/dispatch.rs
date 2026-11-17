@@ -192,17 +192,20 @@ pub trait Kernel<T: Scalar> {
     type Output;
 
     /// Ceiling on the ILP unroll factor for this kernel, `min`'d against the factor the runtime
-    /// sweep resolves for the core. Defaults to [`MAX_UNROLL`](crate::MAX_UNROLL) (no cap). The
-    /// `#[kernel]` macro overrides it from build-time MIR analysis so a register-heavy kernel is
-    /// not unrolled past the point where it spills. Only the runtime dispatch path reads it; the
-    /// build-resolved static path bakes `K` as a const and cannot be per-kernel-capped on stable.
+    /// sweep resolves for the core. Defaults to [`MAX_UNROLL`](crate::MAX_UNROLL) (no cap); the
+    /// reductions already fit their chain count to the accumulator's registers, and
+    /// `#[kernel(unroll = N)]` sets it for a step that keeps many other varyings live. Only the
+    /// runtime dispatch path reads it; the build-resolved static path bakes `K` as a const and
+    /// cannot be per-kernel-capped on stable.
     const K_CAP: usize = crate::MAX_UNROLL;
 
-    /// Mark hand-written impls `#[inline]` (`#[kernel]` does): dispatch runs the body inside a
-    /// function compiled with the backend's target features, and only code inlined into it can
-    /// inline the backend's ops. For the same reason, keep varying math out of closures that are
-    /// called from several places or handed to `[T; N]::map`/`array::from_fn`: such a closure can
-    /// be left out of line, compiled for the baseline ISA, with every op a call.
+    /// Mark hand-written impls `#[inline(always)]`, as `#[kernel]` does, and likewise any helper
+    /// they call that takes a [`Gang`] or [`Varying`](crate::Varying): dispatch runs the body
+    /// inside a function compiled with the backend's target features, and only code inlined into
+    /// it can inline the backend's ops. A plain `#[inline]` is a hint LLVM drops for large bodies,
+    /// leaving them compiled for the baseline ISA with every op a call (a 25× slowdown measured on
+    /// a three-dot kernel). For the same reason, keep varying math out of closures that are called
+    /// from several places or handed to `[T; N]::map`/`array::from_fn`.
     fn run<S: BackendAll + Backend<T>>(self, simd: Gang<S>) -> Self::Output;
 }
 
@@ -230,7 +233,7 @@ struct UnrollSelect<K>(K);
 impl<T: Scalar, K: Kernel<T>> Kernel<T> for UnrollSelect<K> {
     type Output = K::Output;
 
-    #[inline]
+    #[inline(always)]
     #[cfg(all(not(hp_no_ilp), not(target_arch = "spirv"), not(hp_resolved_unroll)))]
     fn run<S: BackendAll + Backend<T>>(self, g: Gang<S>) -> Self::Output {
         use crate::backend::Unroll;
@@ -239,7 +242,6 @@ impl<T: Scalar, K: Kernel<T>> Kernel<T> for UnrollSelect<K> {
             2 => Entered::run(self.0, Unroll::<S, 2>(b)),
             4 => Entered::run(self.0, Unroll::<S, 4>(b)),
             8 => Entered::run(self.0, Unroll::<S, 8>(b)),
-            12 => Entered::run(self.0, Unroll::<S, 12>(b)),
             16 => Entered::run(self.0, Unroll::<S, 16>(b)),
             _ => Entered::run(self.0, Unroll::<S, 1>(b)),
         }
@@ -247,7 +249,7 @@ impl<T: Scalar, K: Kernel<T>> Kernel<T> for UnrollSelect<K> {
 
     /// Build-resolved (`hp_static_dispatch` + pinned cpu): `K` is the constant `build.rs` baked in,
     /// so there is no detection sweep and the kernel monomorphizes for exactly one `Unroll<S, K>`.
-    #[inline]
+    #[inline(always)]
     #[cfg(hp_resolved_unroll)]
     fn run<S: BackendAll + Backend<T>>(self, g: Gang<S>) -> Self::Output {
         use crate::backend::Unroll;
@@ -255,7 +257,7 @@ impl<T: Scalar, K: Kernel<T>> Kernel<T> for UnrollSelect<K> {
     }
 
     /// ILP compiled out: no factor to resolve, run the kernel on the raw backend.
-    #[inline]
+    #[inline(always)]
     #[cfg(any(hp_no_ilp, target_arch = "spirv"))]
     fn run<S: BackendAll + Backend<T>>(self, g: Gang<S>) -> Self::Output {
         Entered::run(self.0, g.backend())
@@ -471,7 +473,7 @@ pub fn combo_tier(combo: u8) -> u8 {
 /// Run a kernel on an explicit backend with the standard unroll-factor resolution; the arm body
 /// the `#[kernel]` combo-dispatch match uses.
 #[doc(hidden)]
-#[inline]
+#[inline(always)]
 pub fn run_kernel_on<T: Scalar, K: Kernel<T>, S: BackendAll + Backend<T>>(
     kernel: K,
     backend: S,

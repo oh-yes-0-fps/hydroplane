@@ -15,6 +15,26 @@ pub struct Band {
     band: Vec<f64>,
 }
 
+/// `Σ row[len − 1 − t] · s[t]`, over four partial sums so the multiply-adds overlap.
+#[inline]
+fn reversed_dot(row: &[f64], s: &[f64]) -> f64 {
+    debug_assert_eq!(row.len(), s.len());
+    let mut acc = [0.0f64; 4];
+    let mut t = 0;
+    for (r, sv) in row.as_rchunks::<4>().1.iter().rev().zip(s.as_chunks::<4>().0) {
+        acc[0] += r[3] * sv[0];
+        acc[1] += r[2] * sv[1];
+        acc[2] += r[1] * sv[2];
+        acc[3] += r[0] * sv[3];
+        t += 4;
+    }
+    let mut tail = 0.0;
+    for k in t..s.len() {
+        tail += row[row.len() - 1 - k] * s[k];
+    }
+    (acc[0] + acc[2]) + (acc[1] + acc[3]) + tail
+}
+
 impl Band {
     pub fn zeros(n: usize, w: usize) -> Self {
         Self { n, w, band: vec![0.0; n * (w + 1)] }
@@ -128,11 +148,17 @@ impl BandedLdlt {
             }
             band[j * stride] = d;
             for i in j + 1..(j + w + 1).min(n) {
+                // Only columns `k ≥ i − w` are inside row `i`'s band; they are its entries at
+                // offsets `i − k`, adjacent and descending as `k` rises.
+                let lo = first.max(i.saturating_sub(w));
                 let mut v = band[i * stride + (i - j)];
-                for (s, k) in scaled.iter().zip(first..j) {
-                    if i - k <= w {
-                        v -= band[i * stride + (i - k)] * s;
+                if j - lo < 8 {
+                    for k in lo..j {
+                        v -= band[i * stride + (i - k)] * scaled[k - first];
                     }
+                } else {
+                    let row = &band[i * stride + (i - j + 1)..=i * stride + (i - lo)];
+                    v -= reversed_dot(row, &scaled[lo - first..j - first]);
                 }
                 band[i * stride + (i - j)] = v / d;
             }
@@ -214,7 +240,7 @@ mod tests {
 
     #[test]
     fn positive_definite_bands_solve() {
-        for w in [1, 3, 8] {
+        for w in [1, 3, 8, 13, 37] {
             let a = chain(500, w, 0.1);
             let f = BandedLdlt::positive_definite(a.clone()).unwrap();
             assert!(check(&a, &f) < 1e-12, "w {w}");

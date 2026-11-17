@@ -42,14 +42,55 @@ pub use minres::Minres;
 /// added in a fixed order.
 const BLOCK: usize = 2048;
 
+/// Elements below which a vector operation stays on the calling thread. Handing rayon even one
+/// unsplit task from outside its pool costs microseconds, more than the whole operation on a
+/// few thousand elements (a 4096-element `dot` took 5-20 us through the pool against under one
+/// on the caller). Reductions add their block sums in the same order either way.
+pub(crate) const PAR_MIN: usize = 1 << 15;
+
 /// `Σ f(i)` for `i < n` in blocks of 2048, the blocks' sums added in order: the same
 /// result for any thread count.
 pub fn sum_blocks(n: usize, f: impl Fn(usize) -> f64 + Sync) -> f64 {
-    if n <= BLOCK {
-        return (0..n).map(f).sum();
+    let block = |b: usize| sum8(b * BLOCK, ((b + 1) * BLOCK).min(n), &f);
+    if n < PAR_MIN {
+        return (0..n.div_ceil(BLOCK)).map(block).sum();
     }
-    let partial: Vec<f64> = (0..n.div_ceil(BLOCK)).into_par_iter().map(|b| (b * BLOCK..((b + 1) * BLOCK).min(n)).map(&f).sum::<f64>()).collect();
+    let partial: Vec<f64> = (0..n.div_ceil(BLOCK)).into_par_iter().map(block).collect();
     partial.iter().sum()
+}
+
+/// `Σ f(i)` for `i` in `start..end` over eight independent sums, combined in a fixed order: a
+/// single running sum waits out the add latency on every term, and the compiler may not split
+/// it itself.
+#[inline]
+fn sum8(start: usize, end: usize, f: impl Fn(usize) -> f64) -> f64 {
+    let mut acc = [0.0f64; 8];
+    let mut i = start;
+    while i + 8 <= end {
+        for (k, a) in acc.iter_mut().enumerate() {
+            *a += f(i + k);
+        }
+        i += 8;
+    }
+    let mut tail = 0.0;
+    for j in i..end {
+        tail += f(j);
+    }
+    ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7])) + tail
+}
+
+#[hydroplane::kernel]
+fn dot_f64<'a>(ctx: hydroplane::Gang, a: &'a [f64], b: &'a [f64]) -> f64 {
+    ctx.dot(a, b)
+}
+
+/// The `f64` components of a slice of elements made of nothing else.
+#[inline]
+fn f64_components<E: Element>(a: &[E]) -> &[f64] {
+    assert_eq!(size_of::<E>(), E::LANES * size_of::<f64>());
+    // SAFETY: callers pass element types that are `E::LANES` contiguous `f64`s (`f64`, `[f64; N]`,
+    // `DVec3`), which the size check above backs up.
+    unsafe { core::slice::from_raw_parts(a.as_ptr().cast::<f64>(), a.len() * E::LANES) }
 }
 
 /// A vector entry: a scalar, or a node's few components ([`Self::LANES`]).
@@ -64,11 +105,29 @@ pub trait Element: Copy + Send + Sync + 'static {
     fn axpy(y: &mut Self, a: f64, x: &Self);
     /// `y = x + a y`.
     fn xpay(y: &mut Self, x: &Self, a: f64);
+    /// `Σ a[i] · b[i]` over one block, in `f64` (`a` and `b` the same length).
+    #[inline]
+    fn dot_block(a: &[Self], b: &[Self]) -> f64 {
+        sum8(0, a.len(), |i| Self::dot(&a[i], &b[i]))
+    }
 }
 
 macro_rules! scalar {
     ($t:ty) => {
+        scalar!($t, {});
+    };
+    // Elements made of `f64`s reduce through hydroplane's vector `dot`.
+    ($t:ty, simd) => {
+        scalar!($t, {
+            #[inline]
+            fn dot_block(a: &[Self], b: &[Self]) -> f64 {
+                dot_f64(f64_components(a), f64_components(b))
+            }
+        });
+    };
+    ($t:ty, { $($dot_block:item)? }) => {
         impl Element for $t {
+            $($dot_block)?
             const LANES: usize = 1;
             const ZERO: Self = 0.0;
             #[inline]
@@ -94,6 +153,7 @@ macro_rules! scalar {
         }
 
         impl<const N: usize> Element for [$t; N] {
+            $($dot_block)?
             const LANES: usize = N;
             const ZERO: Self = [0.0; N];
             #[inline]
@@ -124,7 +184,7 @@ macro_rules! scalar {
     };
 }
 
-scalar!(f64);
+scalar!(f64, simd);
 scalar!(f32);
 
 #[cfg(feature = "glam")]
@@ -210,27 +270,57 @@ impl<E: Element> Vector for [E] {
     }
 
     fn fill_zero(&mut self) {
-        self.par_iter_mut().with_min_len(BLOCK).for_each(|v| *v = E::ZERO);
+        if self.len() < PAR_MIN {
+            self.fill(E::ZERO);
+        } else {
+            self.par_iter_mut().with_min_len(BLOCK).for_each(|v| *v = E::ZERO);
+        }
     }
 
     fn dot(&self, other: &Self) -> f64 {
-        sum_blocks(self.len(), |i| E::dot(&self[i], &other[i]))
+        let n = self.len();
+        assert_eq!(other.len(), n);
+        let block = |b: usize| {
+            let range = b * BLOCK..((b + 1) * BLOCK).min(n);
+            E::dot_block(&self[range.clone()], &other[range])
+        };
+        if n < PAR_MIN {
+            return (0..n.div_ceil(BLOCK)).map(block).sum();
+        }
+        let partial: Vec<f64> = (0..n.div_ceil(BLOCK)).into_par_iter().map(block).collect();
+        partial.iter().sum()
     }
 
     fn axpy(&mut self, a: f64, x: &Self) {
-        self.par_iter_mut().zip(x).with_min_len(BLOCK).for_each(|(y, x)| E::axpy(y, a, x));
+        let f = |(y, x): (&mut E, &E)| E::axpy(y, a, x);
+        if self.len() < PAR_MIN {
+            self.iter_mut().zip(x).for_each(f);
+        } else {
+            self.par_iter_mut().zip(x).with_min_len(BLOCK).for_each(f);
+        }
     }
 
     fn xpay(&mut self, x: &Self, a: f64) {
-        self.par_iter_mut().zip(x).with_min_len(BLOCK).for_each(|(y, x)| E::xpay(y, x, a));
+        let f = |(y, x): (&mut E, &E)| E::xpay(y, x, a);
+        if self.len() < PAR_MIN {
+            self.iter_mut().zip(x).for_each(f);
+        } else {
+            self.par_iter_mut().zip(x).with_min_len(BLOCK).for_each(f);
+        }
     }
 
     fn scale(&mut self, a: f64) {
-        self.par_iter_mut().with_min_len(BLOCK).for_each(|y| E::xpay(y, &E::ZERO, a));
+        let f = |y: &mut E| E::xpay(y, &E::ZERO, a);
+        if self.len() < PAR_MIN {
+            self.iter_mut().for_each(f);
+        } else {
+            self.par_iter_mut().with_min_len(BLOCK).for_each(f);
+        }
     }
 
     fn all_finite(&self) -> bool {
-        self.par_iter().with_min_len(BLOCK).all(|v| (0..E::LANES).all(|k| v.lane(k).is_finite()))
+        let f = |v: &E| (0..E::LANES).all(|k| v.lane(k).is_finite());
+        if self.len() < PAR_MIN { self.iter().all(f) } else { self.par_iter().with_min_len(BLOCK).all(f) }
     }
 
     fn dots(&self, others: &[&Self], out: &mut [f64]) {
@@ -238,9 +328,10 @@ impl<E: Element> Vector for [E] {
         let block = |b: usize| -> Vec<f64> {
             let range = b * BLOCK..((b + 1) * BLOCK).min(n);
             let mine = &self[range.clone()];
-            others.iter().map(|o| mine.iter().zip(&o[range.clone()]).map(|(a, b)| E::dot(a, b)).sum::<f64>()).collect()
+            others.iter().map(|o| E::dot_block(mine, &o[range.clone()])).collect()
         };
-        let partial: Vec<Vec<f64>> = (0..n.div_ceil(BLOCK)).into_par_iter().map(block).collect();
+        let blocks = 0..n.div_ceil(BLOCK);
+        let partial: Vec<Vec<f64>> = if n < PAR_MIN { blocks.map(block).collect() } else { blocks.into_par_iter().map(block).collect() };
         out[..others.len()].fill(0.0);
         for p in &partial {
             for (o, s) in out.iter_mut().zip(p) {
@@ -250,14 +341,19 @@ impl<E: Element> Vector for [E] {
     }
 
     fn axpys(&mut self, a: &[f64], xs: &[&Self]) {
-        self.par_chunks_mut(BLOCK).enumerate().for_each(|(b, chunk)| {
+        let f = |(b, chunk): (usize, &mut [E])| {
             let range = b * BLOCK..b * BLOCK + chunk.len();
             for (&a, x) in a.iter().zip(xs) {
                 for (y, x) in chunk.iter_mut().zip(&x[range.clone()]) {
                     E::axpy(y, a, x);
                 }
             }
-        });
+        };
+        if self.len() < PAR_MIN {
+            self.chunks_mut(BLOCK).enumerate().for_each(f);
+        } else {
+            self.par_chunks_mut(BLOCK).enumerate().for_each(f);
+        }
     }
 }
 
@@ -335,11 +431,16 @@ impl<E: Element> Preconditioner<[E]> for Jacobi {
     fn apply(&mut self, r: &[E], z: &mut [E]) {
         assert_eq!(self.inverse.len(), r.len() * E::LANES);
         let inv = &self.inverse;
-        z.par_iter_mut().zip(r).enumerate().with_min_len(BLOCK).for_each(|(i, (z, r))| {
+        let f = |(i, (z, r)): (usize, (&mut E, &E))| {
             for k in 0..E::LANES {
                 z.set_lane(k, inv[i * E::LANES + k] * r.lane(k));
             }
-        });
+        };
+        if z.len() < PAR_MIN {
+            z.iter_mut().zip(r).enumerate().for_each(f);
+        } else {
+            z.par_iter_mut().zip(r).enumerate().with_min_len(BLOCK).for_each(f);
+        }
     }
 }
 

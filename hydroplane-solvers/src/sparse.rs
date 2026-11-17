@@ -13,6 +13,9 @@ const C: usize = 8;
 const SIGMA: usize = 256;
 /// Marks a padding slot in [`SellMatrix::src`].
 const PAD: u32 = u32::MAX;
+/// Stored slots below which a product stays on the calling thread: rayon's hand-off costs more
+/// than splitting a product this small saves.
+const PAR_SLOTS: usize = 1 << 16;
 
 /// A square sparse matrix stored for fast `y = A x`. Built once from a sparsity pattern; values
 /// are packed in by [`set_values`](Self::set_values) in the pattern's own storage order, so
@@ -122,12 +125,17 @@ impl SellMatrix {
         assert_eq!(x.len(), self.n, "SellMatrix::spmv: x has the wrong length");
         assert_eq!(y.len(), self.n, "SellMatrix::spmv: y has the wrong length");
         let chunks_per_window = SIGMA / C;
-        y.par_chunks_mut(SIGMA).enumerate().for_each(|(w, yw)| {
+        let window = |(w, yw): (usize, &mut [f64])| {
             let first = w * chunks_per_window;
             let last = (first + chunks_per_window).min(self.chunk_ptr.len() - 1);
             let rows = &self.perm[w * SIGMA..w * SIGMA + yw.len()];
             sell_window(&self.chunk_ptr[first..=last], &self.cols, &self.vals, x, rows, w * SIGMA, yw);
-        });
+        };
+        if self.cols.len() < PAR_SLOTS {
+            y.chunks_mut(SIGMA).enumerate().for_each(window);
+        } else {
+            y.par_chunks_mut(SIGMA).enumerate().for_each(window);
+        }
     }
 
     /// `‖b − A x‖ / ‖b‖` (`‖b − A x‖` when `b = 0`).

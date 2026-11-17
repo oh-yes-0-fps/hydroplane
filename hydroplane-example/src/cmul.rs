@@ -22,7 +22,7 @@ pub fn cmul_hp<'a>(
     outr: &'a mut [f32],
     outi: &'a mut [f32],
 ) {
-    ctx.map_cols::<f32, 4, 2>(
+    ctx.map_cols(
         [ar, ai, br, bi],
         [outr, outi],
         0.0,

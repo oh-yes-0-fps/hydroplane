@@ -1,6 +1,7 @@
 //! Small dense symmetric positive definite systems: the coarse problems of two-level
 //! preconditioners (`WᵀAW` over a handful of rigid-body modes per region).
 
+use hydroplane::dense::{Diag, Mat, MatMut, Side, Trans, Uplo, potrf, trsm};
 use rayon::prelude::*;
 
 use crate::iterative::{Element, LinearOperator, Preconditioner, Vector};
@@ -29,7 +30,15 @@ impl DenseCholesky {
         let trace: f64 = (0..n).map(|i| a[i * n + i]).sum();
         let delta = shift * trace / n.max(1) as f64;
         let floor = f64::EPSILON * (0..n).map(|i| a[i * n + i].abs()).fold(0.0, f64::max).max(f64::MIN_POSITIVE);
-        let mut l = vec![0.0; n * n];
+        let mut l = a.to_vec();
+        for i in 0..n {
+            l[i * n + i] += delta;
+        }
+        // A pivot that `potrf` rejects is rare; the loop below floors it instead of failing.
+        if potrf(Uplo::Lower, MatMut::new(&mut l, n, n)).is_ok() && (0..n).all(|i| l[i * n + i] > floor.sqrt()) {
+            return Self { n, l };
+        }
+        l.fill(0.0);
         for i in 0..n {
             for j in 0..=i {
                 let s: f64 = (0..j).map(|k| l[i * n + k] * l[j * n + k]).sum();
@@ -50,16 +59,14 @@ impl DenseCholesky {
 
     /// `x ← A⁻¹ x`.
     pub fn solve_in_place(&self, x: &mut [f64]) {
-        let (n, l) = (self.n, &self.l);
+        let n = self.n;
         assert_eq!(x.len(), n);
-        for i in 0..n {
-            let s: f64 = (0..i).map(|k| l[i * n + k] * x[k]).sum();
-            x[i] = (x[i] - s) / l[i * n + i];
+        if n == 0 {
+            return;
         }
-        for i in (0..n).rev() {
-            let s: f64 = (i + 1..n).map(|k| l[k * n + i] * x[k]).sum();
-            x[i] = (x[i] - s) / l[i * n + i];
-        }
+        let l = Mat::new(&self.l, n, n);
+        trsm(Side::Left, Uplo::Lower, Trans::N, Diag::NonUnit, 1.0, l, MatMut::new(x, n, 1));
+        trsm(Side::Left, Uplo::Lower, Trans::T, Diag::NonUnit, 1.0, l, MatMut::new(x, n, 1));
     }
 }
 

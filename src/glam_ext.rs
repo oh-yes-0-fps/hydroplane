@@ -7,7 +7,7 @@ use core::ops::{Add, Mul, Sub};
 use glam::{Mat3, Vec3};
 
 use crate::backend::Backend;
-use crate::varying::{Gang, Mask, Varying};
+use crate::varying::{Gang, Mask, Varying, fill_array};
 
 /// A `Vec3` whose three components are each a full register of lanes: the SIMD-wide form of a
 /// glam [`Vec3`]. The public `.0` is the `[Varying; 3]` the [`Gang`] combinators (`gather_n`,
@@ -233,8 +233,9 @@ impl<S: Backend<f32>, const R: usize, const C: usize> MatWide<S, R, C> {
     /// contraction is an FMA chain per output entry.
     #[inline(always)]
     pub fn matmul<const N: usize>(self, rhs: MatWide<S, C, N>) -> MatWide<S, R, N> {
-        MatWide(core::array::from_fn(|i| {
-            core::array::from_fn(|j| {
+        let seed = self.0[0][0];
+        MatWide(fill_array!(R, [seed; N], |i| {
+            fill_array!(N, seed, |j| {
                 let mut acc = self.0[i][0] * rhs.0[0][j];
                 for k in 1..C {
                     acc = self.0[i][k].fma(rhs.0[k][j], acc);
@@ -247,7 +248,8 @@ impl<S: Backend<f32>, const R: usize, const C: usize> MatWide<S, R, C> {
     /// The per-lane transpose (`C×R`).
     #[inline(always)]
     pub fn transpose(self) -> MatWide<S, C, R> {
-        MatWide(core::array::from_fn(|j| core::array::from_fn(|i| self.0[i][j])))
+        let seed = self.0[0][0];
+        MatWide(fill_array!(C, [seed; R], |j| fill_array!(R, seed, |i| self.0[i][j])))
     }
 
     /// The `R×C` entries in row-major order as nested `[Varying; C]` rows.
@@ -362,11 +364,11 @@ impl<S: Backend<f32>> GangGlamExt<S> for Gang<S> {
     }
     #[inline(always)]
     fn splat_mat<const R: usize, const C: usize>(self, m: [[f32; C]; R]) -> MatWide<S, R, C> {
-        MatWide(core::array::from_fn(|i| self.splat_n(m[i])))
+        MatWide(fill_array!(R, [self.splat(0.0); C], |i| self.splat_n(m[i])))
     }
     #[inline(always)]
     fn load_mat<const R: usize, const C: usize>(self, planes: [[&[f32]; C]; R]) -> MatWide<S, R, C> {
-        MatWide(planes.map(|row| self.load_n(row)))
+        MatWide(fill_array!(R, [self.splat(0.0); C], |i| self.load_n(planes[i])))
     }
     #[inline(always)]
     fn load_partial_mat<const R: usize, const C: usize>(
@@ -374,6 +376,6 @@ impl<S: Backend<f32>> GangGlamExt<S> for Gang<S> {
         planes: [[&[f32]; C]; R],
         fill: f32,
     ) -> MatWide<S, R, C> {
-        MatWide(planes.map(|row| self.load_partial_n(row, fill)))
+        MatWide(fill_array!(R, [self.splat(fill); C], |i| self.load_partial_n(planes[i], fill)))
     }
 }

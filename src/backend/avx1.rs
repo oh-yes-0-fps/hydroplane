@@ -41,6 +41,15 @@ impl Backend<f32> for Avx1 {
     type Vector = __m256;
     type Mask = __m256;
 
+    #[inline(always)]
+    fn load_first(self, s: &[f32], fill: f32) -> __m256 {
+        unsafe { f32_load_first(s.as_ptr(), s.len(), fill) }
+    }
+    #[inline(always)]
+    fn store_first(self, v: __m256, s: &mut [f32]) {
+        unsafe { f32_store_first(s.as_mut_ptr(), s.len(), v) }
+    }
+
     type IVector = [u32; 8];
     #[inline(always)]
     fn iload(self, s: &[u32]) -> [u32; 8] {
@@ -307,6 +316,15 @@ impl Backend<f64> for Avx1 {
     type Vector = __m256d;
     type Mask = __m256d;
 
+    #[inline(always)]
+    fn load_first(self, s: &[f64], fill: f64) -> __m256d {
+        unsafe { f64_load_first(s.as_ptr(), s.len(), fill) }
+    }
+    #[inline(always)]
+    fn store_first(self, v: __m256d, s: &mut [f64]) {
+        unsafe { f64_store_first(s.as_mut_ptr(), s.len(), v) }
+    }
+
     type IVector = [u32; 4];
     #[inline(always)]
     fn iload(self, s: &[u32]) -> [u32; 4] {
@@ -571,3 +589,38 @@ crate::backend::emulated_float_element!(Avx1, half::f16, 8);
 crate::backend::emulated_float_element!(Avx1, half::bf16, 8);
 crate::backend::emulated_int_element!(Avx1, u32, 8);
 crate::backend::emulated_int_element!(Avx1, i32, 8);
+
+// `vmaskmovps`/`vmaskmovpd` read and write only the selected lanes, so a short slice is never
+// over-read. AVX has no 256-bit integer compare, so the lane mask comes from a float one.
+#[target_feature(enable = "avx")]
+#[inline]
+unsafe fn f32_first_mask(len: usize) -> __m256 {
+    _mm256_cmp_ps::<_CMP_LT_OQ>(_mm256_setr_ps(0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0), _mm256_set1_ps(len as f32))
+}
+#[target_feature(enable = "avx")]
+#[inline]
+unsafe fn f64_first_mask(len: usize) -> __m256d {
+    _mm256_cmp_pd::<_CMP_LT_OQ>(_mm256_setr_pd(0.0, 1.0, 2.0, 3.0), _mm256_set1_pd(len as f64))
+}
+#[target_feature(enable = "avx")]
+#[inline]
+unsafe fn f32_load_first(p: *const f32, len: usize, fill: f32) -> __m256 {
+    let m = f32_first_mask(len);
+    unsafe { _mm256_blendv_ps(_mm256_set1_ps(fill), _mm256_maskload_ps(p, _mm256_castps_si256(m)), m) }
+}
+#[target_feature(enable = "avx")]
+#[inline]
+unsafe fn f32_store_first(p: *mut f32, len: usize, v: __m256) {
+    unsafe { _mm256_maskstore_ps(p, _mm256_castps_si256(f32_first_mask(len)), v) }
+}
+#[target_feature(enable = "avx")]
+#[inline]
+unsafe fn f64_load_first(p: *const f64, len: usize, fill: f64) -> __m256d {
+    let m = f64_first_mask(len);
+    unsafe { _mm256_blendv_pd(_mm256_set1_pd(fill), _mm256_maskload_pd(p, _mm256_castpd_si256(m)), m) }
+}
+#[target_feature(enable = "avx")]
+#[inline]
+unsafe fn f64_store_first(p: *mut f64, len: usize, v: __m256d) {
+    unsafe { _mm256_maskstore_pd(p, _mm256_castpd_si256(f64_first_mask(len)), v) }
+}

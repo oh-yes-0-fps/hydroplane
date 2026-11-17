@@ -222,6 +222,11 @@ pub trait Backend<T: Scalar>: Copy {
     fn lt(self, a: Self::Vector, b: Self::Vector) -> Self::Mask;
     fn ge(self, a: Self::Vector, b: Self::Vector) -> Self::Mask;
     fn gt(self, a: Self::Vector, b: Self::Vector) -> Self::Mask;
+    /// Lane-wise ordered `a == b`: false wherever either lane is NaN.
+    #[inline(always)]
+    fn eq(self, a: Self::Vector, b: Self::Vector) -> Self::Mask {
+        self.mask_and(self.le(a, b), self.ge(a, b))
+    }
 
     fn mask_and(self, a: Self::Mask, b: Self::Mask) -> Self::Mask;
     fn mask_or(self, a: Self::Mask, b: Self::Mask) -> Self::Mask;

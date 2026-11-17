@@ -11,31 +11,48 @@ in a single hardware instruction (NVIDIA tensor cores, AMD WMMA, Intel XMX, Appl
 simdgroup_matrix). It is the SPIR-V equivalent of CUDA `wmma` / HLSL SM6.8
 `WaveMatrix` / Metal `simdgroup_matrix`.
 
-## Status: does not compile on rust-gpu yet (empirical, 2026-06-28)
+## Status: implemented on a patched rust-gpu 0.11 (2026-11-13)
 
-The asm blocks below are **grammar-correct but do not compile** — verified by building
-`hydroplane-test` with the exact KHR example against **both** `spirv-std 0.10.0-alpha.1` (the pinned
-release) and the **git rev `36e3348`** named above, targeting `spirv-unknown-vulkan1.3`. Both ICE
-identically:
+rust-gpu 0.11.0 added `SpirvType::CooperativeMatrixKhr` and the `#[spirv(cooperative_matrix)]`
+intrinsic type, which removed the codegen ICE that blocked this before. hydroplane now lowers
+[`MatrixBackend`] for `f16` onto cooperative matrices in `src/matrix/coop.rs`.
 
-```
-internal error: entered unreachable code: OpTypeCooperativeMatrixKHR is reserved for SPV_KHR_cooperative_matrix
-```
+Kernels reach it through the one GPU entry point `dispatch_matrix_subgroup(kernel)`, the twin of
+the CPU `dispatch_matrix`. The shader build picks the lowering: enabling the
+`CooperativeMatrixKHR` capability gives cooperative-matrix tiles, and otherwise tiles are
+lane-distributed arrays (`src/matrix/lanes.rs`). rustc does not expose SPIR-V target features to
+`cfg`, so hydroplane's `build.rs` reads the capability from `CARGO_ENCODED_RUSTFLAGS` and sets
+`hp_coop_matrix`.
 
-Root cause, traced in `rustc_codegen_spirv`: the codegen's internal `SpirvType` enum **has no
-cooperative-matrix variant** (`spirv_type.rs` — no `Cooperative*`), and `instruction_signatures`
-stubs every `*CooperativeMatrix*` opcode as `reserved!(…)`, which is an `unreachable!`. So while
-the inline-`asm!` *parser* understands the operand kinds (`CooperativeMatrixLayout`/`Use`/…), the
-codegen cannot lower the type: declaring `OpTypeCooperativeMatrixKHR` in `asm!` falls through the
-`OpType*` match unregistered, and the first reference to it hits the `reserved!` `unreachable!`.
-Giving explicit result types (this doc's point 2) does **not** avoid it — the type *declaration*
-itself triggers the path. `options(nostack)` is also rejected (`asm flags not supported: NOSTACK`).
+On the coop path:
 
-**Conclusion:** cooperative matrices need an upstream rust-gpu codegen feature (a
-`SpirvType::CooperativeMatrix` + real `instruction_signatures`), not just hand-written `asm!`.
-Until a rust-gpu version ships that, this path is blocked. The rest of this file remains a correct
-operand-grammar reference for when it lands. (The `hydroplane` non-coop GPU fallback — per-invocation
-scalar tiles in `MatrixBackend for Subgroup` — is unaffected and remains the working path.)
+* Loads, stores, splats and `mma` are single `OpCooperativeMatrix*KHR` instructions.
+* `tile_map` / `tile_zip` loop over each invocation's components (`OpCooperativeMatrixLengthKHR`
+  + `OpAccessChain`).
+* Each row/column op stages its tile through a workgroup array it declares itself
+  (`MATRIX_SCRATCH_WORDS`: one 16×16 `f32` tile per subgroup for up to four subgroups), because
+  the extension never says which element sits at which `(row, col)`.
+
+Two constraints remain:
+
+* **The fork.** `OpCooperativeMatrixLengthKHR` takes a type operand inside a function, which
+  SPIR-T 0.4.0 rejects. The fix is upstream SPIR-T commit `44eb9c4`, but it is unreleased. Shader
+  crates must build with `oh-yes-0-fps/rust-gpu@coop-matrix-0.11`, which pins
+  `oh-yes-0-fps/spirt@coop-matrix-0.4` (that commit backported onto 0.4.0). See
+  `hydroplane-gpu-test/shader/Cargo.toml` for the `spirv-std` git dependency and the
+  `[patch.crates-io]` that makes hydroplane's own `spirv-std` resolve to the same fork.
+* **No Function-storage load/store.** Vulkan allows cooperative-matrix load/store only through
+  Workgroup or StorageBuffer pointers (`VUID-StandaloneSpirv-Pointer-08973`). So tiles load from
+  buffers, and the row/column ops need workgroup memory.
+
+`SPV_NV_cooperative_matrix2`'s per-element and reduce ops would remove the scratch, but they take
+a callback function id. rust-gpu can neither name a Rust function in `asm!` nor keep such a
+callback from being inlined away.
+
+`hydroplane-gpu-test` checks both lowerings against the CPU oracle; the coop one matched on an
+RTX 5090.
+
+The asm reference below predates the typed lowering, but its operand grammar still holds.
 
 ## What rust-gpu actually gives you
 

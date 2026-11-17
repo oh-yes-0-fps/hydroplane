@@ -18,6 +18,14 @@ fn main() {
     let hp_no_ilp = has("hp_no_ilp");
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
+    // A SPIR-V build that enables the `CooperativeMatrixKHR` capability (rust-gpu passes
+    // capabilities as `-Ctarget-feature=+<Capability>`) lowers tiles onto cooperative matrices.
+    // rustc does not expose SPIR-V target features to `cfg`, so the flag is read here.
+    println!("cargo::rustc-check-cfg=cfg(hp_coop_matrix)");
+    if arch == "spirv" && has("+CooperativeMatrixKHR") {
+        println!("cargo:rustc-cfg=hp_coop_matrix");
+    }
+
     if !(hp_static_dispatch && pinned_cpu) || hp_no_ilp || arch == "spirv" {
         return;
     }

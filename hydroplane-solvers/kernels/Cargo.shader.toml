@@ -19,4 +19,6 @@ unexpected_cfgs = { level = "allow", check-cfg = ['cfg(target_arch, values("spir
 [workspace]
 
 [dependencies]
-spirv-std = "0.10.0"
+# rust-gpu 0.11 fork: sub-slicing and array slices compile, and optimized builds fold bounds
+# checks away (panics are unreachable there).
+spirv-std = { git = "https://github.com/oh-yes-0-fps/rust-gpu", rev = "d0f8fc6d8122c0c0950f750293bf984b123fba32" }

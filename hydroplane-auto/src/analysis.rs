@@ -20,8 +20,7 @@ pub struct Metrics {
     /// Total MIR statements of the `_on` body — overall (non-closure) body size.
     pub stmts: u64,
     /// Statement count including the kernel's combinator closures (the `|acc,v| …` step bodies), an
-    /// arithmetic-intensity proxy: a compute-bound step saturates the FP units on one chain, so
-    /// high compute caps K low.
+    /// arithmetic-intensity proxy.
     pub compute: u64,
     /// Element-type bitmask (`Scalar::TYPE_BITS` values) the kernel's MIR actually touches, seen
     /// through generics and helper calls, so tighter than the macro's token scan. `0` when the
@@ -35,15 +34,6 @@ const TINY_STMTS: u64 = 24;
 /// At or above this many memory ops the kernel is memory-bound and wants the `noalias` boundary so
 /// LLVM can cluster and reorder its loads/stores.
 const MEM_THRESH: u64 = 4;
-/// The one knob for the unroll cap: `K ≈ BUDGET / compute-intensity`, where compute-intensity is
-/// the statements reachable from the kernel body (its `_on` body, combinator closures, and the
-/// non-kernel helpers they call, folded by the driver). One signal captures both effects that bound
-/// `K`: a heavy body is both register-hungrier and more throughput-bound, so both push `K` down
-/// together. Calibrated against the benchmark suite on aarch64; where it's off,
-/// `#[kernel(unroll = N)]` overrides it.
-const COMPUTE_BUDGET: u64 = 200;
-
-const K_CANDIDATES: [u64; 5] = [1, 2, 4, 8, 16];
 
 impl Metrics {
     /// Keep the `noalias` boundary unless the kernel is genuinely a micro-kernel.
@@ -54,13 +44,6 @@ impl Metrics {
     /// The measured element-type bitmask, when the driver recorded one.
     pub fn type_bits(&self) -> Option<u8> {
         (self.types != 0).then_some(self.types as u8)
-    }
-
-    /// Largest unroll factor whose per-chain cost still fits the compute budget, snapped to a dispatch
-    /// candidate `{1,2,4,8,16}`.
-    pub fn k_cap(&self) -> usize {
-        let raw = (COMPUTE_BUDGET / self.compute.max(1)).max(1);
-        K_CANDIDATES.iter().copied().filter(|&c| c <= raw).max().unwrap_or(1) as usize
     }
 }
 

@@ -35,13 +35,18 @@ pub fn choose(item_count: usize, subgroup_size: u32, fill_factor: u32) -> Execut
 // The intrinsic names below target spirv-std's `arch` subgroup ops; pin them to the rust-gpu
 // rev used by the shader crate.
 #[cfg(target_arch = "spirv")]
-pub use device::{Subgroup, dispatch_subgroup};
+pub use device::{
+    Coop, MATRIX_SCRATCH_WORDS, MatrixSubgroup, Mode, Plain, Subgroup, dispatch_matrix_subgroup,
+    dispatch_subgroup,
+};
 
 #[cfg(target_arch = "spirv")]
-mod device {
+pub(crate) mod device {
     use super::{Execution, choose};
     use crate::backend::{Backend, ScalarBackend};
     use crate::dispatch::Kernel;
+    use crate::matrix::{MatrixBackend, MatrixKernel};
+    use crate::scalar::FloatScalar;
     use crate::scalar::Scalar;
     use crate::varying::Gang;
     use half::{bf16, f16};
@@ -70,32 +75,90 @@ mod device {
         }
     }
 
-    /// Read the hardware `SubgroupSize` builtin: per-invocation ground truth (correct even
-    /// where the subgroup size is variable), lowering to a single builtin load. The `Input`
-    /// variable and its decoration are hoisted to module scope by rust-gpu's inline-asm
-    /// lowering; pin to the rust-gpu rev.
+    /// Workgroup memory, in words, each row/column tile op (`fold_rows`, `zip_cols`, …) stages
+    /// through on cooperative-matrix builds, split evenly between the workgroup's subgroups:
+    /// enough for one `16×16` `f32` accumulator per subgroup with up to four subgroups.
+    pub const MATRIX_SCRATCH_WORDS: usize = 1024;
+
+    /// The tile lowering of this build: cooperative matrices when it enables the
+    /// `CooperativeMatrixKHR` capability (`f16` tiles; other elements stay lane-distributed
+    /// arrays), lane-distributed array tiles otherwise.
+    #[cfg(hp_coop_matrix)]
+    pub type MatrixSubgroup<const W: usize = 0> = Subgroup<Coop<MATRIX_SCRATCH_WORDS>, W>;
+    /// The tile lowering of this build: cooperative matrices when it enables the
+    /// `CooperativeMatrixKHR` capability (`f16` tiles; other elements stay lane-distributed
+    /// arrays), lane-distributed array tiles otherwise.
+    #[cfg(not(hp_coop_matrix))]
+    pub type MatrixSubgroup<const W: usize = 0> = Subgroup<Plain, W>;
+
+    /// Device entry point for a [`MatrixKernel`], the GPU twin of
+    /// [`dispatch_matrix`](crate::dispatch_matrix): the calling subgroup is the gang and holds
+    /// each tile together.
+    ///
+    /// The same kernel source builds for every device; the shader build picks the lowering.
+    /// Enabling the `CooperativeMatrixKHR` capability (and `SPV_KHR_cooperative_matrix`) gives
+    /// hardware matrix tiles. Such a module only loads on devices with
+    /// `VK_KHR_cooperative_matrix`, so build it once with and once without, and use tile shapes
+    /// the device lists in `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR`.
+    ///
+    /// The warp width is matched here, once, and the kernel runs on a backend fixed to it: a
+    /// tile op deciding the width for itself would leave the code for every other width beside
+    /// it, and drivers keep a tile that some unused width indexes at run time in memory.
     #[inline]
-    fn subgroup_size() -> u32 {
-        let mut size: u32;
-        unsafe {
-            core::arch::asm!(
-                "%u32 = OpTypeInt 32 0",
-                // rust-gpu requires `Generic` for `OpTypePointer` in asm! and infers the real
-                // storage class (here `Input`) from the `OpVariable` below.
-                "%ptr = OpTypePointer Generic %u32",
-                "%var = OpVariable %ptr Input",
-                "OpDecorate %var BuiltIn SubgroupSize",
-                "{size} = OpLoad %u32 %var",
-                size = out(reg) size,
-            );
+    pub fn dispatch_matrix_subgroup<T, K>(kernel: K) -> K::Output
+    where
+        T: FloatScalar,
+        K: MatrixKernel<T>,
+        MatrixSubgroup<32>: MatrixBackend<T>,
+        MatrixSubgroup<64>: MatrixBackend<T>,
+        MatrixSubgroup<16>: MatrixBackend<T>,
+        MatrixSubgroup<8>: MatrixBackend<T>,
+        MatrixSubgroup<0>: MatrixBackend<T>,
+    {
+        match subgroup_size() {
+            32 => kernel.run(Gang::new(MatrixSubgroup::<32>::default())),
+            64 => kernel.run(Gang::new(MatrixSubgroup::<64>::default())),
+            16 => kernel.run(Gang::new(MatrixSubgroup::<16>::default())),
+            8 => kernel.run(Gang::new(MatrixSubgroup::<8>::default())),
+            _ => kernel.run(Gang::new(MatrixSubgroup::<0>::default())),
         }
-        size
     }
+
+    /// Read a `u32` input builtin with a single load. rust-gpu hoists the `Input` variable and
+    /// its decoration to module scope, and requires `Generic` for `OpTypePointer` in `asm!`,
+    /// inferring the real storage class from the `OpVariable`.
+    macro_rules! builtin_u32 {
+        ($name:ident, $builtin:literal) => {
+            #[inline]
+            pub(crate) fn $name() -> u32 {
+                let v: u32;
+                unsafe {
+                    core::arch::asm!(
+                        "OpCapability GroupNonUniform",
+                        "%u32 = OpTypeInt 32 0",
+                        "%ptr = OpTypePointer Generic %u32",
+                        "%var = OpVariable %ptr Input",
+                        concat!("OpDecorate %var BuiltIn ", $builtin),
+                        "{v} = OpLoad %u32 %var",
+                        v = out(reg) v,
+                    );
+                }
+                v
+            }
+        };
+    }
+    builtin_u32!(subgroup_id, "SubgroupId");
+    builtin_u32!(num_subgroups, "NumSubgroups");
+    builtin_u32!(subgroup_local_invocation_id, "SubgroupLocalInvocationId");
+
+    // The `SubgroupSize` builtin is per-invocation ground truth, correct even where the subgroup
+    // size is variable.
+    builtin_u32!(subgroup_size, "SubgroupSize");
 
     /// Hardware square root, GLSL.std.450 `Sqrt` (opcode 31), generic over the float width.
     /// Replaces the portable Babylonian fallback in [`Scalar::sqrt`] on-device.
     #[inline]
-    fn gpu_sqrt<T: Copy + Default>(x: T) -> T {
+    pub(crate) fn gpu_sqrt<T: Copy + Default>(x: T) -> T {
         let mut result = T::default();
         unsafe {
             core::arch::asm!(
@@ -113,7 +176,7 @@ mod device {
     /// Hardware fused multiply-add `a * b + c`, GLSL.std.450 `Fma` (opcode 50), generic over
     /// the float width. Replaces the unfused `mul`+`add` of the default [`Scalar::fma`].
     #[inline]
-    fn gpu_fma<T: Copy + Default>(a: T, b: T, c: T) -> T {
+    pub(crate) fn gpu_fma<T: Copy + Default>(a: T, b: T, c: T) -> T {
         let mut result = T::default();
         unsafe {
             core::arch::asm!(
@@ -156,23 +219,59 @@ mod device {
         unsafe { core::arch::asm!("OpCapability GroupNonUniformVote") }
     }
 
-    /// GPU subgroup execution token. Zero-sized: the warp width is fetched on demand from the
-    /// `SubgroupSize` builtin, so there is nothing for the caller to store or pass in.
+    /// GPU subgroup execution token. `M` picks the tile lowering: [`Plain`] array tiles, or
+    /// [`Coop`] cooperative matrices. `W` is the warp width when the entry point already matched
+    /// it, so every tile op is laid out for that width alone; with `0` the width is read from the
+    /// `SubgroupSize` builtin on demand.
     #[derive(Clone, Copy, Default)]
-    pub struct Subgroup;
+    pub struct Subgroup<M = Plain, const W: usize = 0> {
+        pub(crate) mode: M,
+    }
+
+    /// The warp width: `W` when known at compile time, else the `SubgroupSize` builtin.
+    #[inline]
+    pub(crate) fn width<const W: usize>() -> usize {
+        if const { W != 0 } {
+            W
+        } else {
+            subgroup_size() as usize
+        }
+    }
 
     impl Subgroup {
         #[inline]
         pub fn new() -> Self {
-            Self
+            Self { mode: Plain }
         }
     }
+
+    mod sealed {
+        pub trait Sealed {}
+    }
+
+    /// How a [`Subgroup`] lowers matrix tiles. Sealed: [`Plain`] or [`Coop`].
+    pub trait Mode: sealed::Sealed + Copy + 'static {}
+
+    /// Array tiles, held whole by every invocation.
+    #[derive(Clone, Copy, Default)]
+    pub struct Plain;
+
+    /// Cooperative-matrix tiles; the row/column ops stage through `N` words of workgroup memory.
+    /// Zero-sized, so tiles can sit in arrays and locals freely: SPIR-V allows no pointer
+    /// inside a composite.
+    #[derive(Clone, Copy, Default)]
+    pub struct Coop<const N: usize>;
+
+    impl sealed::Sealed for Plain {}
+    impl<const N: usize> sealed::Sealed for Coop<N> {}
+    impl Mode for Plain {}
+    impl<const N: usize> Mode for Coop<N> {}
 
     // Arithmetic is per-invocation scalar (each lane is one invocation); only the cross-lane
     // reductions use subgroup collectives.
     macro_rules! subgroup_backend {
         ($ty:ty, $cap:path) => {
-            impl Backend<$ty> for Subgroup {
+            impl<M: Mode, const W: usize> Backend<$ty> for Subgroup<M, W> {
                 type Vector = $ty;
                 type Mask = bool;
 
@@ -189,7 +288,7 @@ mod device {
 
                 #[inline]
                 fn lanes(self) -> usize {
-                    subgroup_size() as usize
+                    width::<W>()
                 }
                 #[inline]
                 fn splat(self, v: $ty) -> $ty {
@@ -303,6 +402,49 @@ mod device {
                     cap_group_arithmetic();
                     spirv_std::arch::subgroup_f_max(v)
                 }
+
+                // One invocation per lane, so a varying-index gather is this invocation reading
+                // its own `base[idx]` — a single buffer access, no subgroup collective. Overriding
+                // the trait default keeps it a clean `OpAccessChain`+`OpLoad` instead of the
+                // default's dynamically-indexed stack array, which rust-gpu spills to memory.
+                // Cross-invocation duplicate scatter indices race (as any GPU scatter does); a
+                // histogram-style accumulation needs atomics, not this.
+                #[inline]
+                fn gather(self, base: &[$ty], idx: u32) -> $ty {
+                    base[idx as usize]
+                }
+                #[inline]
+                fn gather_masked(self, base: &[$ty], idx: u32, m: bool, fill: $ty) -> $ty {
+                    if m { base[idx as usize] } else { fill }
+                }
+                #[inline]
+                fn scatter(self, out: &mut [$ty], idx: u32, v: $ty) {
+                    out[idx as usize] = v;
+                }
+                #[inline]
+                fn scatter_masked(self, out: &mut [$ty], idx: u32, v: $ty, m: bool) {
+                    if m {
+                        out[idx as usize] = v;
+                    }
+                }
+                #[inline]
+                fn igather(self, base: &[u32], idx: u32) -> u32 {
+                    base[idx as usize]
+                }
+                #[inline]
+                fn igather_masked(self, base: &[u32], idx: u32, m: bool, fill: u32) -> u32 {
+                    if m { base[idx as usize] } else { fill }
+                }
+                #[inline]
+                fn iscatter(self, out: &mut [u32], idx: u32, v: u32) {
+                    out[idx as usize] = v;
+                }
+                #[inline]
+                fn iscatter_masked(self, out: &mut [u32], idx: u32, v: u32, m: bool) {
+                    if m {
+                        out[idx as usize] = v;
+                    }
+                }
             }
         };
     }
@@ -311,7 +453,7 @@ mod device {
     /// collectives for the cross-lane surface (`OpGroupNonUniform` integer arithmetic).
     macro_rules! subgroup_int_backend {
         ($ty:ty, $umin:ident, $umax:ident) => {
-            impl Backend<$ty> for Subgroup {
+            impl<M: Mode, const W: usize> Backend<$ty> for Subgroup<M, W> {
                 type Vector = $ty;
                 type Mask = bool;
 
@@ -327,7 +469,7 @@ mod device {
 
                 #[inline]
                 fn lanes(self) -> usize {
-                    subgroup_size() as usize
+                    width::<W>()
                 }
                 #[inline]
                 fn splat(self, v: $ty) -> $ty {
@@ -450,6 +592,44 @@ mod device {
                 fn bit_not(self, a: $ty) -> $ty {
                     !a
                 }
+
+                // Per-invocation indexed access; see the float macro for the rationale.
+                #[inline]
+                fn gather(self, base: &[$ty], idx: u32) -> $ty {
+                    base[idx as usize]
+                }
+                #[inline]
+                fn gather_masked(self, base: &[$ty], idx: u32, m: bool, fill: $ty) -> $ty {
+                    if m { base[idx as usize] } else { fill }
+                }
+                #[inline]
+                fn scatter(self, out: &mut [$ty], idx: u32, v: $ty) {
+                    out[idx as usize] = v;
+                }
+                #[inline]
+                fn scatter_masked(self, out: &mut [$ty], idx: u32, v: $ty, m: bool) {
+                    if m {
+                        out[idx as usize] = v;
+                    }
+                }
+                #[inline]
+                fn igather(self, base: &[u32], idx: u32) -> u32 {
+                    base[idx as usize]
+                }
+                #[inline]
+                fn igather_masked(self, base: &[u32], idx: u32, m: bool, fill: u32) -> u32 {
+                    if m { base[idx as usize] } else { fill }
+                }
+                #[inline]
+                fn iscatter(self, out: &mut [u32], idx: u32, v: u32) {
+                    out[idx as usize] = v;
+                }
+                #[inline]
+                fn iscatter_masked(self, out: &mut [u32], idx: u32, v: u32, m: bool) {
+                    if m {
+                        out[idx as usize] = v;
+                    }
+                }
             }
         };
     }
@@ -486,7 +666,7 @@ mod device {
     // 16-bit storage type.
     macro_rules! subgroup_widen_backend {
         ($ty:ty, $widen:path, $narrow:path) => {
-            impl Backend<$ty> for Subgroup {
+            impl<M: Mode, const W: usize> Backend<$ty> for Subgroup<M, W> {
                 type Vector = f32;
                 type Mask = bool;
 
@@ -503,7 +683,7 @@ mod device {
 
                 #[inline]
                 fn lanes(self) -> usize {
-                    subgroup_size() as usize
+                    width::<W>()
                 }
                 #[inline]
                 fn splat(self, v: $ty) -> f32 {
@@ -615,6 +795,52 @@ mod device {
                 fn reduce_max(self, v: f32) -> $ty {
                     cap_group_arithmetic();
                     $narrow(spirv_std::arch::subgroup_f_max(v))
+                }
+
+                // 16-bit storage, f32 register: gather widens at the memory boundary, scatter
+                // narrows, matching this backend's `load`/`store`. See the float macro for the
+                // per-invocation rationale.
+                #[inline]
+                fn gather(self, base: &[$ty], idx: u32) -> f32 {
+                    cap_int16();
+                    $widen(base[idx as usize])
+                }
+                #[inline]
+                fn gather_masked(self, base: &[$ty], idx: u32, m: bool, fill: f32) -> f32 {
+                    if m {
+                        cap_int16();
+                        $widen(base[idx as usize])
+                    } else {
+                        fill
+                    }
+                }
+                #[inline]
+                fn scatter(self, out: &mut [$ty], idx: u32, v: f32) {
+                    out[idx as usize] = $narrow(v);
+                }
+                #[inline]
+                fn scatter_masked(self, out: &mut [$ty], idx: u32, v: f32, m: bool) {
+                    if m {
+                        out[idx as usize] = $narrow(v);
+                    }
+                }
+                #[inline]
+                fn igather(self, base: &[u32], idx: u32) -> u32 {
+                    base[idx as usize]
+                }
+                #[inline]
+                fn igather_masked(self, base: &[u32], idx: u32, m: bool, fill: u32) -> u32 {
+                    if m { base[idx as usize] } else { fill }
+                }
+                #[inline]
+                fn iscatter(self, out: &mut [u32], idx: u32, v: u32) {
+                    out[idx as usize] = v;
+                }
+                #[inline]
+                fn iscatter_masked(self, out: &mut [u32], idx: u32, v: u32, m: bool) {
+                    if m {
+                        out[idx as usize] = v;
+                    }
                 }
             }
         };

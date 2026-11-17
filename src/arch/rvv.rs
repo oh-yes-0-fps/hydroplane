@@ -295,6 +295,46 @@ reduce!(reduce_sum_f32, f32, u32, "e32", 4, "vle32.v", "li {t}, 0\nvmv.s.x v2, {
 reduce!(reduce_min_f32, f32, u32, "e32", 4, "vle32.v", "li {t}, 0x7F800000\nvmv.s.x v2, {t}", "vfredmin.vs v0, v1, v2");
 reduce!(reduce_max_f32, f32, u32, "e32", 4, "vle32.v", "li {t}, 0xFF800000\nvmv.s.x v2, {t}", "vfredmax.vs v0, v1, v2");
 
+// UNVALIDATED AT RUNTIME: written against the RVV v1.0 indexed-gather encoding, type-checked by
+// cross-compiling to riscv64, but no RISC-V host here so it has not executed. `vluxei32` takes
+// BYTE offsets, so the element index is shifted left by 2 (×4). Only gather is native; scatter
+// keeps the portable default, which preserves the highest-lane-wins tie-break on duplicate indices
+// that RVV's unordered indexed store (`vsuxei`) does not.
+pub unsafe fn gather_f32<const C: usize>(base: *const f32, idx: *const u32) -> RvvVec<C> {
+    let mut o = RvvVec::<C>::zeroed();
+    asm!(
+        ".option push", ".option arch, +v",
+        "vsetvli {vl}, {n}, e32, m1, ta, ma",
+        "vle32.v v2, ({i})",
+        "vsll.vi v2, v2, 2",
+        "vluxei32.v v1, ({a}), v2",
+        "vse32.v v1, ({o})",
+        ".option pop",
+        vl = out(reg) _, n = in(reg) C / 4,
+        a = in(reg) base, i = in(reg) idx, o = in(reg) o.0.as_mut_ptr(),
+        out("v1") _, out("v2") _,
+        options(nostack),
+    );
+    o
+}
+
+/// Gather `n` `u32` lanes into `out` (the integer companion); `n` is the caller's lane count.
+pub unsafe fn gather_u32(base: *const u32, idx: *const u32, out: *mut u32, n: usize) {
+    asm!(
+        ".option push", ".option arch, +v",
+        "vsetvli {vl}, {n}, e32, m1, ta, ma",
+        "vle32.v v2, ({i})",
+        "vsll.vi v2, v2, 2",
+        "vluxei32.v v1, ({a}), v2",
+        "vse32.v v1, ({o})",
+        ".option pop",
+        vl = out(reg) _, n = in(reg) n,
+        a = in(reg) base, i = in(reg) idx, o = in(reg) out,
+        out("v1") _, out("v2") _,
+        options(nostack),
+    );
+}
+
 splat!(splat_f64, f64, "e64", 8, "vse64.v");
 loadstore!(load_f64, store_f64, f64, "e64", 8, "vle64.v", "vse64.v");
 binop!(add_f64, "e64", 8, "vle64.v", "vse64.v", "vfadd.vv v1, v1, v2");

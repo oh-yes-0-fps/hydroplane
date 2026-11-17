@@ -22,17 +22,10 @@ impl Avx512Bf16 {
     // Dead when the build statically pins `avx512bf16`; dispatch then uses `new_unchecked`.
     #[allow(dead_code)]
     pub fn detect() -> Option<Self> {
-        if is_x86_feature_detected!("avx512bf16")
-            && is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx512bw")
-        {
-            Some(Self(()))
-        } else {
-            None
-        }
+        if crate::__hp_isa!(detect AVX512BF16) { Some(Self(())) } else { None }
     }
     /// # Safety
-    /// The CPU must support `avx512bf16` (and `avx512f`/`avx512bw`).
+    /// The CPU must have the whole `AVX512BF16` tier bundle ([`crate::isa`]).
     #[allow(dead_code)]
     #[inline]
     pub const unsafe fn new_unchecked() -> Self {
@@ -181,9 +174,13 @@ impl Backend<bf16> for Avx512Bf16 {
 }
 
 // `avx512bf16` implies `avx512f`, so every non-bf16 element rides the plain AVX-512 impls.
-crate::backend::delegate_float_element!(Avx512Bf16, f32, crate::backend::avx512::Avx512, unsafe {
-    crate::backend::avx512::Avx512::new_unchecked()
-});
+crate::backend::delegate_float_element!(
+    Avx512Bf16,
+    f32,
+    crate::backend::avx512::Avx512,
+    unsafe { crate::backend::avx512::Avx512::new_unchecked() },
+    enter = AVX512BF16
+);
 crate::backend::delegate_float_element!(Avx512Bf16, f64, crate::backend::avx512::Avx512, unsafe {
     crate::backend::avx512::Avx512::new_unchecked()
 });

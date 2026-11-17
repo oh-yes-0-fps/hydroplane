@@ -55,6 +55,33 @@ macro_rules! wasm_backend {
             type Vector = v128;
             type Mask = v128;
 
+            #[inline(always)]
+            fn load_first(self, s: &[f32], fill: f32) -> v128 {
+                let mut v = f32x4_splat(fill);
+                if !s.is_empty() {
+                    v = f32x4_replace_lane::<0>(v, s[0]);
+                }
+                if s.len() > 1 {
+                    v = f32x4_replace_lane::<1>(v, s[1]);
+                }
+                if s.len() > 2 {
+                    v = f32x4_replace_lane::<2>(v, s[2]);
+                }
+                v
+            }
+            #[inline(always)]
+            fn store_first(self, v: v128, s: &mut [f32]) {
+                if !s.is_empty() {
+                    s[0] = f32x4_extract_lane::<0>(v);
+                }
+                if s.len() > 1 {
+                    s[1] = f32x4_extract_lane::<1>(v);
+                }
+                if s.len() > 2 {
+                    s[2] = f32x4_extract_lane::<2>(v);
+                }
+            }
+
             type IVector = v128;
             #[inline(always)]
             fn iload(self, s: &[u32]) -> v128 {
@@ -215,6 +242,10 @@ macro_rules! wasm_backend {
                 f32x4_ge(a, b)
             }
             #[inline(always)]
+            fn eq(self, a: v128, b: v128) -> v128 {
+                f32x4_eq(a, b)
+            }
+            #[inline(always)]
             fn gt(self, a: v128, b: v128) -> v128 {
                 f32x4_gt(a, b)
             }
@@ -272,6 +303,18 @@ macro_rules! wasm_backend {
         impl Backend<f64> for $token {
             type Vector = v128;
             type Mask = v128;
+
+            #[inline(always)]
+            fn load_first(self, s: &[f64], fill: f64) -> v128 {
+                let v = f64x2_splat(fill);
+                if s.is_empty() { v } else { f64x2_replace_lane::<0>(v, s[0]) }
+            }
+            #[inline(always)]
+            fn store_first(self, v: v128, s: &mut [f64]) {
+                if !s.is_empty() {
+                    s[0] = f64x2_extract_lane::<0>(v);
+                }
+            }
 
             type IVector = [u32; 2];
             #[inline(always)]
@@ -359,6 +402,10 @@ macro_rules! wasm_backend {
             #[inline(always)]
             fn ge(self, a: v128, b: v128) -> v128 {
                 f64x2_ge(a, b)
+            }
+            #[inline(always)]
+            fn eq(self, a: v128, b: v128) -> v128 {
+                f64x2_eq(a, b)
             }
             #[inline(always)]
             fn gt(self, a: v128, b: v128) -> v128 {
@@ -498,6 +545,10 @@ macro_rules! wasm_backend {
             #[inline(always)]
             fn ge(self, a: v128, b: v128) -> v128 {
                 f32x4_ge(a, b)
+            }
+            #[inline(always)]
+            fn eq(self, a: v128, b: v128) -> v128 {
+                f32x4_eq(a, b)
             }
             #[inline(always)]
             fn gt(self, a: v128, b: v128) -> v128 {
@@ -651,6 +702,10 @@ macro_rules! wasm_backend {
             #[inline(always)]
             fn ge(self, a: v128, b: v128) -> v128 {
                 f32x4_ge(a, b)
+            }
+            #[inline(always)]
+            fn eq(self, a: v128, b: v128) -> v128 {
+                f32x4_eq(a, b)
             }
             #[inline(always)]
             fn gt(self, a: v128, b: v128) -> v128 {

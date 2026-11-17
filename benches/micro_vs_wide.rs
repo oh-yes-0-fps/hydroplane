@@ -1,6 +1,4 @@
 //! `#[kernel]` dispatch vs hand-written `wide` SIMD vs scalar, for a small-`N` f32 dot product.
-//! On x86 a generic build keeps hydroplane's ops behind the `#[target_feature]` call boundary;
-//! pass RUSTFLAGS="-C target-cpu=native" to inline them.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hydroplane::{Gang, kernel};
@@ -62,7 +60,7 @@ fn dot_opt<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     acc.reduce_sum()
 }
 
-// Same body as `dot_opt`; `tiny` opts out of the `noalias` `_on` call boundary.
+// Same body as `dot_opt`; `tiny` skips the `noalias` `_on` function.
 #[kernel(tiny)]
 fn dot_opt_tiny<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
     let n = ctx.lanes::<f32>();

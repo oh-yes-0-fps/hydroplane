@@ -15,8 +15,12 @@
 //! becomes a struct field carried across the dispatch boundary, so borrows need explicit
 //! lifetimes. The dispatch element is the generic bound by `Scalar`/`FloatScalar`/`IntScalar` (or
 //! the one named `T`), inferred for concrete kernels; attribute overrides: `scalar = U`, extra
-//! element names (OR'd into the dispatch type-combo), `tiny`/`noalias` (mutually exclusive), and
-//! `unroll = N` — the manual knobs over what the `hydroplane-auto` build-time analysis picks.
+//! element names (OR'd into the dispatch type-combo), and `unroll = N`, which caps the ILP unroll
+//! factor for this kernel. `tiny` and `noalias` are still accepted but no
+//! longer change the generated code: the body always runs in an inlined `_on`.
+//!
+//! Inside the body, `a * b + c` and `c + a * b` on varyings compile to a fused multiply-add, as
+//! `.fma` would; on anything else they stay the two operators.
 
 use hydroplane_auto::analysis;
 
@@ -52,12 +56,13 @@ struct KernelOpts {
     /// work too).
     matrix: bool,
     scalar: Option<Ident>,
-    /// Run the body behind a non-inlined `noalias` boundary. On by default; `tiny` turns it off.
+    /// Whether the build-time analysis measures this kernel (its body is the `_on` companion);
+    /// `tiny` turns it off.
     noalias: bool,
     /// `tiny` or `noalias` was written explicitly; build-time analysis must not override it.
     explicit_boundary: bool,
-    /// Explicit ILP unroll cap, overriding the build-time estimate. Escape hatch for kernels whose
-    /// register pressure the analysis under-counts (e.g. varyings kept in a combinator closure).
+    /// Explicit ILP unroll cap. The combinators already fit their chains to the accumulator's
+    /// registers; this is for steps that keep many other varyings live.
     unroll: Option<usize>,
     /// Element names listed in the attribute (`#[kernel(u32, f32)]`): OR'd into the type-combo
     /// bitmask unconditionally, even over MIR-measured sets. The first listed doubles as the
@@ -165,8 +170,9 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         attrs,
         vis,
         sig,
-        block,
+        mut block,
     } = func;
+    syn::visit_mut::VisitMut::visit_block_mut(&mut FuseMulAdd, &mut block);
 
     if let Some(a) = sig.asyncness {
         return Err(syn::Error::new_spanned(a, "a kernel cannot be `async`"));
@@ -361,7 +367,7 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         Some(m) if !opts.explicit_boundary => m.noalias(),
         _ => opts.noalias,
     };
-    let k_cap = opts.unroll.or_else(|| metrics.map(|m| m.k_cap()));
+    let k_cap = opts.unroll;
 
     // Under the default `noalias` boundary the real body lives in `_on`, which is what the analysis
     // driver measures; explicit-`tiny` and matrix kernels aren't measured. The metrics attribute is
@@ -392,9 +398,10 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
     // keeps its declared name inside the body.
     let primary_ctx = &ctx_idents[0];
     let primary_ty = &ctx_tys[0];
-    let ctx_aliases = ctx_idents[1..]
+    let ctx_aliases: Vec<TokenStream2> = ctx_idents[1..]
         .iter()
-        .map(|id| quote!(let #id = #primary_ctx;));
+        .map(|id| quote!(let #id = #primary_ctx;))
+        .collect();
 
     // `<name>_on(ctx, …)` runs the body on a caller-supplied context, skipping dispatch, so nested
     // kernel calls dispatch once at the outer boundary. Generic over the backend `__S`, no dispatch
@@ -404,39 +411,76 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
     on_generics.params.push(syn::GenericParam::Type(parse_quote!(__S: #run_bound)));
     let (on_impl_generics, _, on_where) = on_generics.split_for_impl();
 
-    // Default (`!tiny`): the body runs inside `_on`, whose slice parameters keep the `noalias`
-    // attribute that a load through the `__Kernel` struct field drops. The attribute only survives
-    // a genuine call, so `_on` is `#[inline(never)]`; `tiny` inlines everything instead.
     let on_call_turbofish = if turbofish_args.is_empty() {
         quote!(::<__S>)
     } else {
         quote!(::<#(#turbofish_args,)* __S>)
     };
-    let (run_body, on_body, on_inline) = if use_noalias {
-        (
-            quote! {
-                let Self { #( #field_idents, )* .. } = self;
-                #on_name #on_call_turbofish ( #primary_ctx, #( #field_idents, )* )
-            },
-            quote! {
-                #( #ctx_aliases )*
-                #block
-            },
-            quote!(#[inline(never)]),
-        )
-    } else {
-        (
-            quote! {
-                #( #ctx_aliases )*
-                let Self { #( #field_idents, )* .. } = self;
-                #block
-            },
-            quote! {
-                #ktrait::run(#name::__Kernel #turbofish { #( #field_idents, )* #phantom_init }, #primary_ctx)
-            },
-            quote!(#[inline]),
-        )
+    let run_body = quote! {
+        let Self { #( #field_idents, )* .. } = self;
+        #on_name #on_call_turbofish ( #primary_ctx, #( #field_idents, )* )
     };
+
+    // The body is emitted once per ISA the build's architecture can dispatch to, each copy a
+    // `#[target_feature]` fn, plus a plain copy in `_on` for the baseline and scalar backends.
+    // `_on` picks the copy from the backend's `ISA` constant, which folds away per backend. Code
+    // compiled inside a copy (closures, `array::map`, helpers the body defines) inherits its
+    // target features, so every op inlines whether or not LLVM inlines the code around it. Matrix
+    // kernels keep a single body: their backends dispatch per tile.
+    let isa_copies: Vec<(&str, bool)> = if matrix_present {
+        Vec::new()
+    } else {
+        let generic = scalar_is_generic_early(&generics, &scalar);
+        let bits = metrics.and_then(|m| m.type_bits()).unwrap_or(scanned_bits_early);
+        vec![
+            ("SSE41", true),
+            ("AVX", generic || bits & 60 == 0),
+            ("AVX2", true),
+            ("AVX512", true),
+            ("AVX512FP16", generic || bits & 4 != 0),
+            ("AVX512BF16", generic || bits & 8 != 0),
+            ("SVE", generic || bits & 48 == 0),
+        ]
+    };
+    let mut isa_fns = Vec::new();
+    let mut isa_arms = Vec::new();
+    for (code, wanted) in isa_copies {
+        if !wanted {
+            continue;
+        }
+        let code_ident = format_ident!("{}", code);
+        let fn_name = format_ident!("__{}_{}", name, code.to_lowercase());
+        // `__hp_isa!` owns the tier table: each tier's feature bundle, its architecture, and
+        // which tiers this build of hydroplane dispatches to.
+        isa_fns.push(quote! {
+            ::hydroplane::__hp_isa! { kitem #code_ident
+                #[doc(hidden)]
+                #[inline]
+                #[allow(non_snake_case, clippy::too_many_arguments, clippy::multiple_bound_locations)]
+                fn #fn_name #on_impl_generics ( #primary_ctx: #primary_ty, #( #field_idents: #field_tys ),* ) -> #ret
+                #on_where
+                {
+                    #( #ctx_aliases )*
+                    #block
+                }
+            }
+        });
+        isa_arms.push(quote! {
+            ::hydroplane::__hp_isa! { kstmt #code_ident
+                if <__S as ::hydroplane::Backend<f32>>::ISA == ::hydroplane::isa::#code_ident {
+                    // SAFETY: a backend reports this tier only when its token was built on a CPU
+                    // with the tier's whole feature bundle.
+                    return unsafe { #fn_name #on_call_turbofish ( #primary_ctx, #( #field_idents, )* ) };
+                }
+            }
+        });
+    }
+    let on_body = quote! {
+        #( #isa_arms )*
+        #( #ctx_aliases )*
+        #block
+    };
+    let on_inline = quote!(#[inline(always)]);
 
     // Type-combo: the scanned (or MIR-measured) element set plus the dispatch element's own bits,
     // baked as a constant in the wrapper.
@@ -560,7 +604,7 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
             impl #impl_generics #ktrait<#scalar> for __Kernel #ty_generics #where_clause {
                 type Output = #ret;
                 #k_cap_item
-                #[inline]
+                #[inline(always)]
                 fn run<__S: #run_bound>(self, #primary_ctx: #primary_ty) -> #ret {
                     #run_body
                 }
@@ -577,6 +621,7 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         {
             #dispatch_call
         }
+        #( #isa_fns )*
         #[doc = concat!("Run [`", stringify!(#name), "`]'s body on an already-dispatched context, ")]
         #[doc = "skipping a second dispatch — call this from inside another kernel to reuse its backend."]
         #metrics_attr
@@ -587,6 +632,16 @@ fn expand(func: ItemFn, opts: KernelOpts) -> syn::Result<TokenStream2> {
         {
             #on_body
         }
+    })
+}
+
+/// Whether the kernel's element is one of its own generic parameters, known only at
+/// monomorphization.
+fn scalar_is_generic_early(generics: &syn::Generics, scalar: &TokenStream2) -> bool {
+    let scalar_str = scalar.to_string();
+    generics.params.iter().any(|p| match p {
+        GenericParam::Type(t) => t.ident == scalar_str,
+        _ => false,
     })
 }
 
@@ -726,4 +781,67 @@ fn detect_scalar(generics: &Generics) -> syn::Result<Option<Ident>> {
     }
 
     Ok(scalar_bound.or(named_t))
+}
+
+/// Rewrites `a * b + c` and `c + a * b` in a kernel body into a `::hydroplane::__fuse` call,
+/// which is a fused multiply-add when the operands are varyings and the same two operators
+/// otherwise, so kernels written with plain operators get the FMA throughput of `.fma`.
+/// Operands keep their evaluation order. Constant contexts (types, array lengths, `const`
+/// items and blocks, generic arguments, patterns) are left alone, since the rewrite is a
+/// method call.
+struct FuseMulAdd;
+
+fn peel(e: &syn::Expr) -> &syn::Expr {
+    match e {
+        syn::Expr::Paren(p) => peel(&p.expr),
+        _ => e,
+    }
+}
+
+fn as_mul(e: &syn::Expr) -> Option<(syn::Expr, syn::Expr)> {
+    match peel(e) {
+        syn::Expr::Binary(b) if matches!(b.op, syn::BinOp::Mul(_)) => Some((peel(&b.left).clone(), peel(&b.right).clone())),
+        _ => None,
+    }
+}
+
+impl syn::visit_mut::VisitMut for FuseMulAdd {
+    fn visit_expr_mut(&mut self, e: &mut syn::Expr) {
+        match e {
+            syn::Expr::Const(_) => return,
+            syn::Expr::Repeat(r) => {
+                self.visit_expr_mut(&mut r.expr);
+                return;
+            }
+            _ => {}
+        }
+        syn::visit_mut::visit_expr_mut(self, e);
+        let syn::Expr::Binary(b) = e else { return };
+        if !matches!(b.op, syn::BinOp::Add(_)) {
+            return;
+        }
+        let (x, y, c, c_first) = if let Some((x, y)) = as_mul(&b.right) {
+            (x, y, peel(&b.left).clone(), true)
+        } else if let Some((x, y)) = as_mul(&b.left) {
+            (x, y, peel(&b.right).clone(), false)
+        } else {
+            return;
+        };
+        let bind = if c_first {
+            quote! { let __hp_c = #c; let __hp_a = #x; let __hp_b = #y; }
+        } else {
+            quote! { let __hp_a = #x; let __hp_b = #y; let __hp_c = #c; }
+        };
+        *e = syn::parse_quote!({
+            #[allow(unused_imports)]
+            use ::hydroplane::__fuse::{ViaFma as _, ViaOps as _};
+            #bind
+            (&::hydroplane::__fuse::Fuse::new(__hp_a, __hp_b, __hp_c)).__hp_fuse()
+        });
+    }
+    fn visit_type_mut(&mut self, _: &mut syn::Type) {}
+    fn visit_pat_mut(&mut self, _: &mut syn::Pat) {}
+    fn visit_generic_argument_mut(&mut self, _: &mut syn::GenericArgument) {}
+    fn visit_item_const_mut(&mut self, _: &mut syn::ItemConst) {}
+    fn visit_item_static_mut(&mut self, _: &mut syn::ItemStatic) {}
 }

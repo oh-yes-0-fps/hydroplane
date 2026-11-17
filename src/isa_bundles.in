@@ -1,0 +1,37 @@
+// The target-feature bundle each dispatch tier requires, as mainstream x86 CPUs ship them: a tier
+// is only selected when every feature in its bundle is present, and its code is compiled with all
+// of them. Read by `build.rs` (static-dispatch cfgs) and checked against `__hp_isa!` by a test.
+&[
+    ("SSE41", &["sse3", "ssse3", "sse4.1", "sse4.2", "popcnt"]),
+    ("AVX", &["sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx"]),
+    (
+        "AVX2",
+        &[
+            "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx", "avx2", "bmi1", "bmi2", "f16c",
+            "fma", "lzcnt", "movbe",
+        ],
+    ),
+    (
+        "AVX512",
+        &[
+            "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx", "avx2", "bmi1", "bmi2", "f16c",
+            "fma", "lzcnt", "movbe", "avx512f", "avx512cd", "avx512bw", "avx512dq", "avx512vl",
+        ],
+    ),
+    (
+        "AVX512BF16",
+        &[
+            "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx", "avx2", "bmi1", "bmi2", "f16c",
+            "fma", "lzcnt", "movbe", "avx512f", "avx512cd", "avx512bw", "avx512dq", "avx512vl",
+            "avx512bf16",
+        ],
+    ),
+    (
+        "AVX512FP16",
+        &[
+            "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx", "avx2", "bmi1", "bmi2", "f16c",
+            "fma", "lzcnt", "movbe", "avx512f", "avx512cd", "avx512bw", "avx512dq", "avx512vl",
+            "avx512bf16", "avx512fp16",
+        ],
+    ),
+]

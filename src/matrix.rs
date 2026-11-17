@@ -18,7 +18,15 @@ pub trait Role: sealed::Sealed + Copy + 'static {
     /// How the CPU/array backends store a tile of this role: a borrowing [`View`] for the
     /// read-only inputs (`A`/`B`), an owned `[[E; C]; R]` for the accumulator. The GPU backend
     /// ignores this and uses its own opaque tile.
+    #[cfg(not(target_arch = "spirv"))]
     type Repr<'a, E: Scalar, const R: usize, const C: usize>: CpuTile<'a, E, R, C>;
+    #[cfg(target_arch = "spirv")]
+    type Repr<'a, E: Scalar, const R: usize, const C: usize>: CpuTile<'a, E, R, C>
+        + lanes::LaneTile<'a, E, R, C>;
+    /// The cooperative-matrix type of an `R×C` tile of SPIR-V component `E` in this role.
+    #[cfg(target_arch = "spirv")]
+    #[doc(hidden)]
+    type Coop<E: Copy, const R: usize, const C: usize>: Copy;
 }
 
 /// The left operand `A` (`M×K`).
@@ -37,14 +45,20 @@ impl sealed::Sealed for Accumulator {}
 impl Role for MatrixA {
     const USE: u32 = 0;
     type Repr<'a, E: Scalar, const R: usize, const C: usize> = View<'a, E, R, C>;
+    #[cfg(target_arch = "spirv")]
+    type Coop<E: Copy, const R: usize, const C: usize> = coop::CoopMatrix<E, 0, R, C>;
 }
 impl Role for MatrixB {
     const USE: u32 = 1;
     type Repr<'a, E: Scalar, const R: usize, const C: usize> = View<'a, E, R, C>;
+    #[cfg(target_arch = "spirv")]
+    type Coop<E: Copy, const R: usize, const C: usize> = coop::CoopMatrix<E, 1, R, C>;
 }
 impl Role for Accumulator {
     const USE: u32 = 2;
     type Repr<'a, E: Scalar, const R: usize, const C: usize> = [[E; C]; R];
+    #[cfg(target_arch = "spirv")]
+    type Coop<E: Copy, const R: usize, const C: usize> = coop::CoopMatrix<E, 2, R, C>;
 }
 
 /// In-memory layout of a tile when loading from / storing to a slice.
@@ -62,6 +76,9 @@ pub enum Layout {
 /// row-major case so the GEMM packs straight from the caller's memory.
 pub struct View<'a, E, const R: usize, const C: usize> {
     ptr: *const E,
+    // SPIR-V cannot offset a raw pointer, so the GPU indexes the borrowed slice.
+    #[cfg(target_arch = "spirv")]
+    mem: &'a [E],
     row_stride: usize,
     layout: Layout,
     _p: core::marker::PhantomData<&'a [E]>,
@@ -79,8 +96,22 @@ impl<'a, E: Scalar, const R: usize, const C: usize> View<'a, E, R, C> {
     /// Element `(r, c)`, honoring the view's stride and layout.
     #[inline]
     pub fn get(self, r: usize, c: usize) -> E {
+        #[cfg(target_arch = "spirv")]
+        return self.mem[tile_index(r, c, self.row_stride, self.layout)];
         // SAFETY: `(r, c)` is in `R×C` and the view borrows a slice large enough for the tile.
-        unsafe { *self.ptr.add(tile_index(r, c, self.row_stride, self.layout)) }
+        #[cfg(not(target_arch = "spirv"))]
+        unsafe {
+            *self.ptr.add(tile_index(r, c, self.row_stride, self.layout))
+        }
+    }
+    /// How far apart in memory consecutive rows and consecutive columns are.
+    #[cfg(not(target_arch = "spirv"))]
+    #[inline]
+    fn steps(self) -> (usize, usize) {
+        match self.layout {
+            Layout::RowMajor => (self.row_stride, 1),
+            Layout::ColMajor => (1, self.row_stride),
+        }
     }
     /// The backing pointer iff the tile is dense row-major (`row_stride == C`), the zero-copy
     /// fast path; `None` when a gather/copy is needed.
@@ -126,7 +157,14 @@ pub trait CpuTile<'a, E: Scalar, const R: usize, const C: usize>: Copy {
 impl<'a, E: Scalar, const R: usize, const C: usize> CpuTile<'a, E, R, C> for View<'a, E, R, C> {
     #[inline]
     fn ct_load(mem: &'a [E], row_stride: usize, layout: Layout) -> Self {
-        View { ptr: mem.as_ptr(), row_stride, layout, _p: core::marker::PhantomData }
+        View {
+            ptr: mem.as_ptr(),
+            #[cfg(target_arch = "spirv")]
+            mem,
+            row_stride,
+            layout,
+            _p: core::marker::PhantomData,
+        }
     }
     #[inline]
     fn ct_store(self, _out: &mut [E], _row_stride: usize, _layout: Layout) {
@@ -136,7 +174,7 @@ impl<'a, E: Scalar, const R: usize, const C: usize> CpuTile<'a, E, R, C> for Vie
     fn ct_splat(_v: E) -> Self {
         unreachable!("a read-only input tile is never splatted")
     }
-    #[inline]
+    #[inline(always)]
     fn ct_map(self, _f: impl Fn(E) -> E) -> Self {
         unreachable!("a read-only input tile is never mapped")
     }
@@ -181,7 +219,7 @@ impl<'a, E: Scalar, const R: usize, const C: usize> CpuTile<'a, E, R, C> for [[E
     fn ct_splat(v: E) -> Self {
         [[v; C]; R]
     }
-    #[inline]
+    #[inline(always)]
     fn ct_map(mut self, f: impl Fn(E) -> E) -> Self {
         let mut r = 0;
         while r < R {
@@ -209,7 +247,7 @@ impl<'a, E: Scalar, const R: usize, const C: usize> CpuTile<'a, E, R, C> for [[E
 /// `MatrixBackend<T>` and the existing dispatch delivers it.
 pub trait MatrixBackend<T: FloatScalar>: Backend<T> {
     /// An `R×C` tile of element `E` in role `Ro`. Concrete `[[E; C]; R]` on the CPU/scalar/GPU
-    /// floor; an opaque distributed handle once a cooperative-matrix lowering is available.
+    /// floor; an opaque subgroup-distributed cooperative matrix on the GPU coop lowering.
     type Tile<'a, E: Scalar, const R: usize, const C: usize, Ro: Role>: Copy;
 
     /// Load an `R×C` tile from `mem` with the given row stride and layout. For the input roles
@@ -287,15 +325,41 @@ pub trait MatrixBackend<T: FloatScalar>: Backend<T> {
         f: impl Fn(E, E) -> E,
     ) -> Self::Tile<'a, E, R, C, Accumulator>;
 
-    /// `D = A·B + C`. `A`/`B` hold element `T`; the accumulator holds `T::Compute`. All three
-    /// tiles and the result share one lifetime `'i`: the inputs borrow their source slices for it,
-    /// the owned accumulator just carries it.
-    fn mma<'i, const M: usize, const N: usize, const K: usize>(
+    /// `D = A·B + C`. `A`/`B` hold element `T`; the accumulator holds `T::Compute`. The inputs
+    /// borrow their source slices for `'i`; the owned accumulator and the result carry their own
+    /// `'c`, so memory the inputs were loaded from can be refilled while an accumulator lives.
+    fn mma<'i, 'c, const M: usize, const N: usize, const K: usize>(
         self,
         a: Self::Tile<'i, T, M, K, MatrixA>,
         b: Self::Tile<'i, T, K, N, MatrixB>,
-        c: Self::Tile<'i, T::Compute, M, N, Accumulator>,
-    ) -> Self::Tile<'i, T::Compute, M, N, Accumulator>;
+        c: Self::Tile<'c, T::Compute, M, N, Accumulator>,
+    ) -> Self::Tile<'c, T::Compute, M, N, Accumulator>;
+
+    /// `C[i][j] = A[i]·B[j] + C[i][j]` over a `BM×BN` register block (each at most 8): the same
+    /// result as an [`mma`](MatrixBackend::mma) per pair, but a backend whose input tiles stay
+    /// in memory reads each input element once for the whole block.
+    #[inline(always)]
+    fn mma_block<
+        'i,
+        'c,
+        const BM: usize,
+        const BN: usize,
+        const M: usize,
+        const N: usize,
+        const K: usize,
+    >(
+        self,
+        a: [Self::Tile<'i, T, M, K, MatrixA>; BM],
+        b: [Self::Tile<'i, T, K, N, MatrixB>; BN],
+        mut c: [[Self::Tile<'c, T::Compute, M, N, Accumulator>; BN]; BM],
+    ) -> [[Self::Tile<'c, T::Compute, M, N, Accumulator>; BN]; BM] {
+        crate::unroll!(BM, i, {
+            crate::unroll!(BN, j, {
+                c[i][j] = self.mma(a[i], b[j], c[i][j]);
+            });
+        });
+        c
+    }
 }
 
 #[inline]
@@ -309,125 +373,206 @@ fn tile_index(r: usize, c: usize, row_stride: usize, layout: Layout) -> usize {
 // The accumulator row/column/zip ops over the owned `[[E; C]; R]` repr, shared by every array
 // backend through `array_tile_methods!`.
 
-#[inline]
+#[inline(always)]
 pub(crate) fn acc_zip<E: Scalar, const R: usize, const C: usize>(
     mut a: [[E; C]; R],
     b: [[E; C]; R],
     f: impl Fn(E, E) -> E,
 ) -> [[E; C]; R] {
-    for (ar, br) in a.iter_mut().zip(&b) {
-        for (av, bv) in ar.iter_mut().zip(br) {
-            *av = f(*av, *bv);
+    let mut r = 0;
+    while r < R {
+        let mut c = 0;
+        while c < C {
+            a[r][c] = f(a[r][c], b[r][c]);
+            c += 1;
         }
+        r += 1;
     }
     a
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) fn acc_fold_rows<E: Scalar, const R: usize, const C: usize>(
     t: [[E; C]; R],
     mut acc: [E; R],
     f: impl Fn(E, E) -> E,
 ) -> [E; R] {
-    for (a, row) in acc.iter_mut().zip(&t) {
-        for &v in row {
-            *a = f(*a, v);
+    let mut r = 0;
+    while r < R {
+        let mut c = 0;
+        while c < C {
+            acc[r] = f(acc[r], t[r][c]);
+            c += 1;
         }
+        r += 1;
     }
     acc
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) fn acc_fold_cols<E: Scalar, const R: usize, const C: usize>(
     t: [[E; C]; R],
     mut acc: [E; C],
     f: impl Fn(E, E) -> E,
 ) -> [E; C] {
-    for row in &t {
-        for (a, &v) in acc.iter_mut().zip(row) {
-            *a = f(*a, v);
+    let mut r = 0;
+    while r < R {
+        let mut c = 0;
+        while c < C {
+            acc[c] = f(acc[c], t[r][c]);
+            c += 1;
         }
+        r += 1;
     }
     acc
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) fn acc_zip_rows<E: Scalar, const R: usize, const C: usize>(
     mut t: [[E; C]; R],
     v: [E; R],
     f: impl Fn(E, E) -> E,
 ) -> [[E; C]; R] {
-    for (row, &s) in t.iter_mut().zip(&v) {
-        for e in row {
-            *e = f(*e, s);
+    let mut r = 0;
+    while r < R {
+        let mut c = 0;
+        while c < C {
+            t[r][c] = f(t[r][c], v[r]);
+            c += 1;
         }
+        r += 1;
     }
     t
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) fn acc_zip_cols<E: Scalar, const R: usize, const C: usize>(
     mut t: [[E; C]; R],
     v: [E; C],
     f: impl Fn(E, E) -> E,
 ) -> [[E; C]; R] {
-    for row in t.iter_mut() {
-        for (e, &s) in row.iter_mut().zip(&v) {
-            *e = f(*e, s);
+    let mut r = 0;
+    while r < R {
+        let mut c = 0;
+        while c < C {
+            t[r][c] = f(t[r][c], v[c]);
+            c += 1;
         }
+        r += 1;
     }
     t
 }
 
-/// Register-blocked GEMM, all operands already in compute precision `C`. Blocks `N` into
-/// `lanes()`-wide accumulators kept in registers across the `K` reduction, folding with the
-/// backend's `fma`; a scalar tail handles `N % lanes`.
-#[inline]
+/// Register-blocked GEMM, all operands already in compute precision `C`.
+#[cfg(all(test, not(target_arch = "spirv")))]
+#[inline(always)]
 fn simd_gemm<C: FloatScalar, B: Backend<C>, const M: usize, const N: usize, const K: usize>(
     backend: B,
     a: [[C; K]; M],
     b: [[C; N]; K],
+    c: [[C; N]; M],
+) -> [[C; N]; M] {
+    simd_gemm_by::<C, B, M, N, K>(backend, |i, k| a[i][k], |k| &b[k], c)
+}
+
+/// [`simd_gemm`] over accessors: `a(i, k)` is one `A` element, `b(k)` row `k` of `B`, so either
+/// can read straight from strided memory. Four rows × two `lanes()`-wide column vectors of `C`
+/// stay in registers across the `K` reduction: eight independent `fma` chains, so the
+/// multiply-adds overlap instead of waiting on each other's latency. Leftover rows and columns
+/// take one vector, then scalars. Always inlined: it runs inside the dispatched backend's
+/// `target_feature` context, and out of line every vector op would become a call (measured ~30×
+/// slower on x86).
+#[cfg(not(target_arch = "spirv"))]
+#[inline(always)]
+fn simd_gemm_by<
+    'b,
+    C: FloatScalar,
+    B: Backend<C>,
+    const M: usize,
+    const N: usize,
+    const K: usize,
+>(
+    backend: B,
+    a: impl Fn(usize, usize) -> C,
+    b: impl Fn(usize) -> &'b [C; N],
     mut c: [[C; N]; M],
 ) -> [[C; N]; M] {
+    const ROWS: usize = 4;
     let lanes = backend.lanes();
     let mut i = 0;
-    while i < M {
+    while i + ROWS <= M {
         let mut j = 0;
-        while j + lanes <= N {
-            let mut acc = backend.load(&c[i][j..j + lanes]);
-            let mut k = 0;
-            while k < K {
-                let aik = backend.splat(a[i][k]);
-                let br = backend.load(&b[k][j..j + lanes]);
-                acc = backend.fma(aik, br, acc);
-                k += 1;
+        while j + 2 * lanes <= N {
+            let mut acc = [[backend.splat(C::ZERO); 2]; ROWS];
+            for (r, acc_r) in acc.iter_mut().enumerate() {
+                acc_r[0] = backend.load(&c[i + r][j..j + lanes]);
+                acc_r[1] = backend.load(&c[i + r][j + lanes..j + 2 * lanes]);
             }
-            backend.store(acc, &mut c[i][j..j + lanes]);
-            j += lanes;
-        }
-        while j < N {
-            let mut s = c[i][j];
-            let mut k = 0;
-            while k < K {
-                s = a[i][k].fma(b[k][j], s);
-                k += 1;
+            for k in 0..K {
+                let b_row = b(k);
+                let b0 = backend.load(&b_row[j..j + lanes]);
+                let b1 = backend.load(&b_row[j + lanes..j + 2 * lanes]);
+                for (r, acc_r) in acc.iter_mut().enumerate() {
+                    let aik = backend.splat(a(i + r, k));
+                    acc_r[0] = backend.fma(aik, b0, acc_r[0]);
+                    acc_r[1] = backend.fma(aik, b1, acc_r[1]);
+                }
             }
-            c[i][j] = s;
-            j += 1;
+            for (r, acc_r) in acc.iter().enumerate() {
+                backend.store(acc_r[0], &mut c[i + r][j..j + lanes]);
+                backend.store(acc_r[1], &mut c[i + r][j + lanes..j + 2 * lanes]);
+            }
+            j += 2 * lanes;
         }
+        for (r, c_row) in c[i..i + ROWS].iter_mut().enumerate() {
+            simd_gemm_row::<C, B, N, K>(backend, |k| a(i + r, k), &b, c_row, j);
+        }
+        i += ROWS;
+    }
+    while i < M {
+        simd_gemm_row::<C, B, N, K>(backend, |k| a(i, k), &b, &mut c[i], 0);
         i += 1;
     }
     c
 }
 
+/// One row of [`simd_gemm_by`] from column `j`: a vector at a time, then scalars.
+#[cfg(not(target_arch = "spirv"))]
+#[inline(always)]
+fn simd_gemm_row<'b, C: FloatScalar, B: Backend<C>, const N: usize, const K: usize>(
+    backend: B,
+    a: impl Fn(usize) -> C,
+    b: &impl Fn(usize) -> &'b [C; N],
+    c: &mut [C; N],
+    mut j: usize,
+) {
+    let lanes = backend.lanes();
+    while j + lanes <= N {
+        let mut acc = backend.load(&c[j..j + lanes]);
+        for k in 0..K {
+            acc = backend.fma(backend.splat(a(k)), backend.load(&b(k)[j..j + lanes]), acc);
+        }
+        backend.store(acc, &mut c[j..j + lanes]);
+        j += lanes;
+    }
+    while j < N {
+        let mut s = c[j];
+        for k in 0..K {
+            s = a(k).fma(b(k)[j], s);
+        }
+        c[j] = s;
+        j += 1;
+    }
+}
+
 /// Register-blocked + B-packed GEMM: the BLIS micro-kernel generalized to every element-wise
-/// [`Backend`]. Two fixes over [`simd_gemm`]: pack B once into contiguous `lanes`-wide column
+/// [`Backend`]. Two fixes over [`simd_gemm_by`]: pack B once into contiguous `lanes`-wide column
 /// panels so the `K`-loop's B loads are unit-stride and L1-resident, and keep an `MR×NR`
 /// micro-tile of `C` in independent accumulators so the `fma` latency chains overlap. The caller
 /// sizes `NR` from the cached per-core unroll factor (`Gang::unroll`), capped to fit the SIMD
 /// register file (`MR·NR + NR + 1` registers).
 ///
-/// Numerically identical to [`simd_gemm`] (same per-element `fma` order). Worth it only for large
+/// Numerically identical to [`simd_gemm_by`] (same per-element `fma` order). Worth it only for large
 /// tiles; the caller gates on size.
 #[cfg(feature = "std")]
 #[inline]
@@ -461,15 +606,20 @@ fn packed_gemm<
 
     // One packed B vector (panel `jb`, row `k`).
     let bvec = |jb: usize, k: usize| backend.load(&bp[jb * panel + k * lanes..jb * panel + k * lanes + lanes]);
-    // Reduce one `lanes`-wide C block over K (the N-block and M-row tails).
-    let edge = |c: &mut [[C; N]; M], i: usize, jb: usize| {
-        let cj = jb * lanes;
-        let mut acc = backend.load(&c[i][cj..cj + lanes]);
-        for k in 0..K {
-            acc = backend.fma(backend.splat(a[i][k]), bvec(jb, k), acc);
-        }
-        backend.store(acc, &mut c[i][cj..cj + lanes]);
-    };
+    // Reduce one `lanes`-wide C block over K (the N-block and M-row tails). A macro, not a
+    // closure: a closure has none of the caller's target features, so the backend ops inside it
+    // stay calls unless the closure itself is inlined.
+    macro_rules! edge {
+        ($i:expr, $jb:expr) => {{
+            let (i, jb) = ($i, $jb);
+            let cj = jb * lanes;
+            let mut acc = backend.load(&c[i][cj..cj + lanes]);
+            for k in 0..K {
+                acc = backend.fma(backend.splat(a[i][k]), bvec(jb, k), acc);
+            }
+            backend.store(acc, &mut c[i][cj..cj + lanes]);
+        }};
+    }
 
     let mut i = 0;
     while i + MR <= M {
@@ -501,7 +651,7 @@ fn packed_gemm<
         }
         while jb < nb {
             for mr in 0..MR {
-                edge(&mut c, i + mr, jb);
+                edge!(i + mr, jb);
             }
             jb += 1;
         }
@@ -509,7 +659,7 @@ fn packed_gemm<
     }
     while i < M {
         for jb in 0..nb {
-            edge(&mut c, i, jb);
+            edge!(i, jb);
         }
         i += 1;
     }
@@ -991,7 +1141,7 @@ unsafe fn bf16_dpbf16_gemm<const M: usize, const N: usize, const K: usize>(
     c
 }
 
-/// `mma` for a SIMD backend: widen `A`/`B` from `T` to `T::Compute`, then run [`simd_gemm`] in
+/// `mma` for a SIMD backend: widen `A`/`B` from `T` to `T::Compute`, then run [`simd_gemm_by`] in
 /// compute precision; `f32`/`f64` are pass-through.
 ///
 /// The matrix-coprocessor path is chosen by platform, mutually exclusive by `target_vendor`:
@@ -999,7 +1149,8 @@ unsafe fn bf16_dpbf16_gemm<const M: usize, const N: usize, const K: usize>(
 /// framework and routes to the SME2 ZA engine instead); non-Apple aarch64 takes the SME ZA engine
 /// when the CPU has it (`--cfg hp_no_sme` opts out). Below the per-path threshold, and everywhere
 /// else, it's the inlinable register-blocked GEMM.
-#[inline]
+#[cfg(not(target_arch = "spirv"))]
+#[inline(always)]
 fn array_mma_simd<'i, T, S, const M: usize, const N: usize, const K: usize>(
     backend: S,
     a: View<'i, T, M, K>,
@@ -1123,7 +1274,25 @@ where
         }
     }
 
-    if needs_materialize {
+    // Only the library and matrix-engine paths below read `ac`/`bc` through `cap`/`cbp`, and only
+    // at their minimum sizes; smaller tiles skip the copy.
+    #[allow(unused_mut)]
+    let mut hw_sized = false;
+    #[cfg(all(target_vendor = "apple", not(hp_no_apple_accelerate)))]
+    {
+        hw_sized |= M >= ACCEL_MIN_DIM && N >= ACCEL_MIN_DIM && K >= ACCEL_MIN_DIM;
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        feature = "std",
+        not(hp_no_sme),
+        any(not(target_vendor = "apple"), hp_no_apple_accelerate)
+    ))]
+    {
+        hw_sized |= M >= SME_MIN_DIM && N >= SME_MIN_DIM && K >= SME_MIN_DIM;
+    }
+    let materialized = needs_materialize && hw_sized;
+    if materialized {
         materialize(&mut ac, &mut bc);
     }
     // Compute-precision source pointers: the view's own pointer when dense, else the materialized
@@ -1321,9 +1490,7 @@ where
             && is_x86_feature_detected!("avx512bw");
         #[cfg(hp_static_dispatch)]
         let avx512bf16 = cfg!(all(
-            target_feature = "avx512bf16",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
+            hp_tf_v4bf16
         ));
         if let (Some(adp), Some(bdp)) = (a_dense, b_dense)
             && TypeId::of::<T>() == TypeId::of::<half::bf16>()
@@ -1342,16 +1509,15 @@ where
         }
     }
 
-    // No hardware path took the tile; the array GEMMs need the materialized arrays.
-    if !needs_materialize {
-        materialize(&mut ac, &mut bc);
-    }
     // Large tiles (B overflows L1) take the B-packed GEMM; below this the pack doesn't pay.
     #[cfg(feature = "std")]
     if M >= 32 && N >= 32 && K >= 32 {
+        if !materialized {
+            materialize(&mut ac, &mut bc);
+        }
         // Size the MR×NR block from the cached per-core unroll factor, capped to fit the SIMD
         // register file with scratch to spare (`5*NR + 1 <= REGS - 2`).
-        const REGS: usize = if cfg!(target_arch = "aarch64") || cfg!(target_feature = "avx512f") {
+        const REGS: usize = if cfg!(target_arch = "aarch64") || cfg!(hp_tf_v4) {
             32
         } else {
             16
@@ -1365,11 +1531,74 @@ where
             _ => packed_gemm::<_, _, M, N, K, 4, 4>(backend, ac, bc, c),
         };
     }
-    simd_gemm(backend, ac, bc, c)
+    view_gemm(backend, a, b, c)
+}
+
+/// [`simd_gemm_by`] straight from the input views. Inputs already in compute precision are read
+/// in place, `A` an element and contiguous `B` a row at a time. Narrower inputs are widened into
+/// compute-precision copies once per call, a whole row at a time so the conversion vectorizes,
+/// instead of once per use.
+#[cfg(not(target_arch = "spirv"))]
+#[inline(always)]
+fn view_gemm<T, S, const M: usize, const N: usize, const K: usize>(
+    backend: S,
+    a: View<'_, T, M, K>,
+    b: View<'_, T, K, N>,
+    c: [[T::Compute; N]; M],
+) -> [[T::Compute; N]; M]
+where
+    T: FloatScalar,
+    S: Backend<T::Compute>,
+{
+    let (ars, acs) = a.steps();
+    let (brs, bcs) = b.steps();
+    if core::any::TypeId::of::<T>() == core::any::TypeId::of::<T::Compute>() {
+        let ap = a.ptr as *const T::Compute;
+        // SAFETY: `T == T::Compute` and `(i, k)` is inside the `M×K` tile the view borrows.
+        let at = |i: usize, k: usize| unsafe { *ap.add(i * ars + k * acs) };
+        // Rows a multiple of 2 KiB apart share one or two L1 sets, so `B`, reread for every
+        // block of four rows, keeps evicting itself; a copy is cheaper than those misses.
+        let aliased = M > 4 && (brs * size_of::<T>()).is_multiple_of(2048);
+        if bcs == 1 && !aliased {
+            let bp = b.ptr as *const T::Compute;
+            // SAFETY: `T == T::Compute`, and row `k` is `N` contiguous elements inside the view.
+            let row = |k: usize| unsafe { &*(bp.add(k * brs) as *const [T::Compute; N]) };
+            return simd_gemm_by::<T::Compute, S, M, N, K>(backend, at, row, c);
+        }
+        let bc = widen_view(b);
+        return simd_gemm_by::<T::Compute, S, M, N, K>(backend, at, |k| &bc[k], c);
+    }
+    let (ac, bc) = (widen_view(a), widen_view(b));
+    simd_gemm_by::<T::Compute, S, M, N, K>(backend, |i, k| ac[i][k], |k| &bc[k], c)
+}
+
+/// The view's tile in compute precision, row by row.
+#[cfg(not(target_arch = "spirv"))]
+#[inline(always)]
+fn widen_view<T: FloatScalar, const R: usize, const C: usize>(
+    v: View<'_, T, R, C>,
+) -> [[T::Compute; C]; R] {
+    let (rs, cs) = v.steps();
+    let mut out = [[<T::Compute as Scalar>::ZERO; C]; R];
+    for (r, row) in out.iter_mut().enumerate() {
+        if cs == 1 {
+            // SAFETY: row `r` is `C` contiguous elements inside the view.
+            let src = unsafe { &*(v.ptr.add(r * rs) as *const [T; C]) };
+            for (x, s) in row.iter_mut().zip(src) {
+                *x = s.widen();
+            }
+        } else {
+            for (cidx, x) in row.iter_mut().enumerate() {
+                // SAFETY: `(r, cidx)` is inside the tile the view borrows.
+                *x = unsafe { *v.ptr.add(r * rs + cidx * cs) }.widen();
+            }
+        }
+    }
+    out
 }
 
 /// `mma` for the GPU `Subgroup` floor: each invocation computes the whole tile scalar-wise. The
-/// subgroup `load` is per-invocation (one element), not a SIMD register, so [`simd_gemm`]'s
+/// subgroup `load` is per-invocation (one element), not a SIMD register, so [`simd_gemm_by`]'s
 /// lane-blocking would be wrong here.
 #[cfg(target_arch = "spirv")]
 #[inline]
@@ -1405,7 +1634,7 @@ macro_rules! array_tile_methods {
         type Tile<'a, E: Scalar, const R: usize, const C: usize, Ro: Role> =
             <Ro as $crate::matrix::Role>::Repr<'a, E, R, C>;
 
-        #[inline]
+        #[inline(always)]
         fn tile_load<'a, E: Scalar, const R: usize, const C: usize, Ro: Role>(
             self,
             mem: &'a [E],
@@ -1415,7 +1644,7 @@ macro_rules! array_tile_methods {
             $crate::matrix::CpuTile::ct_load(mem, row_stride, layout)
         }
 
-        #[inline]
+        #[inline(always)]
         fn tile_store<E: Scalar, const R: usize, const C: usize, Ro: Role>(
             self,
             t: <Ro as $crate::matrix::Role>::Repr<'_, E, R, C>,
@@ -1426,7 +1655,7 @@ macro_rules! array_tile_methods {
             $crate::matrix::CpuTile::ct_store(t, out, row_stride, layout)
         }
 
-        #[inline]
+        #[inline(always)]
         fn tile_splat<'a, E: Scalar, const R: usize, const C: usize, Ro: Role>(
             self,
             v: E,
@@ -1434,7 +1663,7 @@ macro_rules! array_tile_methods {
             $crate::matrix::CpuTile::ct_splat(v)
         }
 
-        #[inline]
+        #[inline(always)]
         fn tile_map<'a, E: Scalar, const R: usize, const C: usize, Ro: Role>(
             self,
             t: <Ro as $crate::matrix::Role>::Repr<'a, E, R, C>,
@@ -1443,7 +1672,7 @@ macro_rules! array_tile_methods {
             $crate::matrix::CpuTile::ct_map(t, f)
         }
 
-        #[inline]
+        #[inline(always)]
         fn tile_zip<'a, E: Scalar, const R: usize, const C: usize>(
             self,
             a: <$crate::matrix::Accumulator as $crate::matrix::Role>::Repr<'a, E, R, C>,
@@ -1453,7 +1682,7 @@ macro_rules! array_tile_methods {
             $crate::matrix::acc_zip(a, b, f)
         }
 
-        #[inline]
+        #[inline(always)]
         fn tile_fold_rows<E: Scalar, const R: usize, const C: usize>(
             self,
             t: <$crate::matrix::Accumulator as $crate::matrix::Role>::Repr<'_, E, R, C>,
@@ -1463,7 +1692,7 @@ macro_rules! array_tile_methods {
             $crate::matrix::acc_fold_rows(t, acc, f)
         }
 
-        #[inline]
+        #[inline(always)]
         fn tile_fold_cols<E: Scalar, const R: usize, const C: usize>(
             self,
             t: <$crate::matrix::Accumulator as $crate::matrix::Role>::Repr<'_, E, R, C>,
@@ -1473,7 +1702,7 @@ macro_rules! array_tile_methods {
             $crate::matrix::acc_fold_cols(t, acc, f)
         }
 
-        #[inline]
+        #[inline(always)]
         fn tile_zip_rows<'a, E: Scalar, const R: usize, const C: usize>(
             self,
             t: <$crate::matrix::Accumulator as $crate::matrix::Role>::Repr<'a, E, R, C>,
@@ -1483,7 +1712,7 @@ macro_rules! array_tile_methods {
             $crate::matrix::acc_zip_rows(t, v, f)
         }
 
-        #[inline]
+        #[inline(always)]
         fn tile_zip_cols<'a, E: Scalar, const R: usize, const C: usize>(
             self,
             t: <$crate::matrix::Accumulator as $crate::matrix::Role>::Repr<'a, E, R, C>,
@@ -1505,14 +1734,39 @@ macro_rules! impl_array_matrix_backend {
         {
             array_tile_methods!();
 
-            #[inline]
-            fn mma<'i, const M: usize, const N: usize, const K: usize>(
+            #[inline(always)]
+            fn mma<'i, 'c, const M: usize, const N: usize, const K: usize>(
                 self,
                 a: Self::Tile<'i, T, M, K, $crate::matrix::MatrixA>,
                 b: Self::Tile<'i, T, K, N, $crate::matrix::MatrixB>,
-                c: Self::Tile<'i, <T as FloatScalar>::Compute, M, N, $crate::matrix::Accumulator>,
-            ) -> Self::Tile<'i, <T as FloatScalar>::Compute, M, N, $crate::matrix::Accumulator> {
+                c: Self::Tile<'c, <T as FloatScalar>::Compute, M, N, $crate::matrix::Accumulator>,
+            ) -> Self::Tile<'c, <T as FloatScalar>::Compute, M, N, $crate::matrix::Accumulator> {
                 array_mma_simd::<T, $backend, M, N, K>(self, a, b, c)
+            }
+        }
+    };
+    // A runtime-detected token enters its target features itself: a kernel body that does not
+    // inline this far would otherwise run every vector op as a call (~40× slower measured on
+    // AVX2). Baseline-ISA tokens skip it, as the extra closure costs them ~15%.
+    ($backend:ty, simd, entered) => {
+        impl<T: FloatScalar> $crate::matrix::MatrixBackend<T> for $backend
+        where
+            $backend: $crate::backend::Backend<T>
+                + $crate::backend::Backend<<T as FloatScalar>::Compute>
+                + $crate::backend::Backend<f32>,
+        {
+            array_tile_methods!();
+
+            #[inline(always)]
+            fn mma<'i, 'c, const M: usize, const N: usize, const K: usize>(
+                self,
+                a: Self::Tile<'i, T, M, K, $crate::matrix::MatrixA>,
+                b: Self::Tile<'i, T, K, N, $crate::matrix::MatrixB>,
+                c: Self::Tile<'c, <T as FloatScalar>::Compute, M, N, $crate::matrix::Accumulator>,
+            ) -> Self::Tile<'c, <T as FloatScalar>::Compute, M, N, $crate::matrix::Accumulator> {
+                $crate::backend::Backend::<f32>::enter(self, || {
+                    array_mma_simd::<T, $backend, M, N, K>(self, a, b, c)
+                })
             }
         }
     };
@@ -1523,31 +1777,36 @@ macro_rules! impl_array_matrix_backend {
         {
             array_tile_methods!();
 
-            #[inline]
-            fn mma<'i, const M: usize, const N: usize, const K: usize>(
+            #[inline(always)]
+            fn mma<'i, 'c, const M: usize, const N: usize, const K: usize>(
                 self,
                 a: Self::Tile<'i, T, M, K, $crate::matrix::MatrixA>,
                 b: Self::Tile<'i, T, K, N, $crate::matrix::MatrixB>,
-                c: Self::Tile<'i, <T as FloatScalar>::Compute, M, N, $crate::matrix::Accumulator>,
-            ) -> Self::Tile<'i, <T as FloatScalar>::Compute, M, N, $crate::matrix::Accumulator> {
+                c: Self::Tile<'c, <T as FloatScalar>::Compute, M, N, $crate::matrix::Accumulator>,
+            ) -> Self::Tile<'c, <T as FloatScalar>::Compute, M, N, $crate::matrix::Accumulator> {
                 array_mma_scalar::<T, M, N, K>(a, b, c)
             }
         }
     };
 }
 
+#[cfg(not(target_arch = "spirv"))]
 impl_array_matrix_backend!(crate::backend::ScalarBackend, simd);
+// On the GPU the scalar backend is the sequential fallback inside one invocation, where the
+// register-blocked GEMM's slice-of-array loads don't lower.
+#[cfg(target_arch = "spirv")]
+impl_array_matrix_backend!(crate::backend::ScalarBackend, scalar);
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-impl_array_matrix_backend!(crate::backend::avx1::Avx1, simd);
+impl_array_matrix_backend!(crate::backend::avx1::Avx1, simd, entered);
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-impl_array_matrix_backend!(crate::backend::avx2::Avx2, simd);
+impl_array_matrix_backend!(crate::backend::avx2::Avx2, simd, entered);
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-impl_array_matrix_backend!(crate::backend::sse4::Sse4, simd);
+impl_array_matrix_backend!(crate::backend::sse4::Sse4, simd, entered);
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-impl_array_matrix_backend!(crate::backend::avx512::Avx512, simd);
+impl_array_matrix_backend!(crate::backend::avx512::Avx512, simd, entered);
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-impl_array_matrix_backend!(crate::backend::avx512fp16::Avx512Fp16, simd);
+impl_array_matrix_backend!(crate::backend::avx512fp16::Avx512Fp16, simd, entered);
 #[cfg(target_arch = "aarch64")]
 impl_array_matrix_backend!(crate::backend::neon::Neon, simd);
 // armv7 NEON is f32-only: the macro's `Backend<T> + Backend<T::Compute>` bound resolves this for
@@ -1565,19 +1824,22 @@ impl_array_matrix_backend!(crate::backend::wasm::RelaxedSimd, simd);
 #[cfg(target_arch = "aarch64")]
 impl<const W: usize, T: FloatScalar> MatrixBackend<T> for crate::backend::sve::Sve<W>
 where
-    crate::backend::sve::Sve<W>:
-        crate::backend::Backend<T> + crate::backend::Backend<<T as FloatScalar>::Compute>,
+    crate::backend::sve::Sve<W>: crate::backend::Backend<T>
+        + crate::backend::Backend<<T as FloatScalar>::Compute>
+        + crate::backend::Backend<f32>,
 {
     array_tile_methods!();
 
-    #[inline]
-    fn mma<'i, const M: usize, const N: usize, const K: usize>(
+    #[inline(always)]
+    fn mma<'i, 'c, const M: usize, const N: usize, const K: usize>(
         self,
         a: Self::Tile<'i, T, M, K, MatrixA>,
         b: Self::Tile<'i, T, K, N, MatrixB>,
-        c: Self::Tile<'i, <T as FloatScalar>::Compute, M, N, Accumulator>,
-    ) -> Self::Tile<'i, <T as FloatScalar>::Compute, M, N, Accumulator> {
-        array_mma_simd::<T, crate::backend::sve::Sve<W>, M, N, K>(self, a, b, c)
+        c: Self::Tile<'c, <T as FloatScalar>::Compute, M, N, Accumulator>,
+    ) -> Self::Tile<'c, <T as FloatScalar>::Compute, M, N, Accumulator> {
+        crate::backend::Backend::<f32>::enter(self, || {
+            array_mma_simd::<T, crate::backend::sve::Sve<W>, M, N, K>(self, a, b, c)
+        })
     }
 }
 
@@ -1591,21 +1853,33 @@ where
 {
     array_tile_methods!();
 
-    #[inline]
-    fn mma<'i, const M: usize, const N: usize, const K: usize>(
+    #[inline(always)]
+    fn mma<'i, 'c, const M: usize, const N: usize, const K: usize>(
         self,
         a: Self::Tile<'i, T, M, K, MatrixA>,
         b: Self::Tile<'i, T, K, N, MatrixB>,
-        c: Self::Tile<'i, <T as FloatScalar>::Compute, M, N, Accumulator>,
-    ) -> Self::Tile<'i, <T as FloatScalar>::Compute, M, N, Accumulator> {
+        c: Self::Tile<'c, <T as FloatScalar>::Compute, M, N, Accumulator>,
+    ) -> Self::Tile<'c, <T as FloatScalar>::Compute, M, N, Accumulator> {
         array_mma_simd::<T, crate::backend::rvv::Rvv<W>, M, N, K>(self, a, b, c)
     }
 }
 
-// GPU non-coop fallback; the cooperative-matrix lowering layers on top once rust-gpu emits
-// OpCooperativeMatrixMulAddKHR.
 #[cfg(target_arch = "spirv")]
-impl_array_matrix_backend!(crate::backend::subgroup::Subgroup, scalar);
+#[doc(hidden)]
+pub mod lanes;
+
+#[cfg(target_arch = "spirv")]
+impl<T: FloatScalar, const W: usize> MatrixBackend<T>
+    for crate::backend::subgroup::Subgroup<crate::backend::subgroup::Plain, W>
+where
+    crate::backend::subgroup::Subgroup<crate::backend::subgroup::Plain, W>: Backend<T>,
+{
+    lanes::lane_tile_methods!(T, W);
+}
+
+#[cfg(target_arch = "spirv")]
+#[doc(hidden)]
+pub mod coop;
 
 use core::marker::PhantomData;
 
@@ -1618,6 +1892,9 @@ pub struct Tiles<T: FloatScalar, S: MatrixBackend<T>> {
     backend: S,
     _t: PhantomData<T>,
 }
+
+type AccBlock<'c, T, S, const M: usize, const N: usize, const BM: usize, const BN: usize> =
+    [[Tile<'c, T, S, <T as FloatScalar>::Compute, M, N, Accumulator>; BN]; BM];
 
 /// An ergonomic tile value: carries the backend token (like [`Varying`](crate::Varying)) so a kernel
 /// chains `load`/`mma`/`map`/`store` without naming the backend.
@@ -1654,7 +1931,7 @@ impl<S: Copy> Gang<S> {
 impl<T: FloatScalar, S: MatrixBackend<T>> Tiles<T, S> {
     /// Load the `M×K` left operand `A` from memory. The returned tile borrows `mem` for `'a`; on
     /// a dense CPU tile this is a zero-copy view and any copy or widen is deferred to `mma`.
-    #[inline]
+    #[inline(always)]
     pub fn load_a<'a, const M: usize, const K: usize>(
         self,
         mem: &'a [T],
@@ -1669,7 +1946,7 @@ impl<T: FloatScalar, S: MatrixBackend<T>> Tiles<T, S> {
     }
 
     /// Load the `K×N` right operand `B` from memory (zero-copy view; see [`load_a`](Tiles::load_a)).
-    #[inline]
+    #[inline(always)]
     pub fn load_b<'a, const K: usize, const N: usize>(
         self,
         mem: &'a [T],
@@ -1684,7 +1961,7 @@ impl<T: FloatScalar, S: MatrixBackend<T>> Tiles<T, S> {
     }
 
     /// Load the `M×N` accumulator `C` from memory (owned; the accumulator is read-modify-written).
-    #[inline]
+    #[inline(always)]
     pub fn load_acc<'a, const M: usize, const N: usize>(
         self,
         mem: &'a [T::Compute],
@@ -1700,7 +1977,7 @@ impl<T: FloatScalar, S: MatrixBackend<T>> Tiles<T, S> {
 
     /// Load a contiguous row-major `M×K` `A` tile (`row_stride = K`, the common case). For a
     /// sub-tile of a larger matrix (stride > `K`) or column-major data, use [`load_a`](Tiles::load_a).
-    #[inline]
+    #[inline(always)]
     pub fn load_a_rm<'a, const M: usize, const K: usize>(
         self,
         mem: &'a [T],
@@ -1709,7 +1986,7 @@ impl<T: FloatScalar, S: MatrixBackend<T>> Tiles<T, S> {
     }
 
     /// Load a contiguous row-major `K×N` `B` tile (`row_stride = N`).
-    #[inline]
+    #[inline(always)]
     pub fn load_b_rm<'a, const K: usize, const N: usize>(
         self,
         mem: &'a [T],
@@ -1718,7 +1995,7 @@ impl<T: FloatScalar, S: MatrixBackend<T>> Tiles<T, S> {
     }
 
     /// Load a contiguous row-major `M×N` accumulator (`row_stride = N`).
-    #[inline]
+    #[inline(always)]
     pub fn load_acc_rm<'a, const M: usize, const N: usize>(
         self,
         mem: &'a [T::Compute],
@@ -1729,7 +2006,7 @@ impl<T: FloatScalar, S: MatrixBackend<T>> Tiles<T, S> {
     /// Load the `M×K` left operand from a buffer holding `Aᵀ` (`K×M`, dense row-major). A
     /// zero-copy transposed view: `Aᵀ·B` products (normal equations `JᵀJ`) read straight from
     /// the row-major source, and backends with a native transposed operand skip the gather.
-    #[inline]
+    #[inline(always)]
     pub fn load_a_t<'a, const M: usize, const K: usize>(
         self,
         mem: &'a [T],
@@ -1739,7 +2016,7 @@ impl<T: FloatScalar, S: MatrixBackend<T>> Tiles<T, S> {
 
     /// Load the `K×N` right operand from a buffer holding `Bᵀ` (`N×K`, dense row-major) — the
     /// `A·Bᵀ` form (Gram/covariance matrices, `J·Jᵀ`) with no transpose copy at load.
-    #[inline]
+    #[inline(always)]
     pub fn load_b_t<'a, const K: usize, const N: usize>(
         self,
         mem: &'a [T],
@@ -1748,7 +2025,7 @@ impl<T: FloatScalar, S: MatrixBackend<T>> Tiles<T, S> {
     }
 
     /// A zeroed `M×N` accumulator. Owned, so it carries whatever lifetime `mma` unifies it to.
-    #[inline]
+    #[inline(always)]
     pub fn zero_acc<'a, const M: usize, const N: usize>(
         self,
     ) -> Tile<'a, T, S, T::Compute, M, N, Accumulator> {
@@ -1756,7 +2033,7 @@ impl<T: FloatScalar, S: MatrixBackend<T>> Tiles<T, S> {
     }
 
     /// An `M×N` accumulator with every element set to `v`.
-    #[inline]
+    #[inline(always)]
     pub fn splat_acc<'a, const M: usize, const N: usize>(
         self,
         v: T::Compute,
@@ -1768,20 +2045,67 @@ impl<T: FloatScalar, S: MatrixBackend<T>> Tiles<T, S> {
         }
     }
 
-    /// `D = A·B + C`. The operands and accumulator share one lifetime `'i`; loaded in the same
-    /// kernel scope, the borrowed inputs and owned accumulator unify naturally.
-    #[inline]
-    pub fn mma<'i, const M: usize, const N: usize, const K: usize>(
+    /// `D = A·B + C`. The inputs borrow their memory for `'i`; the accumulator keeps its own
+    /// lifetime, so the inputs' memory can be refilled while it lives (e.g. staging buffers).
+    #[inline(always)]
+    pub fn mma<'i, 'c, const M: usize, const N: usize, const K: usize>(
         self,
         a: Tile<'i, T, S, T, M, K, MatrixA>,
         b: Tile<'i, T, S, T, K, N, MatrixB>,
-        c: Tile<'i, T, S, T::Compute, M, N, Accumulator>,
-    ) -> Tile<'i, T, S, T::Compute, M, N, Accumulator> {
+        c: Tile<'c, T, S, T::Compute, M, N, Accumulator>,
+    ) -> Tile<'c, T, S, T::Compute, M, N, Accumulator> {
         Tile {
             backend: self.backend,
             inner: self.backend.mma(a.inner, b.inner, c.inner),
             _p: PhantomData,
         }
+    }
+
+    /// [`mma`](Tiles::mma) over a `BM×BN` register block, `c[i][j] = a[i]·b[j] + c[i][j]`, with
+    /// `BM` and `BN` from 1 to 8. Prefer it to a loop of `mma`s: where tiles are read straight
+    /// from memory, as on GPUs without cooperative matrices, each `A` and `B` element is loaded
+    /// once for the block instead of once per pair.
+    #[inline(always)]
+    pub fn mma_block<
+        'i,
+        'c,
+        const BM: usize,
+        const BN: usize,
+        const M: usize,
+        const N: usize,
+        const K: usize,
+    >(
+        self,
+        a: [Tile<'i, T, S, T, M, K, MatrixA>; BM],
+        b: [Tile<'i, T, S, T, K, N, MatrixB>; BN],
+        c: AccBlock<'c, T, S, M, N, BM, BN>,
+    ) -> AccBlock<'c, T, S, M, N, BM, BN> {
+        const {
+            assert!(
+                BM >= 1 && BM <= 8 && BN >= 1 && BN <= 8,
+                "mma_block takes 1 to 8 tiles per side"
+            )
+        };
+        let mut ai = [a[0].inner; BM];
+        let mut bi = [b[0].inner; BN];
+        let mut ci = [[c[0][0].inner; BN]; BM];
+        crate::unroll!(BM, i, {
+            ai[i] = a[i].inner;
+            crate::unroll!(BN, j, {
+                ci[i][j] = c[i][j].inner;
+            });
+        });
+        crate::unroll!(BN, j, {
+            bi[j] = b[j].inner;
+        });
+        let d = self.backend.mma_block(ai, bi, ci);
+        let mut out = c;
+        crate::unroll!(BM, i, {
+            crate::unroll!(BN, j, {
+                out[i][j].inner = d[i][j];
+            });
+        });
+        out
     }
 }
 
@@ -1795,14 +2119,14 @@ impl<'a, T: FloatScalar, S: MatrixBackend<T>, E: Scalar, const R: usize, const C
     }
 
     /// Store the tile to memory.
-    #[inline]
+    #[inline(always)]
     pub fn store(self, out: &mut [E], row_stride: usize, layout: Layout) {
         self.backend.tile_store(self.inner, out, row_stride, layout);
     }
 
     /// Store the tile contiguously row-major (`row_stride = C`, the tile's column count). The
     /// companion to the `*_rm` loaders for the common dense case.
-    #[inline]
+    #[inline(always)]
     pub fn store_rm(self, out: &mut [E]) {
         self.backend.tile_store(self.inner, out, C, Layout::RowMajor);
     }
@@ -1810,20 +2134,20 @@ impl<'a, T: FloatScalar, S: MatrixBackend<T>, E: Scalar, const R: usize, const C
     /// Store with a fused element-wise epilogue `f` (scale, bias, clamp, activation) folded into
     /// the writeback, avoiding a second pass. Position-independent like [`map`](Tile::map): `f`
     /// must not depend on `(row, col)`.
-    #[inline]
+    #[inline(always)]
     pub fn store_ex(self, out: &mut [E], row_stride: usize, layout: Layout, f: impl Fn(E) -> E) {
         self.map(f).store(out, row_stride, layout);
     }
 
     /// Row-major [`store_ex`](Tile::store_ex) (`row_stride = C`).
-    #[inline]
+    #[inline(always)]
     pub fn store_rm_ex(self, out: &mut [E], f: impl Fn(E) -> E) {
         self.map(f).store_rm(out);
     }
 
     /// Apply a position-independent function to every element (activation / bias / scale). On the
     /// GPU the element→`(row, col)` mapping is opaque, so `f` must not depend on position.
-    #[inline]
+    #[inline(always)]
     pub fn map(self, f: impl Fn(E) -> E) -> Self {
         Tile {
             backend: self.backend,
@@ -1837,7 +2161,7 @@ impl<'a, T: FloatScalar, S: MatrixBackend<T>, E: Scalar, const R: usize, const C
     Tile<'a, T, S, E, R, C, Accumulator>
 {
     /// Combine with another accumulator elementwise: `f(self, other)` per element.
-    #[inline]
+    #[inline(always)]
     pub fn zip(self, other: Self, f: impl Fn(E, E) -> E) -> Self {
         Tile {
             backend: self.backend,
@@ -1848,44 +2172,44 @@ impl<'a, T: FloatScalar, S: MatrixBackend<T>, E: Scalar, const R: usize, const C
 
     /// Fold each row into the matching entry of `acc` — the online form, for running
     /// maxima/sums carried across successive tiles.
-    #[inline]
+    #[inline(always)]
     pub fn fold_rows(self, acc: [E; R], f: impl Fn(E, E) -> E) -> [E; R] {
         self.backend.tile_fold_rows(self.inner, acc, f)
     }
 
     /// Fold each column into the matching entry of `acc` (see [`fold_rows`](Tile::fold_rows)).
-    #[inline]
+    #[inline(always)]
     pub fn fold_cols(self, acc: [E; C], f: impl Fn(E, E) -> E) -> [E; C] {
         self.backend.tile_fold_cols(self.inner, acc, f)
     }
 
     /// Reduce each row to a scalar: `out[r] = f(…f(init, t[r][0])…, t[r][C-1])`.
-    #[inline]
+    #[inline(always)]
     pub fn reduce_rows(self, init: E, f: impl Fn(E, E) -> E) -> [E; R] {
         self.fold_rows([init; R], f)
     }
 
     /// Reduce each column to a scalar (see [`reduce_rows`](Tile::reduce_rows)).
-    #[inline]
+    #[inline(always)]
     pub fn reduce_cols(self, init: E, f: impl Fn(E, E) -> E) -> [E; C] {
         self.fold_cols([init; C], f)
     }
 
     /// The sum of each row.
-    #[inline]
+    #[inline(always)]
     pub fn row_sums(self) -> [E; R] {
         self.reduce_rows(E::ZERO, |a, v| a + v)
     }
 
     /// The sum of each column.
-    #[inline]
+    #[inline(always)]
     pub fn col_sums(self) -> [E; C] {
         self.reduce_cols(E::ZERO, |a, v| a + v)
     }
 
     /// Apply `f(elem, v[row])` across each row — a per-row scalar broadcast (bias add, per-row
     /// scale, softmax normalization).
-    #[inline]
+    #[inline(always)]
     pub fn zip_rows(self, v: [E; R], f: impl Fn(E, E) -> E) -> Self {
         Tile {
             backend: self.backend,
@@ -1895,7 +2219,7 @@ impl<'a, T: FloatScalar, S: MatrixBackend<T>, E: Scalar, const R: usize, const C
     }
 
     /// Apply `f(elem, v[col])` down each column — a per-column scalar broadcast.
-    #[inline]
+    #[inline(always)]
     pub fn zip_cols(self, v: [E; C], f: impl Fn(E, E) -> E) -> Self {
         Tile {
             backend: self.backend,
@@ -1910,7 +2234,7 @@ impl<'a, T: FloatScalar, S: MatrixBackend<T>, E: Scalar, const R: usize, const C
 {
     type Output = Self;
     /// Elementwise sum of two accumulators.
-    #[inline]
+    #[inline(always)]
     fn add(self, rhs: Self) -> Self {
         self.zip(rhs, |a, b| a + b)
     }
@@ -1921,7 +2245,7 @@ impl<'a, T: FloatScalar, S: MatrixBackend<T>, E: Scalar, const R: usize, const C
 {
     type Output = Self;
     /// Elementwise difference of two accumulators.
-    #[inline]
+    #[inline(always)]
     fn sub(self, rhs: Self) -> Self {
         self.zip(rhs, |a, b| a - b)
     }
@@ -1966,18 +2290,18 @@ macro_rules! impl_matrix_dispatch_simd {
                 {
                     #[cfg(not(any(hp_no_avx, hp_no_avx512)))]
                     if let Some(b) = crate::backend::avx512::Avx512::detect() {
-                        return kernel.run(Gang::new(b));
+                        return crate::dispatch::run_entered!(kernel, b);
                     }
                     #[cfg(not(hp_no_avx))]
                     if let Some(b) = crate::backend::avx2::Avx2::detect() {
-                        return kernel.run(Gang::new(b));
+                        return crate::dispatch::run_entered!(kernel, b);
                     }
-                    #[cfg(not(hp_no_avx))]
+                    #[cfg(all(not(hp_no_avx), feature = "avx1"))]
                     if let Some(b) = crate::backend::avx1::Avx1::detect() {
-                        return kernel.run(Gang::new(b));
+                        return crate::dispatch::run_entered!(kernel, b);
                     }
                     if let Some(b) = crate::backend::sse4::Sse4::detect() {
-                        return kernel.run(Gang::new(b));
+                        return crate::dispatch::run_entered!(kernel, b);
                     }
                 }
                 // Compile-time selection (no-std, or `hp_static_dispatch` on std): the widest
@@ -1985,52 +2309,51 @@ macro_rules! impl_matrix_dispatch_simd {
                 #[cfg(all(
                     any(target_arch = "x86_64", target_arch = "x86"),
                     any(not(feature = "std"), hp_static_dispatch),
-                    target_feature = "avx512f",
+                    hp_tf_v4,
                     not(any(hp_no_avx, hp_no_avx512))
                 ))]
                 {
                     // SAFETY: target compiled with avx512f.
                     let b = unsafe { crate::backend::avx512::Avx512::new_unchecked() };
-                    return kernel.run(Gang::new(b));
+                    return crate::dispatch::run_entered!(kernel, b);
                 }
                 #[cfg(all(
                     any(target_arch = "x86_64", target_arch = "x86"),
                     any(not(feature = "std"), hp_static_dispatch),
-                    not(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512)))),
-                    target_feature = "avx2",
-                    target_feature = "fma",
+                    not(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512)))),
+                    hp_tf_v3,
                     not(hp_no_avx)
                 ))]
                 {
                     // SAFETY: target compiled with avx2+fma.
                     let b = unsafe { crate::backend::avx2::Avx2::new_unchecked() };
-                    return kernel.run(Gang::new(b));
+                    return crate::dispatch::run_entered!(kernel, b);
                 }
                 #[cfg(all(
                     any(target_arch = "x86_64", target_arch = "x86"),
                     any(not(feature = "std"), hp_static_dispatch),
-                    not(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512)))),
-                    not(all(target_feature = "avx2", target_feature = "fma", not(hp_no_avx))),
-                    target_feature = "avx",
+                    not(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512)))),
+                    not(all(hp_tf_v3, not(hp_no_avx))),
+                    hp_tf_avx,
                     not(hp_no_avx)
                 ))]
                 {
                     // SAFETY: target compiled with avx.
                     let b = unsafe { crate::backend::avx1::Avx1::new_unchecked() };
-                    return kernel.run(Gang::new(b));
+                    return crate::dispatch::run_entered!(kernel, b);
                 }
                 #[cfg(all(
                     any(target_arch = "x86_64", target_arch = "x86"),
                     any(not(feature = "std"), hp_static_dispatch),
-                    not(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512)))),
-                    not(all(target_feature = "avx2", target_feature = "fma", not(hp_no_avx))),
-                    not(all(target_feature = "avx", not(hp_no_avx))),
-                    target_feature = "sse4.1"
+                    not(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512)))),
+                    not(all(hp_tf_v3, not(hp_no_avx))),
+                    not(all(hp_tf_avx, not(hp_no_avx))),
+                    hp_tf_v2
                 ))]
                 {
                     // SAFETY: target compiled with sse4.1.
                     let b = unsafe { crate::backend::sse4::Sse4::new_unchecked() };
-                    return kernel.run(Gang::new(b));
+                    return crate::dispatch::run_entered!(kernel, b);
                 }
                 // aarch64: non-Apple SVE token (its `mma` lands on the SME ZA engine where
                 // present), else NEON; Apple NEON delegates large tiles to Accelerate.
@@ -2066,22 +2389,37 @@ mod half_matrix_dispatch {
             ))]
             {
                 if let Some(b) = crate::backend::avx2::Avx2::detect() {
-                    return kernel.run(Gang::new(b));
+                    return crate::dispatch::run_entered!(kernel, b);
                 }
             }
             // Compile-time AVX2 F16C widen tile (no-std, or `hp_static_dispatch` on std).
             #[cfg(all(
                 any(target_arch = "x86_64", target_arch = "x86"),
                 any(not(feature = "std"), hp_static_dispatch),
-                target_feature = "avx2",
-                target_feature = "fma",
-                target_feature = "f16c",
+                hp_tf_v3,
                 not(hp_no_avx)
             ))]
             {
                 // SAFETY: target compiled with avx2+fma+f16c.
                 let b = unsafe { crate::backend::avx2::Avx2::new_unchecked() };
-                return kernel.run(Gang::new(b));
+                return crate::dispatch::run_entered!(kernel, b);
+            }
+            // aarch64 with FEAT_FP16 (all Apple silicon): NEON tiles, as the element-wise f16
+            // dispatch picks; without it, SVE or scalar.
+            #[cfg(all(target_arch = "aarch64", target_feature = "fp16"))]
+            {
+                return kernel.run(Gang::new(crate::backend::neon::Neon::new()));
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                feature = "std",
+                not(hp_static_dispatch),
+                not(target_feature = "fp16")
+            ))]
+            {
+                if std::arch::is_aarch64_feature_detected!("fp16") {
+                    return kernel.run(Gang::new(crate::backend::neon::Neon::new()));
+                }
             }
             crate::dispatch::aarch64_dispatch_tail!(kernel, crate::backend::ScalarBackend);
             kernel.run(Gang::new(crate::backend::ScalarBackend))
@@ -2101,37 +2439,36 @@ mod half_matrix_dispatch {
             {
                 #[cfg(not(any(hp_no_avx, hp_no_avx512)))]
                 if let Some(b) = crate::backend::avx512::Avx512::detect() {
-                    return kernel.run(Gang::new(b));
+                    return crate::dispatch::run_entered!(kernel, b);
                 }
                 #[cfg(not(hp_no_avx))]
                 if let Some(b) = crate::backend::avx2::Avx2::detect() {
-                    return kernel.run(Gang::new(b));
+                    return crate::dispatch::run_entered!(kernel, b);
                 }
             }
             // Compile-time bf16 widen tile: AVX-512 if the build guarantees `avx512f`, else AVX2.
             #[cfg(all(
                 any(target_arch = "x86_64", target_arch = "x86"),
                 any(not(feature = "std"), hp_static_dispatch),
-                target_feature = "avx512f",
+                hp_tf_v4,
                 not(any(hp_no_avx, hp_no_avx512))
             ))]
             {
                 // SAFETY: target compiled with avx512f.
                 let b = unsafe { crate::backend::avx512::Avx512::new_unchecked() };
-                return kernel.run(Gang::new(b));
+                return crate::dispatch::run_entered!(kernel, b);
             }
             #[cfg(all(
                 any(target_arch = "x86_64", target_arch = "x86"),
                 any(not(feature = "std"), hp_static_dispatch),
-                not(all(target_feature = "avx512f", not(any(hp_no_avx, hp_no_avx512)))),
-                target_feature = "avx2",
-                target_feature = "fma",
+                not(all(hp_tf_v4, not(any(hp_no_avx, hp_no_avx512)))),
+                hp_tf_v3,
                 not(hp_no_avx)
             ))]
             {
                 // SAFETY: target compiled with avx2+fma.
                 let b = unsafe { crate::backend::avx2::Avx2::new_unchecked() };
-                return kernel.run(Gang::new(b));
+                return crate::dispatch::run_entered!(kernel, b);
             }
             crate::dispatch::aarch64_dispatch_tail!(kernel, crate::backend::neon::Neon::new());
             crate::dispatch::wasm_dispatch_tail!(kernel);

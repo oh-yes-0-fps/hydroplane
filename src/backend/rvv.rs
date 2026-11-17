@@ -43,7 +43,7 @@ macro_rules! impl_rvv_backend {
      $add:ident, $sub:ident, $mul:ident, $divop:ident, $neg:ident, $fma:ident, $sqrt:ident,
      $min:ident, $max:ident,
      $le:ident, $lt:ident, $ge:ident, $gt:ident, $sel:ident,
-     $rsum:ident, $rmin:ident, $rmax:ident) => {
+     $rsum:ident, $rmin:ident, $rmax:ident, { $($extra:tt)* }) => {
         impl<const C: usize> Backend<$t> for Rvv<C> {
             type Vector = RvvVec<C>;
             type Mask = RvvVec<C>;
@@ -174,6 +174,8 @@ macro_rules! impl_rvv_backend {
             fn reduce_max(self, v: RvvVec<C>) -> $t {
                 unsafe { rvv::$rmax::<C>(&v) }
             }
+
+            $($extra)*
         }
     };
 }
@@ -181,12 +183,34 @@ macro_rules! impl_rvv_backend {
 impl_rvv_backend!(
     f32, 4, splat_f32, load_f32, store_f32, add_f32, sub_f32, mul_f32, div_f32, neg_f32, fma_f32,
     sqrt_f32, min_f32, max_f32, le_f32, lt_f32, ge_f32, gt_f32, select_f32, reduce_sum_f32,
-    reduce_min_f32, reduce_max_f32
+    reduce_min_f32, reduce_max_f32,
+    {
+        #[inline]
+        fn gather(self, base: &[f32], idx: [u32; crate::MAX_LANES]) -> RvvVec<C> {
+            #[cfg(debug_assertions)]
+            {
+                let n = <Self as Backend<f32>>::lanes(self);
+                debug_assert!(idx[..n].iter().all(|&j| (j as usize) < base.len()));
+            }
+            unsafe { rvv::gather_f32::<C>(base.as_ptr(), idx.as_ptr()) }
+        }
+        #[inline]
+        fn igather(self, base: &[u32], idx: [u32; crate::MAX_LANES]) -> [u32; crate::MAX_LANES] {
+            let n = <Self as Backend<f32>>::lanes(self);
+            #[cfg(debug_assertions)]
+            debug_assert!(idx[..n].iter().all(|&j| (j as usize) < base.len()));
+            let mut out = [0u32; crate::MAX_LANES];
+            unsafe { rvv::gather_u32(base.as_ptr(), idx.as_ptr(), out.as_mut_ptr(), n) };
+            out
+        }
+    }
 );
+// f64 keeps the portable-default gather: the `vluxei` index width vs `e64` SEW interplay is fiddly
+// and can't be validated on this host.
 impl_rvv_backend!(
     f64, 8, splat_f64, load_f64, store_f64, add_f64, sub_f64, mul_f64, div_f64, neg_f64, fma_f64,
     sqrt_f64, min_f64, max_f64, le_f64, lt_f64, ge_f64, gt_f64, select_f64, reduce_sum_f64,
-    reduce_min_f64, reduce_max_f64
+    reduce_min_f64, reduce_max_f64, {}
 );
 
 // Elements base "V" has no vector ALU for (f16/bf16 need Zvfh/Zvfbfmin; integer primitives are

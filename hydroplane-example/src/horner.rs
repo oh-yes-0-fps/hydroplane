@@ -16,7 +16,7 @@ pub fn horner_hp<'a>(ctx: Gang, c: [f32; 9], x: &'a [f32], out: &'a mut [f32]) {
     ctx.map(x, out, 0.0, |xv| {
         let mut acc = ctx.splat(c[8]);
         for k in (0..8).rev() {
-            acc = acc.fma(xv, ctx.splat(c[k]));
+            acc = acc * xv + ctx.splat(c[k]);
         }
         acc
     });

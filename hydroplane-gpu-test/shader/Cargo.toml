@@ -1,0 +1,18 @@
+[package]
+name = "hydroplane-gpu-test-shader"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Kernels hydroplane-gpu-test compiles to SPIR-V and also runs on the CPU as the oracle."
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(target_arch, values("spirv"))'] }
+
+[dependencies]
+hydroplane = { path = "../..", default-features = false }
+# rust-gpu 0.11 with spirt's type-operand support backported, which `OpCooperativeMatrixLengthKHR`
+# needs; cargo-gpu builds the codegen from this source.
+spirv-std = { git = "https://github.com/oh-yes-0-fps/rust-gpu", rev = "d0f8fc6d8122c0c0950f750293bf984b123fba32" }

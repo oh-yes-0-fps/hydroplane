@@ -25,6 +25,13 @@ pub fn cosine_hp<'a>(ctx: Gang, x: &'a [f32], y: &'a [f32]) -> f32 {
     d / (nx * ny).sqrt()
 }
 
+/// All three sums in one pass over the columns.
+#[kernel]
+pub fn cosine_fused<'a>(ctx: Gang, x: &'a [f32], y: &'a [f32]) -> f32 {
+    let [d, nx, ny] = ctx.zip_sum_n(x, y, |[d, nx, ny], a, b| [d + a * b, nx + a * a, ny + b * b]);
+    d / (nx * ny).sqrt()
+}
+
 /// All three sums in a single fused pass, one chain each (full register + scalar tail).
 pub fn cosine_wide(x: &[f32], y: &[f32]) -> f32 {
     let n = x.len();

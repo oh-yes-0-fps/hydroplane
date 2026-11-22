@@ -13,16 +13,13 @@ pub fn inputs(n: usize) -> Vec<f32> {
 
 #[kernel]
 pub fn polysum_hp<'a>(ctx: Gang, c: [f32; 9], x: &'a [f32]) -> f32 {
-    // `sum` zero-fills tail lanes and `P(0) = c[0] ≠ 0`, so each padding lane would leak a `c[0]`.
-    // Sum `P(x) − c[0]` instead and add back `c[0]·n` at the end.
-    let bias = c[0];
     ctx.sum(x, |acc, v| {
         let mut p = ctx.splat(c[8]);
         for k in (0..8).rev() {
-            p = p.fma(v, ctx.splat(c[k]));
+            p = p * v + ctx.splat(c[k]);
         }
-        acc + (p - bias)
-    }) + bias * x.len() as f32
+        acc + p
+    })
 }
 
 /// One f32x8 accumulator, a full Horner chain per lane-vector before the add: a single dependency

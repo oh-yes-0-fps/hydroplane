@@ -26,9 +26,7 @@ fn horner8<S: Backend<f32>>(ctx: Gang<S>, x: Varying<f32, S>) -> Varying<f32, S>
 /// The heavy inner reduction, reused by the outer kernel through its `_on` companion.
 #[kernel]
 pub fn polystep<'a>(ctx: Gang, x: &'a [f32]) -> f32 {
-    // `sum` zero-fills tail lanes and `horner8(0) == COEFFS[0]`, so padding lanes would each add
-    // `COEFFS[0]`. Subtract it per lane and add back `COEFFS[0]·n` for the real lanes.
-    ctx.sum(x, |acc, v| acc + (horner8(ctx, v) - COEFFS[0])) + COEFFS[0] * x.len() as f32
+    ctx.sum(x, |acc, v| acc + horner8(ctx, v))
 }
 
 /// Outer body: two runs of the heavy reduction on the already-dispatched backend, then an add.

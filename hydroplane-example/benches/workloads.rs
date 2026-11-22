@@ -320,8 +320,12 @@ fn bench_cosine(c: &mut Criterion) {
         let want = cosine::cosine_scalar(&x, &y);
         assert!((cosine::cosine_hp(&x, &y) - want).abs() <= TOL * want.abs().max(1.0), "cosine hp n={n}");
         assert!((cosine::cosine_wide(&x, &y) - want).abs() <= TOL * want.abs().max(1.0), "cosine wide n={n}");
+        assert!((cosine::cosine_fused(&x, &y) - want).abs() <= TOL * want.abs().max(1.0), "cosine fused n={n}");
         g.bench_with_input(BenchmarkId::new("hp", n), &n, |b, _| {
             b.iter(|| cosine::cosine_hp(black_box(&x), black_box(&y)))
+        });
+        g.bench_with_input(BenchmarkId::new("hp_fused", n), &n, |b, _| {
+            b.iter(|| cosine::cosine_fused(black_box(&x), black_box(&y)))
         });
         g.bench_with_input(BenchmarkId::new("wide", n), &n, |b, _| {
             b.iter(|| cosine::cosine_wide(black_box(&x), black_box(&y)))

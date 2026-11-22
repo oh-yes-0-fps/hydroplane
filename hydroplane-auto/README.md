@@ -1,6 +1,6 @@
 # hydroplane-auto
 
-Build-time MIR analysis for [hydroplane](https://crates.io/crates/hydroplane) `#[kernel]`s. It measures each kernel body (stack bytes, varying locals, memory ops, branches, calls) and feeds the metrics back to the `#[kernel]` macro, which uses them to pick `tiny`/`noalias`/unroll decisions per kernel instead of one-size defaults.
+Build-time MIR analysis for [hydroplane](https://crates.io/crates/hydroplane) `#[kernel]`s. It measures each kernel body (stack bytes, varying locals, memory ops, branches, calls) and feeds the metrics back to the `#[kernel]` macro, which uses them to narrow the element types each kernel dispatches over.
 
 Wire it into the crate that defines the kernels:
 

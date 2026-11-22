@@ -1,0 +1,24 @@
+[package]
+name = "hydroplane-solvers-kernels"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "rust-gpu compute kernels for hydroplane-solvers"
+repository = "https://github.com/oh-yes-0-fps/hydroplane"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+f64 = []
+ef64 = []
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(target_arch, values("spirv"))'] }
+
+[workspace]
+
+[dependencies]
+# rust-gpu 0.11 fork: sub-slicing and array slices compile, and optimized builds fold bounds
+# checks away (panics are unreachable there).
+spirv-std = { git = "https://github.com/oh-yes-0-fps/rust-gpu", rev = "d0f8fc6d8122c0c0950f750293bf984b123fba32" }

@@ -135,6 +135,46 @@ fn gather_count_hp<'a>(ctx: Gang, pts: &'a [[f32; 4]], q: [f32; 4]) -> usize {
     acc.reduce_sum() as usize
 }
 
+// Strided hardware gather straight from the AoS rows, no transpose through scratch.
+#[kernel]
+fn gather_count_hw<'a>(ctx: Gang, pts: &'a [[f32; 4]], q: [f32; 4]) -> usize {
+    let flat = pts.as_flattened();
+    let [cx, cy, cz, sr] = ctx.splat_n(q);
+    let (one, zero) = (ctx.splat(1.0), ctx.splat(0.0));
+    let rows = ctx.ramp_u32::<f32>() << 2;
+    let (ix, iy, iz, ir) = (rows, rows + ctx.splat_u32(1), rows + ctx.splat_u32(2), rows + ctx.splat_u32(3));
+    let mut acc = zero;
+    for off in ctx.chunks_exact::<f32>(pts.len()) {
+        let base = &flat[off * 4..];
+        let (x, y, z, r) = (ctx.gather(base, ix), ctx.gather(base, iy), ctx.gather(base, iz), ctx.gather(base, ir));
+        let (dx, dy, dz) = (cx - x, cy - y, cz - z);
+        let rsum = sr + r;
+        acc = acc + one.select((dx * dx + dy * dy + dz * dz).le(rsum * rsum), zero);
+    }
+    if let Some((off, cnt)) = ctx.remainder::<f32>(pts.len()) {
+        let [x, y, z, r] = ctx.gather_n(&pts[off..off + cnt], [0.0, 0.0, 0.0, f32::NAN], |p| *p);
+        let (dx, dy, dz) = (cx - x, cy - y, cz - z);
+        let rsum = sr + r;
+        acc = acc + one.select((dx * dx + dy * dy + dz * dz).le(rsum * rsum), zero);
+    }
+    acc.reduce_sum() as usize
+}
+
+// `gather_rows`: the same scan with rows read straight out of the slice.
+#[kernel]
+fn gather_count_rows<'a>(ctx: Gang, pts: &'a [[f32; 4]], q: [f32; 4]) -> usize {
+    let [cx, cy, cz, sr] = ctx.splat_n(q);
+    let (one, zero) = (ctx.splat(1.0), ctx.splat(0.0));
+    let mut acc = zero;
+    ctx.for_each_chunk::<f32>(pts.len(), |off, cnt| {
+        let [x, y, z, r] = ctx.gather_rows(&pts[off..off + cnt], [0.0, 0.0, 0.0, f32::NAN]);
+        let (dx, dy, dz) = (cx - x, cy - y, cz - z);
+        let rsum = sr + r;
+        acc = acc + one.select((dx * dx + dy * dy + dz * dz).le(rsum * rsum), zero);
+    });
+    acc.reduce_sum() as usize
+}
+
 // Sentinel variant: NaN-fill the radius lane so inactive tail lanes self-reject, no active mask.
 #[kernel]
 fn gather_count_sentinel_hp<'a>(ctx: Gang, pts: &'a [[f32; 4]], q: [f32; 4]) -> usize {
@@ -217,6 +257,14 @@ fn bench(c: &mut Criterion) {
         });
         g.bench_with_input(BenchmarkId::new("gather_n", n), &n, |b, _| {
             b.iter(|| gather_count_hp(black_box(&pts), Q))
+        });
+        assert_eq!(gather_count_hw(&pts, Q), want, "gather hw n={n}");
+        assert_eq!(gather_count_rows(&pts, Q), want, "gather_rows n={n}");
+        g.bench_with_input(BenchmarkId::new("gather_rows", n), &n, |b, _| {
+            b.iter(|| gather_count_rows(black_box(&pts), Q))
+        });
+        g.bench_with_input(BenchmarkId::new("gather_hw", n), &n, |b, _| {
+            b.iter(|| gather_count_hw(black_box(&pts), Q))
         });
         g.bench_with_input(BenchmarkId::new("gather_n_sentinel", n), &n, |b, _| {
             b.iter(|| gather_count_sentinel_hp(black_box(&pts), Q))

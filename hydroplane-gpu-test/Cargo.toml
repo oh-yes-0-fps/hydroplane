@@ -1,0 +1,40 @@
+[package]
+name = "hydroplane-gpu-test"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "On-device tests for hydroplane's rust-gpu backend: builds shader/ to SPIR-V and checks it on a Vulkan device against the same kernel run on the CPU."
+
+[workspace]
+members = ["shader"]
+
+# hydroplane's own `spirv-std` must resolve to the shader's rust-gpu fork, or the shader links two.
+[patch.crates-io]
+spirv-std = { git = "https://github.com/oh-yes-0-fps/rust-gpu", rev = "d0f8fc6d8122c0c0950f750293bf984b123fba32" }
+
+[[bench]]
+name = "device"
+harness = false
+
+[[bench]]
+name = "gemm"
+harness = false
+
+[[bench]]
+name = "cpu_gemm"
+harness = false
+
+[[bench]]
+name = "tile_mma"
+harness = false
+
+[dependencies]
+ash = "0.38"
+half = "2"
+hydroplane = { version = "0.3.0", path = ".." }
+hydroplane-gpu-test-shader = { version = "0.0.0", path = "shader" }
+hydroplane-whatcompute = { version = "0.1.0", path = "../hydroplane-whatcompute" }
+
+[build-dependencies]
+cargo-gpu-install = "0.11.0"
+

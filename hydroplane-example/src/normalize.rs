@@ -1,7 +1,7 @@
 //! Batched `v / ‖v‖` over SoA vec3 columns: moderate arithmetic intensity, multi-component.
 
 use glam::Vec3;
-use hydroplane::{Gang, GangGlamExt, kernel};
+use hydroplane::{Gang, Vec3Wide, kernel};
 use wide::f32x8;
 
 use crate::ramp;
@@ -20,22 +20,11 @@ pub fn normalize_hp<'a>(
     oy: &'a mut [f32],
     oz: &'a mut [f32],
 ) {
-    let n = x.len();
-    let lanes = ctx.lanes::<f32>();
-    let mut off = 0;
-    while off + lanes <= n {
-        let r = off..off + lanes;
-        let v = ctx.load_vec3([&x[r.clone()], &y[r.clone()], &z[r.clone()]]);
-        let inv = v.length().recip();
-        (v * inv).store([&mut ox[r.clone()], &mut oy[r.clone()], &mut oz[r]]);
-        off += lanes;
-    }
-    if off < n {
-        let r = off..n;
-        let v = ctx.load_partial_vec3([&x[r.clone()], &y[r.clone()], &z[r.clone()]], 1.0);
-        let inv = v.length().recip();
-        (v * inv).store_partial([&mut ox[r.clone()], &mut oy[r.clone()], &mut oz[r]]);
-    }
+    // The padding lanes of the tail are filled with 1.0 so their reciprocal length stays finite.
+    ctx.map_cols([x, y, z], [ox, oy, oz], 1.0, |xyz| {
+        let v = Vec3Wide::from(xyz);
+        (v * v.length().recip()).0
+    });
 }
 
 pub fn normalize_wide(x: &[f32], y: &[f32], z: &[f32], ox: &mut [f32], oy: &mut [f32], oz: &mut [f32]) {

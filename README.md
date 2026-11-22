@@ -7,8 +7,7 @@ use hydroplane::{Gang, kernel};
 
 #[kernel]
 fn dot<'a>(ctx: Gang, a: &'a [f32], b: &'a [f32]) -> f32 {
-    ctx.zip_fold(a, b, 0.0, 0.0, ctx.splat(0.0), |acc, x, y| acc + x * y)
-        .reduce_sum()
+    ctx.zip_sum(a, b, |acc, x, y| acc + x * y)
 }
 
 let s = dot(&a, &b); // dispatched: AVX-512 / AVX2 / SSE4 / NEON / SVE / ... picked per host
@@ -19,7 +18,8 @@ let s = dot(&a, &b); // dispatched: AVX-512 / AVX2 / SSE4 / NEON / SVE / ... pic
 ## What "raising" means
 
 - **ISA raising.** At run time the dispatcher picks the widest implemented backend the CPU supports; the SIMD ops are `#[target_feature]` bodies, so a generic x86 binary still uses AVX-512 on a host that has it. With `--cfg hp_static_dispatch` + a pinned `target-cpu` the ladder folds into one unconditional call at compile time.
-- **ILP raising.** Reductions and maps run `K` independent register chains to saturate the core's FP pipes. `K` is measured once per process by a startup sweep and baked into the monomorphized kernel as a compile-time constant (`Unroll<S, K>`); on pinned builds `build.rs` resolves it at build time instead. This is routinely worth more than lane width on latency-bound loops — see the [case study](CASE_STUDY.md).
+- **ILP raising.** Reductions and maps run `K` independent register chains to saturate the core's FP pipes. `K` is measured once per process by a startup sweep and baked into the monomorphized kernel as a compile-time constant (`Unroll<S, K>`); on pinned builds `build.rs` resolves it at build time instead. A reduction carrying several accumulators (`ctx.zip_sum_n(a, b, |[xy, xx, yy], x, y| [xy + x * y, xx + x * x, yy + y * y])`, one pass for a cosine) runs fewer chains so they all stay in registers. This is routinely worth more than lane width on latency-bound loops — see the [case study](CASE_STUDY.md).
+- **Alignment.** With 32- and 64-byte registers, the combinators start with a masked step up to the first register boundary, so the rest of the loads never straddle two cache lines whatever alignment the caller's slices have.
 
 ## Backends
 
@@ -36,7 +36,7 @@ Three layers: raw `Backend` ops → the ergonomic `Gang`/`Varying` surface (oper
 
 ## Benchmarks
 
-Paired implementations of each workload — hydroplane `#[kernel]` (`hp`), hand-rolled [`wide`](https://crates.io/crates/wide) SIMD with manual ILP (`wide`), and a plain scalar loop (`scalar`) — live in [`hydroplane-example`](hydroplane-example/). Apple M5 Pro, rustc 1.95, `RUSTFLAGS="-C target-cpu=native"`, criterion `--quick`, n = 4096 `f32` elements; correctness is asserted against the scalar oracle before timing.
+Paired implementations of each workload — hydroplane `#[kernel]` (`hp`), hand-rolled [`wide`](https://crates.io/crates/wide) SIMD with manual ILP (`wide`), and a plain scalar loop (`scalar`) — live in [`hydroplane-example`](hydroplane-example/). Apple M5 Pro, rustc 1.99, `RUSTFLAGS="-C target-cpu=native"`, criterion `--quick` (best of three runs), n = 4096 `f32` elements; correctness is asserted against the scalar oracle before timing.
 
 ```
 RUSTFLAGS="-C target-cpu=native" cargo bench -p hydroplane-example --bench workloads
@@ -44,20 +44,20 @@ RUSTFLAGS="-C target-cpu=native" cargo bench -p hydroplane-example --bench workl
 
 | workload | shape | scalar | hand `wide` | hydroplane | hp vs scalar | hp vs `wide` |
 |---|---|---|---|---|---|---|
-| l2norm | `√Σx²` reduction | 1976.4 ns | 351.4 ns | **88.8 ns** | **22.26×** | 3.96× |
-| asum | `Σ\|x\|` reduction | 1968.9 ns | 294.1 ns | **120.2 ns** | **16.39×** | 2.45× |
-| dot | `Σ x·y` reduction | 1977.1 ns | 176.5 ns | **168.1 ns** | **11.76×** | 1.05× |
-| l1dist | `Σ\|x−y\|` reduction | 1977.9 ns | 311.1 ns | **169.1 ns** | **11.70×** | 1.84× |
-| cosine | three dots + combine | 2317.8 ns | **426.6 ns** | 492.6 ns | 4.71× | 0.87× |
-| polysum | register-heavy poly reduction | 2275.5 ns | **584.5 ns** | 636.1 ns | 3.58× | 0.92× |
-| double_polysum | two fused poly reductions | 4554.1 ns | **1261.3 ns** | 1371.3 ns | 3.32× | 0.92× |
-| mandelbrot | divergent escape-time loop | 113.24 µs | 112.79 µs | **47.12 µs** | **2.40×** | 2.39× |
-| horner | degree-8 poly, elementwise | 965.8 ns | **544.4 ns** | 630.8 ns | 1.53× | 0.86× |
-| normalize | SoA vec3 `v/‖v‖` | 870.3 ns | 829.7 ns | **823.4 ns** | 1.06× | 1.01× |
-| mat3_inverse | batched 3×3 inverse | 7423.3 ns | 30194.8 ns | **7327.3 ns** | **1.01×** | 4.12× |
-| saxpy | elementwise FMA (memory-bound) | **172.8 ns** | 207.7 ns | 175.3 ns | 0.99× | 1.18× |
-| cmul | streaming complex multiply | **456.5 ns** | 588.3 ns | 481.8 ns | 0.95× | 1.22× |
-| transform | batched 3×3 · vec3 | **3191.9 ns** | 3523.9 ns | 3468.9 ns | 0.92× | 1.02× |
+| l2norm | `√Σx²` reduction | 1960.7 ns | 352.5 ns | **104.5 ns** | **18.76×** | 3.37× |
+| asum | `Σ\|x\|` reduction | 1973.6 ns | 290.6 ns | **120.3 ns** | **16.41×** | 2.42× |
+| l1dist | `Σ\|x−y\|` reduction | 2022.2 ns | 304.2 ns | **165.7 ns** | **12.21×** | 1.84× |
+| dot | `Σ x·y` reduction | 1992.5 ns | 175.6 ns | **166.8 ns** | **11.95×** | 1.05× |
+| cosine | three dots + combine | 2320.4 ns | 423.0 ns | **374.6 ns** | **6.19×** | 1.13× |
+| polysum | register-heavy poly reduction | 2307.3 ns | 593.7 ns | **586.4 ns** | **3.93×** | 1.01× |
+| double_polysum | two fused poly reductions | 4572.3 ns | **1256.6 ns** | 1296.8 ns | 3.53× | 0.97× |
+| mandelbrot | divergent escape-time loop | 112.53 µs | 112.39 µs | **43.41 µs** | **2.59×** | 2.59× |
+| horner | degree-8 poly, elementwise | 966.1 ns | 549.8 ns | **525.9 ns** | **1.84×** | 1.05× |
+| mat3_inverse | batched 3×3 inverse | 7085.7 ns | 28998.0 ns | **6909.7 ns** | **1.03×** | 4.20× |
+| normalize | SoA vec3 `v/‖v‖` | 860.8 ns | **825.8 ns** | 850.3 ns | 1.01× | 0.97× |
+| saxpy | elementwise FMA (memory-bound) | **174.5 ns** | 197.5 ns | 178.2 ns | 0.98× | 1.11× |
+| cmul | streaming complex multiply | **425.0 ns** | 606.0 ns | 467.8 ns | 0.91× | 1.30× |
+| transform | batched 3×3 · vec3 | **3131.1 ns** | 3373.1 ns | 3476.3 ns | 0.90× | 0.97× |
 
 For the full progression, scalar → portable `wide` → `wide` restructured for ILP → hydroplane (with raw NEON intrinsics as the ceiling reference) on one problem, with the mechanics of why each step pays (read **[CASE_STUDY.md](CASE_STUDY.md)** ):
 

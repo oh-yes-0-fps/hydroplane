@@ -9,7 +9,8 @@ use core::arch::x86_64::*;
 
 use crate::backend::Backend;
 
-/// SSE4.1 execution token. Construct only when the CPU supports `sse4.1`.
+/// SSE4 execution token: the x86-64-v2 tier ([`crate::isa`]). Construct only when the CPU has the
+/// whole bundle.
 #[derive(Clone, Copy, Debug)]
 pub struct Sse4(());
 
@@ -20,14 +21,10 @@ impl Sse4 {
     #[allow(dead_code)]
     #[inline]
     pub fn detect() -> Option<Self> {
-        if is_x86_feature_detected!("sse4.1") {
-            Some(Self(()))
-        } else {
-            None
-        }
+        if crate::__hp_isa!(detect SSE41) { Some(Self(())) } else { None }
     }
     /// # Safety
-    /// The CPU must support `sse4.1`.
+    /// The CPU must have the whole `SSE41` tier bundle ([`crate::isa`]).
     // Used only by the statically-pinned and no-std dispatch paths; std builds go through
     // runtime `detect`.
     #[allow(dead_code)]
@@ -38,8 +35,19 @@ impl Sse4 {
 }
 
 impl Backend<f32> for Sse4 {
+    crate::backend::enter_with_features!(SSE41);
+
     type Vector = __m128;
     type Mask = __m128;
+
+    #[inline(always)]
+    fn load_first(self, s: &[f32], fill: f32) -> __m128 {
+        unsafe { f32_load_first(s.as_ptr(), s.len(), fill) }
+    }
+    #[inline(always)]
+    fn store_first(self, v: __m128, s: &mut [f32]) {
+        unsafe { f32_store_first(s.as_mut_ptr(), s.len(), v) }
+    }
 
     type IVector = __m128i;
     #[inline(always)]
@@ -199,6 +207,10 @@ impl Backend<f32> for Sse4 {
         unsafe { s_cmpge(a, b) }
     }
     #[inline(always)]
+    fn eq(self, a: __m128, b: __m128) -> __m128 {
+        unsafe { s_cmpeq(a, b) }
+    }
+    #[inline(always)]
     fn gt(self, a: __m128, b: __m128) -> __m128 {
         unsafe { s_cmpgt(a, b) }
     }
@@ -306,6 +318,11 @@ unsafe fn s_cmple(a: __m128, b: __m128) -> __m128 {
 #[inline]
 unsafe fn s_cmplt(a: __m128, b: __m128) -> __m128 {
     _mm_cmplt_ps(a, b)
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn s_cmpeq(a: __m128, b: __m128) -> __m128 {
+    _mm_cmpeq_ps(a, b)
 }
 #[target_feature(enable = "sse4.1")]
 #[inline]
@@ -658,6 +675,15 @@ impl Backend<f64> for Sse4 {
     type Vector = __m128d;
     type Mask = __m128d;
 
+    #[inline(always)]
+    fn load_first(self, s: &[f64], fill: f64) -> __m128d {
+        unsafe { f64_load_first(s.as_ptr(), s.len(), fill) }
+    }
+    #[inline(always)]
+    fn store_first(self, v: __m128d, s: &mut [f64]) {
+        unsafe { f64_store_first(s.as_mut_ptr(), s.len(), v) }
+    }
+
     type IVector = [u32; 2];
     #[inline(always)]
     fn iload(self, s: &[u32]) -> [u32; 2] {
@@ -743,6 +769,10 @@ impl Backend<f64> for Sse4 {
     #[inline(always)]
     fn ge(self, a: __m128d, b: __m128d) -> __m128d {
         unsafe { d_cmpge(a, b) }
+    }
+    #[inline(always)]
+    fn eq(self, a: __m128d, b: __m128d) -> __m128d {
+        unsafe { d_cmpeq(a, b) }
     }
     #[inline(always)]
     fn gt(self, a: __m128d, b: __m128d) -> __m128d {
@@ -851,6 +881,11 @@ unsafe fn d_cmple(a: __m128d, b: __m128d) -> __m128d {
 #[inline]
 unsafe fn d_cmplt(a: __m128d, b: __m128d) -> __m128d {
     _mm_cmplt_pd(a, b)
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn d_cmpeq(a: __m128d, b: __m128d) -> __m128d {
+    _mm_cmpeq_pd(a, b)
 }
 #[target_feature(enable = "sse4.1")]
 #[inline]
@@ -1010,6 +1045,10 @@ macro_rules! sse4_widen_half {
                     unsafe { s_cmpge(a, b) }
                 }
                 #[inline(always)]
+                fn eq(self, a: __m128, b: __m128) -> __m128 {
+                    unsafe { s_cmpeq(a, b) }
+                }
+                #[inline(always)]
                 fn gt(self, a: __m128, b: __m128) -> __m128 {
                     unsafe { s_cmpgt(a, b) }
                 }
@@ -1059,3 +1098,57 @@ macro_rules! sse4_widen_half {
 }
 sse4_widen_half!(f16, f16_impl);
 sse4_widen_half!(bf16, bf16_impl);
+
+// A short tail is assembled from scalar and 64-bit moves that touch only its own elements.
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn f32_load_first(p: *const f32, len: usize, fill: f32) -> __m128 {
+    let f = _mm_set1_ps(fill);
+    unsafe {
+        match len {
+            0 => f,
+            1 => _mm_move_ss(f, _mm_load_ss(p)),
+            2 => _mm_movelh_ps(_mm_castsi128_ps(_mm_loadl_epi64(p.cast())), f),
+            3 => _mm_movelh_ps(_mm_castsi128_ps(_mm_loadl_epi64(p.cast())), _mm_move_ss(f, _mm_load_ss(p.add(2)))),
+            _ => _mm_loadu_ps(p),
+        }
+    }
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn f32_store_first(p: *mut f32, len: usize, v: __m128) {
+    unsafe {
+        match len {
+            0 => {}
+            1 => _mm_store_ss(p, v),
+            2 => _mm_storel_epi64(p.cast(), _mm_castps_si128(v)),
+            3 => {
+                _mm_storel_epi64(p.cast(), _mm_castps_si128(v));
+                _mm_store_ss(p.add(2), _mm_movehl_ps(v, v));
+            }
+            _ => _mm_storeu_ps(p, v),
+        }
+    }
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn f64_load_first(p: *const f64, len: usize, fill: f64) -> __m128d {
+    unsafe {
+        match len {
+            0 => _mm_set1_pd(fill),
+            1 => _mm_loadl_pd(_mm_set1_pd(fill), p),
+            _ => _mm_loadu_pd(p),
+        }
+    }
+}
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn f64_store_first(p: *mut f64, len: usize, v: __m128d) {
+    unsafe {
+        match len {
+            0 => {}
+            1 => _mm_storel_pd(p, v),
+            _ => _mm_storeu_pd(p, v),
+        }
+    }
+}

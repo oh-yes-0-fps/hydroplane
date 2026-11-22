@@ -1,4 +1,4 @@
-use hydroplane::{Gang, MatrixBackend, MatrixKernel, dispatch_matrix, run_matrix_scalar};
+use hydroplane::{Gang, Layout, MatrixBackend, MatrixKernel, dispatch_matrix, run_matrix_scalar};
 
 /// `D = A·Bᵀ` with B loaded straight from its transposed (`N×K` row-major) storage.
 struct GemmBt<'a, const M: usize, const N: usize, const K: usize> {
@@ -236,4 +236,69 @@ impl MatrixKernel<f32> for Softmax {
 fn softmax_rows() {
     run_matrix_scalar(Softmax);
     dispatch_matrix(Softmax);
+}
+
+#[test]
+fn mma_block_matches_reference() {
+    const T: usize = 8;
+    const BM: usize = 2;
+    const BN: usize = 3;
+    const KD: usize = 16;
+    let (m, n) = (BM * T, BN * T);
+    let a: Vec<f32> = (0..m * KD)
+        .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.25)
+        .collect();
+    let b: Vec<f32> = (0..KD * n)
+        .map(|i| ((i * 53 % 19) as f32 - 9.0) * 0.5)
+        .collect();
+    let mut want = vec![0.0f64; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            want[i * n + j] = (0..KD)
+                .map(|k| a[i * KD + k] as f64 * b[k * n + j] as f64)
+                .sum::<f64>()
+                + 1.0;
+        }
+    }
+
+    struct Block<'a> {
+        a: &'a [f32],
+        b: &'a [f32],
+        out: &'a mut [f32],
+    }
+    impl MatrixKernel<f32> for Block<'_> {
+        type Output = ();
+        fn run<S: MatrixBackend<f32>>(self, ctx: Gang<S>) {
+            let tl = ctx.tiles();
+            let n = BN * T;
+            let a = core::array::from_fn::<_, BM, _>(|i| {
+                tl.load_a::<T, KD>(&self.a[i * T * KD..], KD, Layout::RowMajor)
+            });
+            let b = core::array::from_fn::<_, BN, _>(|j| {
+                tl.load_b::<KD, T>(&self.b[j * T..], n, Layout::RowMajor)
+            });
+            let c = [[tl.splat_acc::<T, T>(1.0); BN]; BM];
+            let d = tl.mma_block(a, b, c);
+            for (i, row) in d.into_iter().enumerate() {
+                for (j, t) in row.into_iter().enumerate() {
+                    t.store(&mut self.out[i * T * n + j * T..], n, Layout::RowMajor);
+                }
+            }
+        }
+    }
+
+    for scalar in [false, true] {
+        let mut out = vec![0.0f32; m * n];
+        let k = Block {
+            a: &a,
+            b: &b,
+            out: &mut out,
+        };
+        if scalar {
+            run_matrix_scalar(k);
+        } else {
+            dispatch_matrix(k);
+        }
+        assert_close(&out, &want, 1e-4);
+    }
 }

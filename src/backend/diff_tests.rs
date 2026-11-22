@@ -129,6 +129,52 @@ where
             assert_eq!(got[i], ((a[i] as i32) >> k) as u32, "ishr_arith({k}) lane {i}");
         }
 
+        let kcnt: Vec<u32> = (0..n).map(|_| rng.random_range(0..32u32)).collect();
+        let vk = b.iload(&kcnt);
+        let got = istore(b.ishl_var(va, vk));
+        for i in 0..n {
+            assert_eq!(got[i], a[i] << kcnt[i], "ishl_var lane {i} (k={})", kcnt[i]);
+        }
+        let got = istore(b.ishr_var(va, vk));
+        for i in 0..n {
+            assert_eq!(got[i], a[i] >> kcnt[i], "ishr_var lane {i} (k={})", kcnt[i]);
+        }
+        let got = istore(b.ishr_arith_var(va, vk));
+        for i in 0..n {
+            assert_eq!(got[i], ((a[i] as i32) >> kcnt[i]) as u32, "ishr_arith_var lane {i} (k={})", kcnt[i]);
+        }
+
+        let got = istore(b.imin_u(va, vc));
+        for i in 0..n {
+            assert_eq!(got[i], core::cmp::min(a[i], c[i]), "imin_u lane {i}");
+        }
+        let got = istore(b.imax_u(va, vc));
+        for i in 0..n {
+            assert_eq!(got[i], core::cmp::max(a[i], c[i]), "imax_u lane {i}");
+        }
+        let got = istore(b.imin_s(va, vc));
+        for i in 0..n {
+            assert_eq!(got[i], core::cmp::min(a[i] as i32, c[i] as i32) as u32, "imin_s lane {i}");
+        }
+        let got = istore(b.imax_s(va, vc));
+        for i in 0..n {
+            assert_eq!(got[i], core::cmp::max(a[i] as i32, c[i] as i32) as u32, "imax_s lane {i}");
+        }
+        let got = istore(b.iabs(va));
+        for i in 0..n {
+            assert_eq!(got[i], (a[i] as i32).wrapping_abs() as u32, "iabs lane {i}");
+        }
+        let got = istore(b.ileading_zeros(va));
+        for i in 0..n {
+            assert_eq!(got[i], a[i].leading_zeros(), "ileading_zeros lane {i}");
+        }
+        let edge: Vec<u32> =
+            (0..n).map(|i| [0u32, 1, 0x8000_0000, 0xFFFF_FFFF, 0x0010_0000][i % 5]).collect();
+        let got = istore(b.ileading_zeros(b.iload(&edge)));
+        for i in 0..n {
+            assert_eq!(got[i], edge[i].leading_zeros(), "ileading_zeros edge lane {i}");
+        }
+
         type IntPred = fn(u32, u32) -> bool;
         let cmps: [(&str, u32, IntPred); 3] = [
             ("ieq", b.mask_bitmask(b.ieq(va, vc)), |x, y| x == y),
@@ -181,6 +227,181 @@ where
     }
 }
 
+/// Partial loads and stores at every short length: `load_first` keeps lanes `0..len` from the
+/// slice and the fill beyond, `store_first` writes exactly `len` lanes and nothing past them.
+fn check_partial<T, S>(b: S)
+where
+    T: Scalar,
+    S: Backend<T>,
+{
+    let n = b.lanes();
+    let src: Vec<T> = (0..n).map(|k| T::from_f64((k + 1) as f64)).collect();
+    let fill = T::from_f64(99.0);
+    for len in 0..=n {
+        assert_eq!(b.mask_bitmask(b.mask_first(len)), ((1u64 << len) - 1) as u32, "mask_first {len}");
+        if len == n {
+            break;
+        }
+        let mut got = vec![T::ZERO; n];
+        b.store(b.load_first(&src[..len], fill), &mut got);
+        for (i, g) in got.iter().enumerate() {
+            let want = if i < len { src[i] } else { fill };
+            assert_eq!(g.into_f64(), want.into_f64(), "load_first len {len} lane {i}");
+        }
+        let sentinel = T::from_f64(-7.0);
+        let mut out = vec![sentinel; n];
+        b.store_first(b.load(&src), &mut out[..len]);
+        for (i, o) in out.iter().enumerate() {
+            let want = if i < len { src[i] } else { sentinel };
+            assert_eq!(o.into_f64(), want.into_f64(), "store_first len {len} lane {i}");
+        }
+    }
+}
+
+/// Deinterleaving row loads, where a backend has them, against the plain transpose.
+fn check_rows<T, S>(b: S)
+where
+    T: Scalar,
+    S: Backend<T>,
+{
+    fn one<T: Scalar, S: Backend<T>, const N: usize>(b: S) {
+        let n = b.lanes();
+        let rows: Vec<[T; N]> = (0..n)
+            .map(|i| core::array::from_fn(|c| T::from_f64((i * 10 + c + 1) as f64)))
+            .collect();
+        let Some(cols) = b.load_rows(&rows) else { return };
+        for (c, col) in cols.iter().enumerate() {
+            let mut got = vec![T::ZERO; n];
+            b.store(*col, &mut got);
+            for (i, g) in got.iter().enumerate() {
+                assert_eq!(g.into_f64(), rows[i][c].into_f64(), "load_rows N={N} col {c} lane {i}");
+            }
+        }
+    }
+    one::<T, S, 1>(b);
+    one::<T, S, 2>(b);
+    one::<T, S, 3>(b);
+    one::<T, S, 4>(b);
+    one::<T, S, 5>(b);
+}
+
+/// Varying-index gather/scatter against the scalar oracle: positional gather, masked gather with
+/// fill, scatter to distinct slots, masked scatter, and the highest-lane-wins collision contract,
+/// plus the `u32` integer companion. Table values are small exact integers so the check holds
+/// bit-for-bit at every element width.
+fn check_gather_scatter<T, S>(b: S)
+where
+    T: Scalar,
+    S: Backend<T>,
+{
+    let n = b.lanes();
+    let mut rng = rand::rng();
+    let table_len = 3 * n;
+
+    // Lane `i` set iff `keep[i]`, built through the integer compare every backend has.
+    let mask_from = |keep: &[bool]| {
+        let sel: Vec<u32> = keep.iter().map(|&k| k as u32).collect();
+        b.ieq(b.iload(&sel), b.isplat(1))
+    };
+    let fstore = |v: S::Vector| {
+        let mut o = vec![T::ZERO; n];
+        b.store(v, &mut o);
+        o
+    };
+    let istore = |v: S::IVector| {
+        let mut o = vec![0u32; n];
+        b.istore(v, &mut o);
+        o
+    };
+
+    for _ in 0..300 {
+        let table: Vec<T> = (0..table_len).map(|k| T::from_f64(k as f64)).collect();
+        let idx: Vec<u32> = (0..n).map(|_| rng.random_range(0..table_len as u32)).collect();
+        let vidx = b.iload(&idx);
+
+        let g = fstore(b.gather(&table, vidx));
+        for i in 0..n {
+            assert_eq!(g[i].into_f64(), table[idx[i] as usize].into_f64(), "gather lane {i}");
+        }
+
+        let keep: Vec<bool> = (0..n).map(|_| rng.random_bool(0.5)).collect();
+        let fill: Vec<T> = (0..n).map(|i| T::from_f64((200 + i) as f64)).collect();
+        let gm = fstore(b.gather_masked(&table, vidx, mask_from(&keep), b.load(&fill)));
+        for i in 0..n {
+            let want = if keep[i] { table[idx[i] as usize] } else { fill[i] };
+            assert_eq!(gm[i].into_f64(), want.into_f64(), "gather_masked lane {i}");
+        }
+
+        // Distinct scatter targets: a shuffled prefix of 0..table_len.
+        let mut perm: Vec<u32> = (0..table_len as u32).collect();
+        for i in (1..perm.len()).rev() {
+            perm.swap(i, rng.random_range(0..=i));
+        }
+        let tgt = &perm[..n];
+        let vtgt = b.iload(tgt);
+        let vals: Vec<T> = (0..n).map(|i| T::from_f64((100 + i) as f64)).collect();
+        let vv = b.load(&vals);
+
+        let mut out = vec![T::ZERO; table_len];
+        b.scatter(&mut out, vtgt, vv);
+        let mut want = vec![T::ZERO; table_len];
+        for i in 0..n {
+            want[tgt[i] as usize] = vals[i];
+        }
+        for k in 0..table_len {
+            assert_eq!(out[k].into_f64(), want[k].into_f64(), "scatter slot {k}");
+        }
+
+        let keep2: Vec<bool> = (0..n).map(|_| rng.random_bool(0.5)).collect();
+        let mut out2 = vec![T::ZERO; table_len];
+        b.scatter_masked(&mut out2, vtgt, vv, mask_from(&keep2));
+        let mut want2 = vec![T::ZERO; table_len];
+        for i in 0..n {
+            if keep2[i] {
+                want2[tgt[i] as usize] = vals[i];
+            }
+        }
+        for k in 0..table_len {
+            assert_eq!(out2[k].into_f64(), want2[k].into_f64(), "scatter_masked slot {k}");
+        }
+
+        // All lanes collide on slot 0: the highest lane must win.
+        let mut outc = vec![T::ZERO; table_len];
+        b.scatter(&mut outc, b.isplat(0), vv);
+        assert_eq!(outc[0].into_f64(), vals[n - 1].into_f64(), "scatter collision: highest lane wins");
+
+        let itable: Vec<u32> = (0..table_len as u32).map(|k| k.wrapping_mul(2_654_435_761)).collect();
+        let ig = istore(b.igather(&itable, vidx));
+        for i in 0..n {
+            assert_eq!(ig[i], itable[idx[i] as usize], "igather lane {i}");
+        }
+        let ifill: Vec<u32> = (0..n).map(|i| 0xDEAD_0000 + i as u32).collect();
+        let igm = istore(b.igather_masked(&itable, vidx, mask_from(&keep), b.iload(&ifill)));
+        for i in 0..n {
+            let want = if keep[i] { itable[idx[i] as usize] } else { ifill[i] };
+            assert_eq!(igm[i], want, "igather_masked lane {i}");
+        }
+        let ivals: Vec<u32> = (0..n).map(|i| 0xBEEF_0000 + i as u32).collect();
+        let ivv = b.iload(&ivals);
+        let mut iout = vec![0u32; table_len];
+        b.iscatter(&mut iout, vtgt, ivv);
+        let mut iwant = vec![0u32; table_len];
+        for i in 0..n {
+            iwant[tgt[i] as usize] = ivals[i];
+        }
+        assert_eq!(iout, iwant, "iscatter");
+        let mut iout2 = vec![0u32; table_len];
+        b.iscatter_masked(&mut iout2, vtgt, ivv, mask_from(&keep2));
+        let mut iwant2 = vec![0u32; table_len];
+        for i in 0..n {
+            if keep2[i] {
+                iwant2[tgt[i] as usize] = ivals[i];
+            }
+        }
+        assert_eq!(iout2, iwant2, "iscatter_masked");
+    }
+}
+
 fn check<T, S>(b: S, sample: impl Fn(&mut dyn FnMut() -> f64) -> T)
 where
     T: FloatScalar,
@@ -188,6 +409,9 @@ where
 {
     check_specials(b);
     check_ints(b);
+    check_gather_scatter(b);
+    check_partial(b);
+    check_rows(b);
     let s = ScalarBackend;
     let n = b.lanes();
     let mut rng = rand::rng();
@@ -320,6 +544,9 @@ where
     T: IntScalar + core::fmt::Debug,
     S: Backend<T>,
 {
+    check_gather_scatter(b);
+    check_partial(b);
+    check_rows(b);
     let n = b.lanes();
     let mut rng = rand::rng();
     let store = |v: S::Vector| {
@@ -477,8 +704,45 @@ where
 {
     check::<f32, S>(b, |d| d() as f32);
     check::<f64, S>(b, |d| d());
+    check_casts::<f32, S>(b);
+    check_casts::<f64, S>(b);
     check_mma_one::<f32, S>(b, 1e-4);
     check_mma_one::<f64, S>(b, 1e-12);
+}
+
+/// The numeric float↔int casts against the scalar-`as` oracle: truncate toward zero, round to
+/// nearest even, and the two integer→float directions.
+fn check_casts<T, S>(b: S)
+where
+    T: FloatScalar,
+    S: Backend<T>,
+{
+    let n = b.lanes();
+    let mut rng = rand::rng();
+    let fvals: Vec<T> = (0..n).map(|_| T::from_f64(rng.random_range(-1000.0f64..1000.0))).collect();
+    let vf = b.load(&fvals);
+
+    let mut tbuf = vec![0u32; n];
+    b.istore(b.trunc_to_i32(vf), &mut tbuf);
+    let mut rbuf = vec![0u32; n];
+    b.istore(b.round_to_i32(vf), &mut rbuf);
+    for i in 0..n {
+        assert_eq!(tbuf[i] as i32, fvals[i].into_f64() as i32, "trunc_to_i32 lane {i}");
+        assert_eq!(rbuf[i] as i32, fvals[i].into_f64().round_ties_even() as i32, "round_to_i32 lane {i}");
+    }
+
+    let ints: Vec<u32> = (0..n).map(|i| (i as u32).wrapping_mul(37).wrapping_sub(11)).collect();
+    let vi = b.iload(&ints);
+    let mut sbuf = vec![T::ZERO; n];
+    b.store(b.i32_to_float(vi), &mut sbuf);
+    let mut ubuf = vec![T::ZERO; n];
+    b.store(b.u32_to_float(vi), &mut ubuf);
+    for i in 0..n {
+        // The conversion rounds to `T` (an f32 target can't hold every i32/u32 exactly), so the
+        // oracle rounds through `T` too; u32→f32 double-rounded via f64 is still correctly rounded.
+        assert_eq!(sbuf[i].into_f64(), T::from_f64((ints[i] as i32) as f64).into_f64(), "i32_to_float lane {i}");
+        assert_eq!(ubuf[i].into_f64(), T::from_f64(ints[i] as f64).into_f64(), "u32_to_float lane {i}");
+    }
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
@@ -521,6 +785,27 @@ fn avx512_matches_scalar() {
 #[test]
 fn neon_matches_scalar() {
     check_all(super::neon::Neon::new());
+}
+
+/// SVE at every vector length the host covers (16, 32, 64 bytes); skips where SVE is absent.
+#[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+#[test]
+fn sve_matches_scalar() {
+    use super::sve::Sve;
+    let mut ran = false;
+    if let Some(b) = Sve::<16>::detect() {
+        check_all(b);
+        ran = true;
+    }
+    if let Some(b) = Sve::<32>::detect() {
+        check_all(b);
+    }
+    if let Some(b) = Sve::<64>::detect() {
+        check_all(b);
+    }
+    if !ran {
+        eprintln!("SVE unavailable; skipping");
+    }
 }
 
 /// RVV at the 128-bit floor (`Rvv<16>`: f32x4 / f64x2). "V" mandates `VLEN ≥ 128`, so the 16-byte

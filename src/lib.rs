@@ -6,10 +6,11 @@
 //! Stable Rust, `no_std`-compatible, no SIMD-crate dependency; `f16`/`bf16` come from the
 //! `half` crate, re-exported as [`struct@f16`]/[`bf16`].
 #![cfg_attr(not(feature = "std"), no_std)]
-// The subgroup backend's SubgroupSize reader uses inline SPIR-V assembly, gated behind
-// `asm_experimental_arch`. This is the crate's only nightly requirement and applies solely to
-// the rust-gpu/SPIR-V build; every CPU target compiles on stable.
-#![cfg_attr(target_arch = "spirv", feature(asm_experimental_arch))]
+// The subgroup backend reaches SPIR-V through inline assembly (`asm_experimental_arch`), and the
+// cooperative-matrix tiles hold `f16` as a real 16-bit float (`f16`). These are the crate's only
+// nightly requirements and apply solely to the rust-gpu/SPIR-V build; every CPU target compiles
+// on stable.
+#![cfg_attr(target_arch = "spirv", feature(asm_experimental_arch, f16))]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -25,12 +26,16 @@ pub const MAX_LANES: usize = 32;
 pub const MAX_UNROLL: usize = 16;
 
 pub mod backend;
+#[doc(hidden)]
+pub mod isa;
 pub mod arch;
 pub mod dispatch;
 // The runtime unroll cache; gone when `build.rs` resolved the factor at compile time.
 #[cfg(not(hp_resolved_unroll))]
 pub(crate) mod ilp;
 pub mod dense;
+#[cfg(feature = "alloc")]
+mod scratch;
 pub mod matrix;
 pub mod scalar;
 pub mod varying;
@@ -45,13 +50,13 @@ pub mod soa;
 #[cfg(feature = "glam")]
 pub mod glam_ext;
 
-pub use backend::{Backend, BackendAll, ScalarBackend};
+pub use backend::{Backend, BackendAll, Enter, ScalarBackend};
 pub use dispatch::{Kernel, SimdDispatch, dispatch, run_scalar};
 
 /// The on-device entry point (rust-gpu / SPIR-V target): mirrors [`dispatch`], but branches on
 /// work size (subgroup-distributed vs. a single sequential invocation) instead of CPU ISA.
 #[cfg(target_arch = "spirv")]
-pub use backend::subgroup::dispatch_subgroup;
+pub use backend::subgroup::{dispatch_matrix_subgroup, dispatch_subgroup};
 pub use dense::{Diag, Mat, Side, Trans, Uplo, col_sums, fro_norm, gemv, row_sums};
 #[cfg(feature = "alloc")]
 pub use dense::{MatMut, gemm, potrf, syrk, trsm};
@@ -70,6 +75,152 @@ pub use hydroplane_macros::kernel;
 
 /// `f16`/`bf16` element types (from the `half` crate), usable anywhere a [`Scalar`] is expected.
 pub use half::{bf16, f16};
+
+/// `$body` once for each `$i` in `0..$n`, with `$i` a literal; `$n` is a constant of at most 8
+/// (a const generic works).
+///
+/// Use it for register blocking, so an array of tiles indexed by `$i` resolves to fixed
+/// elements:
+///
+/// ```ignore
+/// let mut acc = [[tl.zero_acc::<16, 16>(); BN]; BM];
+/// hydroplane::unroll!(BM, i, {
+///     let a = tl.load_a::<16, 16>(&a_mem[(row0 + i * 16) * k_dim + k..], k_dim, Layout::RowMajor);
+///     hydroplane::unroll!(BN, j, {
+///         acc[i][j] = tl.mma(a, b[j], acc[i][j]);
+///     });
+/// });
+/// ```
+///
+/// On the GPU an array indexed by a loop variable lives in memory, which made a register-blocked
+/// cooperative-matrix GEMM about 4× slower; there is no loop-unroll attribute to ask for this.
+/// On the CPU it is an ordinary unrolled loop.
+#[macro_export]
+macro_rules! unroll {
+    (0, $i:ident, $body:block) => {{}};
+    (1, $i:ident, $body:block) => { $crate::unroll!(@ $i, $body, 0) };
+    (2, $i:ident, $body:block) => { $crate::unroll!(@ $i, $body, 0 1) };
+    (3, $i:ident, $body:block) => { $crate::unroll!(@ $i, $body, 0 1 2) };
+    (4, $i:ident, $body:block) => { $crate::unroll!(@ $i, $body, 0 1 2 3) };
+    (5, $i:ident, $body:block) => { $crate::unroll!(@ $i, $body, 0 1 2 3 4) };
+    (6, $i:ident, $body:block) => { $crate::unroll!(@ $i, $body, 0 1 2 3 4 5) };
+    (7, $i:ident, $body:block) => { $crate::unroll!(@ $i, $body, 0 1 2 3 4 5 6) };
+    (8, $i:ident, $body:block) => { $crate::unroll!(@ $i, $body, 0 1 2 3 4 5 6 7) };
+    (@ $i:ident, $body:block, $($k:literal)*) => {{
+        $({
+            let $i: usize = $k;
+            $body
+        })*
+    }};
+    // A count only known after monomorphization (a const generic) needs every possible copy,
+    // each behind a test the compiler folds away.
+    ($n:expr, $i:ident, $body:block) => {{
+        const { assert!($n <= 8, "hydroplane::unroll! takes at most 8 iterations") };
+        if $n > 0 {
+            let $i: usize = 0;
+            $body
+        }
+        if $n > 1 {
+            let $i: usize = 1;
+            $body
+        }
+        if $n > 2 {
+            let $i: usize = 2;
+            $body
+        }
+        if $n > 3 {
+            let $i: usize = 3;
+            $body
+        }
+        if $n > 4 {
+            let $i: usize = 4;
+            $body
+        }
+        if $n > 5 {
+            let $i: usize = 5;
+            $body
+        }
+        if $n > 6 {
+            let $i: usize = 6;
+            $body
+        }
+        if $n > 7 {
+            let $i: usize = 7;
+            $body
+        }
+    }};
+}
+
+/// The `#[kernel]` multiply-add rewrite: `a * b + c` becomes
+/// `(&Fuse::new(a, b, c)).__hp_fuse()`, which method resolution sends to [`ViaFma`] (a fused
+/// multiply-add) for varying operands and to [`ViaOps`] (the original operators) for anything
+/// else.
+#[doc(hidden)]
+pub mod __fuse {
+    use core::cell::Cell;
+    use core::ops::{Add, Mul};
+
+    use crate::backend::Backend;
+    use crate::scalar::FloatScalar;
+    use crate::varying::Varying;
+
+    pub struct Fuse<A, B, C>(Cell<Option<(A, B, C)>>);
+
+    impl<A, B, C> Fuse<A, B, C> {
+        #[inline(always)]
+        pub fn new(a: A, b: B, c: C) -> Self {
+            Fuse(Cell::new(Some((a, b, c))))
+        }
+
+        #[inline(always)]
+        fn take(&self) -> (A, B, C) {
+            match self.0.take() {
+                Some(v) => v,
+                None => unreachable!(),
+            }
+        }
+    }
+
+    pub trait ViaFma {
+        type Out;
+        fn __hp_fuse(&self) -> Self::Out;
+    }
+
+    impl<T: FloatScalar, S: Backend<T>> ViaFma for Fuse<Varying<T, S>, Varying<T, S>, Varying<T, S>> {
+        type Out = Varying<T, S>;
+        #[inline(always)]
+        fn __hp_fuse(&self) -> Varying<T, S> {
+            let (a, b, c) = self.take();
+            a.fma(b, c)
+        }
+    }
+
+    impl<T: FloatScalar, S: Backend<T>> ViaFma for Fuse<Varying<T, S>, T, Varying<T, S>> {
+        type Out = Varying<T, S>;
+        #[inline(always)]
+        fn __hp_fuse(&self) -> Varying<T, S> {
+            let (a, b, c) = self.take();
+            a.fma(c.splat_like(b), c)
+        }
+    }
+
+    pub trait ViaOps {
+        type Out;
+        fn __hp_fuse(&self) -> Self::Out;
+    }
+
+    impl<A: Mul<B>, B, C> ViaOps for &Fuse<A, B, C>
+    where
+        A::Output: Add<C>,
+    {
+        type Out = <A::Output as Add<C>>::Output;
+        #[inline(always)]
+        fn __hp_fuse(&self) -> Self::Out {
+            let (a, b, c) = self.take();
+            a * b + c
+        }
+    }
+}
 
 /// Re-export of the crate supplying [`Scalar`]'s numeric supertrait
 /// ([`FloatCore`](num_traits::float::FloatCore)), so generic kernels can name its traits without
@@ -92,9 +243,14 @@ pub mod towers {
     pub use crate::ScalarBackend;
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     pub use crate::backend::{
-        avx1::Avx1, avx2::Avx2, avx512::Avx512, avx512bf16::Avx512Bf16, avx512fp16::Avx512Fp16,
-        sse4::Sse4,
+        avx2::Avx2, avx512::Avx512, avx512bf16::Avx512Bf16, avx512fp16::Avx512Fp16, sse4::Sse4,
     };
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "avx1"))]
+    pub use crate::backend::avx1::Avx1;
+    /// Without the `avx1` feature the AVX tier is never selected; its arm in a `#[kernel]` match
+    /// reuses the SSE4 instantiation rather than compiling another copy of the kernel.
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), not(feature = "avx1")))]
+    pub use crate::backend::sse4::Sse4 as Avx1;
     #[cfg(target_arch = "aarch64")]
     pub use crate::backend::neon::Neon;
     #[cfg(target_arch = "aarch64")]
